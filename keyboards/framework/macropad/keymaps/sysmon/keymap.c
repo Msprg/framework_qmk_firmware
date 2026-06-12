@@ -247,6 +247,33 @@ static uint8_t sysmon_pulse(bool inverted) {
     return sqrt16((uint16_t)s * 255); // sqrt pacing; maps 0..255 onto 0..255
 }
 
+// Glide a displayed stat toward its latest host-sent value over a fixed
+// 150ms so bars sweep to the new level instead of snapping once a second.
+#define SYSMON_GLIDE_MS 150
+
+typedef struct {
+    uint8_t  shown;
+    uint8_t  start;
+    uint8_t  target;
+    uint32_t t0;
+} sysmon_glide_t;
+
+static uint8_t sysmon_glide(sysmon_glide_t *g, uint8_t target) {
+    uint32_t now = timer_read32();
+    if (target != g->target) {
+        g->start  = g->shown;
+        g->target = target;
+        g->t0     = now;
+    }
+    uint32_t elapsed = now - g->t0;
+    if (elapsed >= SYSMON_GLIDE_MS) {
+        g->shown = g->target;
+    } else {
+        g->shown = (uint8_t)(g->start + ((int16_t)g->target - g->start) * (int32_t)elapsed / SYSMON_GLIDE_MS);
+    }
+    return g->shown;
+}
+
 // Slew brightness toward the host-sent target (1 level per 4ms) so a stats
 // packet landing mid-pulse can't step the whole display's brightness.
 static uint8_t sysmon_slewed_val(void) {
@@ -266,11 +293,11 @@ static uint8_t sysmon_slewed_val(void) {
     return val;
 }
 
-static void sysmon_render_battery(uint8_t val) {
-    uint8_t pct         = sysmon.battery > 100 ? 100 : sysmon.battery;
-    bool    ac          = sysmon.flags & SYSMON_FLAG_AC_CONNECTED;
-    bool    charging    = sysmon.flags & SYSMON_FLAG_CHARGING;
-    bool    discharging = sysmon.flags & SYSMON_FLAG_DISCHARGING;
+static void sysmon_render_battery(uint8_t pct, uint8_t val) {
+    if (pct > 100) pct = 100;
+    bool ac          = sysmon.flags & SYSMON_FLAG_AC_CONNECTED;
+    bool charging    = sysmon.flags & SYSMON_FLAG_CHARGING;
+    bool discharging = sysmon.flags & SYSMON_FLAG_DISCHARGING;
     if (!ac && !charging) discharging = true; // unplugged always drains
 
     if (discharging && pct < 15) {
@@ -310,14 +337,13 @@ static void sysmon_render_battery(uint8_t val) {
     }
 }
 
-static void sysmon_render_temp(uint8_t val) {
+static void sysmon_render_temp(uint8_t t, uint8_t val) {
     if (!(sysmon.flags & SYSMON_FLAG_TEMP)) {
         sysmon_render_off(5);
         return;
     }
     // bar length scales 30C..85C; colors are a fixed green-to-deep-red
     // gradient across the four segments regardless of temperature
-    uint8_t t = sysmon.temp_c;
     if (t < 30) t = 30;
     if (t > 85) t = 85;
     uint8_t  pct   = (uint8_t)((uint16_t)(t - 30) * 100 / 55);
@@ -347,23 +373,25 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
     sysmon_set_gcc(sysmon_slewed_val());
     uint8_t val = 255; // full PWM scale; GCC carries the brightness
 
+    static sysmon_glide_t g_batt, g_cpu, g_mem, g_igpu, g_dgpu, g_temp;
+
     if (sysmon.flags & SYSMON_FLAG_BATTERY) {
-        sysmon_render_battery(val);
+        sysmon_render_battery(sysmon_glide(&g_batt, sysmon.battery), val);
     } else {
         sysmon_render_off(0);
     }
 
-    sysmon_render_bar(1, sysmon.cpu, SYSMON_HUE_CPU, val);
-    sysmon_render_bar(2, sysmon.mem, SYSMON_HUE_MEM, val);
-    sysmon_render_bar(3, sysmon.igpu, SYSMON_HUE_IGPU, val);
+    sysmon_render_bar(1, sysmon_glide(&g_cpu, sysmon.cpu), SYSMON_HUE_CPU, val);
+    sysmon_render_bar(2, sysmon_glide(&g_mem, sysmon.mem), SYSMON_HUE_MEM, val);
+    sysmon_render_bar(3, sysmon_glide(&g_igpu, sysmon.igpu), SYSMON_HUE_IGPU, val);
 
     if (sysmon.flags & SYSMON_FLAG_DGPU) {
-        sysmon_render_bar(4, sysmon.dgpu, SYSMON_HUE_DGPU, val);
+        sysmon_render_bar(4, sysmon_glide(&g_dgpu, sysmon.dgpu), SYSMON_HUE_DGPU, val);
     } else {
         sysmon_render_off(4);
     }
 
-    sysmon_render_temp(val);
+    sysmon_render_temp(sysmon_glide(&g_temp, sysmon.temp_c), val);
 
     return false;
 }
