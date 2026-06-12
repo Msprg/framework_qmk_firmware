@@ -180,6 +180,55 @@ static void sysmon_render_off(uint8_t row) {
     }
 }
 
+// Charge/discharge pulse (~4s cycle): a trapezoid — linear rise, hold
+// bright, linear fall, rest fully off — paced through a sqrt curve.
+// With s ~ sqrt(t), the dwell time on each PWM level scales with the level
+// itself, so the ramps sweep the coarse bottom levels quickly (adjacent
+// steps there are huge relative jumps that read as stutter) and ease
+// through the fine bright ones. Resting at off matters too: holding a
+// barely-lit level reads as a freeze, while dark reads as intentional.
+// Charging runs rise-first ("energy arriving"); discharging is
+// time-reversed.
+#define SYSMON_PULSE_PERIOD 4096 // ms; power of two so the modulo is cheap
+#define SYSMON_PULSE_RAMP 1024   // ms of each ramp
+#define SYSMON_PULSE_HOLD 1024   // ms held bright; the remainder rests off
+
+static uint8_t sysmon_pulse(bool inverted) {
+    uint16_t t = timer_read32() % SYSMON_PULSE_PERIOD;
+    if (inverted) t = SYSMON_PULSE_PERIOD - 1 - t;
+
+    uint8_t s; // envelope 0-255
+    if (t < SYSMON_PULSE_RAMP) {
+        s = (uint32_t)t * 255 / SYSMON_PULSE_RAMP;
+    } else if (t < SYSMON_PULSE_RAMP + SYSMON_PULSE_HOLD) {
+        s = 255;
+    } else if (t < 2 * SYSMON_PULSE_RAMP + SYSMON_PULSE_HOLD) {
+        s = 255 - (uint32_t)(t - SYSMON_PULSE_RAMP - SYSMON_PULSE_HOLD) * 255 / SYSMON_PULSE_RAMP;
+    } else {
+        s = 0;
+    }
+    return sqrt16((uint16_t)s * 255); // sqrt pacing; maps 0..255 onto 0..255
+}
+
+// Slew brightness toward the host-sent target (1 level per 4ms) so a stats
+// packet landing mid-pulse can't step the whole display's brightness.
+static uint8_t sysmon_slewed_val(void) {
+    static uint8_t  val  = 0;
+    static uint32_t last = 0;
+
+    uint32_t now  = timer_read32();
+    uint32_t step = (now - last) / 4;
+    if (step) {
+        last = now;
+        if (val < sysmon.brightness) {
+            val += MIN(step, (uint32_t)(sysmon.brightness - val));
+        } else {
+            val -= MIN(step, (uint32_t)(val - sysmon.brightness));
+        }
+    }
+    return val;
+}
+
 static void sysmon_render_battery(uint8_t val) {
     uint8_t pct         = sysmon.battery > 100 ? 100 : sysmon.battery;
     bool    ac          = sysmon.flags & SYSMON_FLAG_AC_CONNECTED;
@@ -202,16 +251,16 @@ static void sysmon_render_battery(uint8_t val) {
     if (seg > 3) seg = 3;
 
     if (charging) {
-        // level bar, red at empty through green at full, with a breathing
-        // pulse on the segment currently filling (~2s cycle)
+        // level bar, red at empty through green at full; the segment
+        // currently filling pulses bright then rests (~4s cycle)
         uint8_t hue   = (uint8_t)((uint16_t)pct * 85 / 100);
-        uint8_t pulse = sin8(timer_read32() / 8);
+        uint8_t pulse = sysmon_pulse(false);
         sysmon_render_bar(0, pct, hue, val);
         RGB rgb = hsv_to_rgb((HSV){hue, 255, scale8(val, pulse)});
         rgb_matrix_set_color(sysmon_row_leds[0][seg], rgb.r, rgb.g, rgb.b);
     } else if (discharging) {
-        // red level bar; the boundary segment breathes down to show the drain
-        uint8_t pulse = 255 - sin8(timer_read32() / 8);
+        // red level bar; the boundary segment flares and fades to show the drain
+        uint8_t pulse = sysmon_pulse(true);
         sysmon_render_bar(0, pct, 0, val);
         RGB rgb = hsv_to_rgb((HSV){0, 255, scale8(val, pulse)});
         rgb_matrix_set_color(sysmon_row_leds[0][seg], rgb.r, rgb.g, rgb.b);
@@ -256,7 +305,7 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
         return true;
     }
 
-    uint8_t val = sysmon.brightness;
+    uint8_t val = sysmon_slewed_val();
 
     if (sysmon.flags & SYSMON_FLAG_BATTERY) {
         sysmon_render_battery(val);
