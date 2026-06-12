@@ -71,6 +71,7 @@ void enable_factory_mode(bool enable) {
 #if defined(RGB_MATRIX_ENABLE)
 
 #include <lib/lib8tion/lib8tion.h>
+#include "is31flcommon.h"
 
 // ---------------------------------------------------------------------------
 // Host -> macropad protocol
@@ -156,6 +157,42 @@ static const uint8_t sysmon_row_leds[6][4] = {
     {8, 10, 14, 12},
 };
 
+// Overall brightness rides the IS31FL3743A's global current register (GCC)
+// instead of scaling the PWM values: PWM then keeps its full 8-bit
+// resolution at any brightness, instead of the few dozen levels left after
+// scale8() at a dim host setting. The board's ISSI_GLOBALCURRENT (185) is a
+// current-budget cap, so the host value scales within it, never above —
+// val=255 lands exactly on the stock value, which is also the idle state.
+// Safe to call mid-frame: the driver re-selects the PWM page on every flush.
+//
+// The map is val squared, not linear: PWM dimming is linear in light output,
+// but GCC dims by LED current, and LEDs convert low currents to light more
+// efficiently, so a linear map runs visibly too bright at the dim end.
+static uint8_t sysmon_gcc = ISSI_GLOBALCURRENT; // last value written to the chip
+
+static void sysmon_set_gcc(uint8_t val) {
+    uint8_t gcc = (uint8_t)((uint32_t)val * val * ISSI_GLOBALCURRENT / (255UL * 255));
+    if (gcc == 0 && val > 0) gcc = 1; // host wants light; GCC 0 is fully off
+    if (gcc == sysmon_gcc) return;
+    sysmon_gcc = gcc;
+    IS31FL_unlock_register(DRIVER_ADDR_1, ISSI_PAGE_FUNCTION);
+    IS31FL_write_single_register(DRIVER_ADDR_1, ISSI_REG_GLOBALCURRENT, gcc);
+}
+
+// Partially-filled bar segments fade in with the fraction, but emitted
+// light goes as PWM x GCC: at global current 1-2, PWM below roughly half
+// scale is not visible at all (measured empirically — even ~100 vanishes
+// while a full segment reads fine), so low-percentage stats disappear.
+// Instead of fading from 0, fade from a GCC-dependent floor: the partial
+// range compresses into [floor..255], keeping every nonzero fraction both
+// visible and distinguishable. At high GCC the floor decays to ~1 and the
+// fade becomes proportional again.
+static uint16_t sysmon_seg_visible(uint16_t seg) {
+    uint16_t fl = 128 / sysmon_gcc;
+    if (fl == 0) fl = 1;
+    return fl + seg * (255 - fl) / 255;
+}
+
 // Paint one row as a 4-segment bar. pct 0-100, val is max brightness.
 // The fractional segment fades in for sub-quarter resolution.
 static void sysmon_render_bar(uint8_t row, uint8_t pct, uint8_t hue, uint8_t val) {
@@ -167,7 +204,7 @@ static void sysmon_render_bar(uint8_t row, uint8_t pct, uint8_t hue, uint8_t val
         if (level >= (uint16_t)(i + 1) * 255) {
             seg = 255;
         } else if (level > (uint16_t)i * 255) {
-            seg = level - i * 255;
+            seg = sysmon_seg_visible(level - i * 255);
         }
         RGB rgb = hsv_to_rgb((HSV){hue, 255, scale8(val, seg)});
         rgb_matrix_set_color(sysmon_row_leds[row][i], rgb.r, rgb.g, rgb.b);
@@ -291,7 +328,7 @@ static void sysmon_render_temp(uint8_t val) {
         if (level >= (uint16_t)(i + 1) * 255) {
             seg = 255;
         } else if (level > (uint16_t)i * 255) {
-            seg = level - i * 255;
+            seg = sysmon_seg_visible(level - i * 255);
         }
         uint8_t hue = 85 - i * 85 / 3; // 85, 57, 28, 0
         RGB rgb = hsv_to_rgb((HSV){hue, 255, scale8(val, seg)});
@@ -301,11 +338,14 @@ static void sysmon_render_temp(uint8_t val) {
 
 bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
     if (sysmon_last_update == 0 || timer_elapsed32(sysmon_last_update) > SYSMON_TIMEOUT_MS) {
-        // No fresh data from the host; let the normal RGB effect run
+        // No fresh data from the host; restore the stock global current and
+        // let the normal RGB effect run at its own brightness
+        sysmon_set_gcc(255);
         return true;
     }
 
-    uint8_t val = sysmon_slewed_val();
+    sysmon_set_gcc(sysmon_slewed_val());
+    uint8_t val = 255; // full PWM scale; GCC carries the brightness
 
     if (sysmon.flags & SYSMON_FLAG_BATTERY) {
         sysmon_render_battery(val);

@@ -344,8 +344,11 @@ def gather(sources, gpu, ec, args):
     brightness_pct = sources.screen_brightness()
     if brightness_pct is None:
         brightness_pct = args.fallback_brightness
+    # gamma bends the curve between the pinned min/max endpoints; screens use
+    # perceptual brightness steps, so a linear map runs too bright mid-range
+    frac = (brightness_pct / 100.0) ** args.led_gamma
     led_val = clamp(
-        args.min_led + (args.max_led - args.min_led) * brightness_pct / 100.0,
+        args.min_led + (args.max_led - args.min_led) * frac,
         args.min_led, args.max_led)
 
     return {
@@ -371,6 +374,9 @@ def main():
                              "0-255 (default: 150; full 255 is blinding)")
     parser.add_argument("--fallback-brightness", type=int, default=30,
                         help="assumed screen brightness %% if unreadable (default: 30)")
+    parser.add_argument("--led-gamma", type=float, default=2.0,
+                        help="curve between min/max LED brightness; higher "
+                             "dims the mid-range, 1.0 is linear (default: 2.0)")
     parser.add_argument("--igpu-match", default=r"Intel|Iris|UHD|Radeon.*(Graphics|M\b)",
                         help="regex matching the iGPU adapter name")
     parser.add_argument("--dgpu-match", default=r"NVIDIA|GeForce|RTX|GTX|Radeon RX",
