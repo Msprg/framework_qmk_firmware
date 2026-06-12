@@ -365,8 +365,8 @@ def gather(sources, gpu, ec, args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--interval", type=float, default=1.0,
-                        help="seconds between updates (default: 1.0)")
+    parser.add_argument("--interval", type=float, default=0.4,
+                        help="seconds between updates (default: 0.4)")
     parser.add_argument("--min-led", type=int, default=8,
                         help="LED brightness at 0%% screen brightness (default: 8)")
     parser.add_argument("--max-led", type=int, default=150,

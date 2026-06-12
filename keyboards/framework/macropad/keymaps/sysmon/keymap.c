@@ -248,8 +248,10 @@ static uint8_t sysmon_pulse(bool inverted) {
 }
 
 // Glide a displayed stat toward its latest host-sent value over a fixed
-// 150ms so bars sweep to the new level instead of snapping once a second.
-#define SYSMON_GLIDE_MS 150
+// 300ms so bars sweep to the new level instead of snapping at each update.
+// Tuned against the host's 400ms poll (~450-500ms effective with gather
+// time) so the bars are in motion for most of each update cycle.
+#define SYSMON_GLIDE_MS 300
 
 typedef struct {
     uint8_t  shown;
