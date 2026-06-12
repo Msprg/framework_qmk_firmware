@@ -1,0 +1,282 @@
+// Copyright 2026 Msprg
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// System monitor keymap for the Framework 16 RGB Macropad.
+//
+// A host-side script (see host/fw16_sysmon.py) periodically sends system
+// stats over the VIA raw HID endpoint, on a private channel that VIA
+// itself never uses. Each of the six key rows becomes a 4-segment bar:
+//
+//   row 0 (top, small keys): battery level + charge/discharge effects
+//   row 1: CPU usage
+//   row 2: memory usage
+//   row 3: iGPU usage
+//   row 4: dGPU usage
+//   row 5: system temperature
+//
+// Overall brightness is dictated by the host (it follows the laptop's
+// screen brightness). When no stats arrive for SYSMON_TIMEOUT_MS the
+// macropad falls back to the regular RGB matrix effect.
+
+#include QMK_KEYBOARD_H
+#include "factory.h"
+#include "via.h"
+
+const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
+    // Same layout as the default keymap; see keymaps/default for diagrams
+    [_NUMLOCK] = LAYOUT(
+        KC_ESC,  KC_CALC, KC_EQL,  KC_BSPC,
+        KC_NUM,  KC_PSLS, KC_PAST, KC_PMNS,
+        KC_P7,   KC_P8,   KC_P9,   KC_PPLS,
+        KC_P4,   KC_P5,   KC_P6,   KC_PPLS,
+        KC_P1,   KC_P2,   KC_P3,   KC_PENT,
+        KC_P0,   KC_P0,   KC_PDOT, KC_PENT
+    ),
+    [_FN] = LAYOUT(
+        RGB_TOG, RGB_SPI, RGB_HUI, RGB_SAI,
+        _______, RGB_SPD, RGB_HUD, RGB_SAD,
+        _______, _______, _______, RGB_MOD,
+        _______, _______, _______, RGB_RMOD,
+        _______, _______, _______, BL_STEP,
+        _______, _______, _______, BL_STEP
+    ),
+    [_FACTORY] = LAYOUT(
+        KC_A,    KC_B,    KC_C,    KC_D,
+        KC_E,    KC_F,    KC_G,    KC_H,
+        KC_I,    KC_J,    KC_K,    KC_L,
+        KC_M,    KC_N,    KC_O,    KC_P,
+        KC_Q,    KC_R,    KC_S,    KC_T,
+        KC_U,    KC_V,    KC_W,    KC_X
+    ),
+};
+
+bool led_update_user(led_t led_state) {
+    // Change layer if numlock state changes, either triggered by OS or
+    // by numlock key on this keyboard
+    if (led_state.num_lock) {
+        layer_off(_FN);
+    } else {
+        layer_on(_FN);
+    }
+    return true;
+}
+
+void enable_factory_mode(bool enable) {
+    if (enable)
+        layer_on(_FACTORY);
+    else
+        layer_off(_FACTORY);
+}
+
+#if defined(RGB_MATRIX_ENABLE)
+
+#include <lib/lib8tion/lib8tion.h>
+
+// ---------------------------------------------------------------------------
+// Host -> macropad protocol
+//
+// The host sends a VIA "custom set value" packet:
+//   data[0] = 0x07 (id_custom_set_value)
+//   data[1] = SYSMON_CHANNEL
+//   data[2] = SYSMON_VALUE_STATS
+//   data[3] = flags  (SYSMON_FLAG_*)
+//   data[4] = battery percentage 0-100
+//   data[5] = CPU usage 0-100
+//   data[6] = memory usage 0-100
+//   data[7] = iGPU usage 0-100
+//   data[8] = dGPU usage 0-100
+//   data[9] = temperature in degrees C
+//   data[10] = LED brightness 0-255 (host derives it from screen brightness)
+// VIA echoes the buffer back, which serves as the ACK.
+// ---------------------------------------------------------------------------
+
+#define SYSMON_CHANNEL 0x42
+#define SYSMON_VALUE_STATS 0x01
+#define SYSMON_TIMEOUT_MS 5000
+
+#define SYSMON_FLAG_AC_CONNECTED (1 << 0)
+#define SYSMON_FLAG_BATTERY (1 << 1)
+#define SYSMON_FLAG_DGPU (1 << 2)
+#define SYSMON_FLAG_TEMP (1 << 3)
+#define SYSMON_FLAG_CHARGING (1 << 4)
+#define SYSMON_FLAG_DISCHARGING (1 << 5)
+
+// Fixed row colors (QMK hue 0-255)
+#define SYSMON_HUE_CPU 0    // red
+#define SYSMON_HUE_MEM 36   // gold
+#define SYSMON_HUE_IGPU 0   // red
+#define SYSMON_HUE_DGPU 85  // green
+
+typedef struct {
+    uint8_t flags;
+    uint8_t battery;
+    uint8_t cpu;
+    uint8_t mem;
+    uint8_t igpu;
+    uint8_t dgpu;
+    uint8_t temp_c;
+    uint8_t brightness;
+} sysmon_stats_t;
+
+static sysmon_stats_t sysmon;
+static uint32_t       sysmon_last_update = 0;
+
+void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
+    uint8_t *command_id = &(data[0]);
+    uint8_t *channel_id = &(data[1]);
+    uint8_t *value_id   = &(data[2]);
+    uint8_t *payload    = &(data[3]);
+
+    if (*channel_id == SYSMON_CHANNEL) {
+        if (*command_id == id_custom_set_value && *value_id == SYSMON_VALUE_STATS) {
+            sysmon.flags       = payload[0];
+            sysmon.battery     = payload[1];
+            sysmon.cpu         = payload[2];
+            sysmon.mem         = payload[3];
+            sysmon.igpu        = payload[4];
+            sysmon.dgpu        = payload[5];
+            sysmon.temp_c      = payload[6];
+            sysmon.brightness  = payload[7];
+            sysmon_last_update = timer_read32();
+        }
+        return;
+    }
+
+    *command_id = id_unhandled;
+}
+
+// LED index of each visual row, left to right. Derived from the physical
+// position table in macropad.c (rows share a y coordinate, sorted by x).
+static const uint8_t sysmon_row_leds[6][4] = {
+    {5, 2, 22, 17}, // top row of small keys
+    {4, 0, 20, 18},
+    {7, 1, 21, 16},
+    {6, 3, 23, 19},
+    {9, 11, 15, 13},
+    {8, 10, 14, 12},
+};
+
+// Paint one row as a 4-segment bar. pct 0-100, val is max brightness.
+// The fractional segment fades in for sub-quarter resolution.
+static void sysmon_render_bar(uint8_t row, uint8_t pct, uint8_t hue, uint8_t val) {
+    if (pct > 100) pct = 100;
+    uint16_t level = (uint16_t)pct * 4 * 255 / 100; // 0..1020
+
+    for (uint8_t i = 0; i < 4; i++) {
+        uint16_t seg = 0;
+        if (level >= (uint16_t)(i + 1) * 255) {
+            seg = 255;
+        } else if (level > (uint16_t)i * 255) {
+            seg = level - i * 255;
+        }
+        RGB rgb = hsv_to_rgb((HSV){hue, 255, scale8(val, seg)});
+        rgb_matrix_set_color(sysmon_row_leds[row][i], rgb.r, rgb.g, rgb.b);
+    }
+}
+
+static void sysmon_render_off(uint8_t row) {
+    for (uint8_t i = 0; i < 4; i++) {
+        rgb_matrix_set_color(sysmon_row_leds[row][i], 0, 0, 0);
+    }
+}
+
+static void sysmon_render_battery(uint8_t val) {
+    uint8_t pct         = sysmon.battery > 100 ? 100 : sysmon.battery;
+    bool    ac          = sysmon.flags & SYSMON_FLAG_AC_CONNECTED;
+    bool    charging    = sysmon.flags & SYSMON_FLAG_CHARGING;
+    bool    discharging = sysmon.flags & SYSMON_FLAG_DISCHARGING;
+    if (!ac && !charging) discharging = true; // unplugged always drains
+
+    if (discharging && pct < 15) {
+        // critical battery: blink the whole row red at ~1Hz
+        if (timer_read32() & 512) {
+            sysmon_render_off(0);
+        } else {
+            sysmon_render_bar(0, 100, 0, val);
+        }
+        return;
+    }
+
+    // segment at the charge boundary, where filling/draining happens
+    uint8_t seg = pct * 4 / 100;
+    if (seg > 3) seg = 3;
+
+    if (charging) {
+        // level bar, red at empty through green at full, with a breathing
+        // pulse on the segment currently filling (~2s cycle)
+        uint8_t hue   = (uint8_t)((uint16_t)pct * 85 / 100);
+        uint8_t pulse = sin8(timer_read32() / 8);
+        sysmon_render_bar(0, pct, hue, val);
+        RGB rgb = hsv_to_rgb((HSV){hue, 255, scale8(val, pulse)});
+        rgb_matrix_set_color(sysmon_row_leds[0][seg], rgb.r, rgb.g, rgb.b);
+    } else if (discharging) {
+        // red level bar; the boundary segment breathes down to show the drain
+        uint8_t pulse = 255 - sin8(timer_read32() / 8);
+        sysmon_render_bar(0, pct, 0, val);
+        RGB rgb = hsv_to_rgb((HSV){0, 255, scale8(val, pulse)});
+        rgb_matrix_set_color(sysmon_row_leds[0][seg], rgb.r, rgb.g, rgb.b);
+    } else {
+        // on AC, held at the charge cap: whole row steady dim green
+        RGB rgb = hsv_to_rgb((HSV){85, 255, scale8(val, 80)});
+        for (uint8_t i = 0; i < 4; i++) {
+            rgb_matrix_set_color(sysmon_row_leds[0][i], rgb.r, rgb.g, rgb.b);
+        }
+    }
+}
+
+static void sysmon_render_temp(uint8_t val) {
+    if (!(sysmon.flags & SYSMON_FLAG_TEMP)) {
+        sysmon_render_off(5);
+        return;
+    }
+    // bar length scales 30C..85C; colors are a fixed green-to-deep-red
+    // gradient across the four segments regardless of temperature
+    uint8_t t = sysmon.temp_c;
+    if (t < 30) t = 30;
+    if (t > 85) t = 85;
+    uint8_t  pct   = (uint8_t)((uint16_t)(t - 30) * 100 / 55);
+    uint16_t level = (uint16_t)pct * 4 * 255 / 100;
+
+    for (uint8_t i = 0; i < 4; i++) {
+        uint16_t seg = 0;
+        if (level >= (uint16_t)(i + 1) * 255) {
+            seg = 255;
+        } else if (level > (uint16_t)i * 255) {
+            seg = level - i * 255;
+        }
+        uint8_t hue = 85 - i * 85 / 3; // 85, 57, 28, 0
+        RGB rgb = hsv_to_rgb((HSV){hue, 255, scale8(val, seg)});
+        rgb_matrix_set_color(sysmon_row_leds[5][i], rgb.r, rgb.g, rgb.b);
+    }
+}
+
+bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
+    if (sysmon_last_update == 0 || timer_elapsed32(sysmon_last_update) > SYSMON_TIMEOUT_MS) {
+        // No fresh data from the host; let the normal RGB effect run
+        return true;
+    }
+
+    uint8_t val = sysmon.brightness;
+
+    if (sysmon.flags & SYSMON_FLAG_BATTERY) {
+        sysmon_render_battery(val);
+    } else {
+        sysmon_render_off(0);
+    }
+
+    sysmon_render_bar(1, sysmon.cpu, SYSMON_HUE_CPU, val);
+    sysmon_render_bar(2, sysmon.mem, SYSMON_HUE_MEM, val);
+    sysmon_render_bar(3, sysmon.igpu, SYSMON_HUE_IGPU, val);
+
+    if (sysmon.flags & SYSMON_FLAG_DGPU) {
+        sysmon_render_bar(4, sysmon.dgpu, SYSMON_HUE_DGPU, val);
+    } else {
+        sysmon_render_off(4);
+    }
+
+    sysmon_render_temp(val);
+
+    return false;
+}
+
+#endif // RGB_MATRIX_ENABLE
