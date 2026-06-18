@@ -1,0 +1,6 @@
+# LibreHardwareMonitorLib + HidSharp DLLs are fetched on demand, not committed
+# (MPL-2.0 native binaries). Populate this directory with:
+#   python fw16_sysmon.py --fetch-lhm
+# This .gitignore keeps the otherwise-empty directory in the tree.
+*
+!.gitignore

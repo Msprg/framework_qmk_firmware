@@ -79,11 +79,14 @@ USB drive that appears.
 ## Host script (Windows)
 
 ```powershell
-pip install hidapi psutil wmi pynvml
+pip install hidapi psutil wmi pynvml pythonnet
+python host\fw16_sysmon.py --fetch-lhm   # one-time: download LibreHardwareMonitorLib into lib/
 python host\fw16_sysmon.py --verbose
 ```
 
-(`pynvml` is optional — only needed for NVIDIA dGPU power-limit indication.)
+(`pynvml` enables the NVIDIA dGPU power-limit breathe; `pythonnet` + `--fetch-lhm`
+enable the in-process AMD APU power-limit breathe and temperature — see below.
+Both are optional; the core bars work without them.)
 
 Useful flags:
 
@@ -96,22 +99,33 @@ Useful flags:
 - `--cpu-power-cap 54` — APU sustained power ceiling (watts) for the CPU
   power-limit breathe; auto-calibrated (approximately) if unset
 - `--no-nvml` — disable NVIDIA dGPU power/throttle detection
+- `--fetch-lhm` — download LibreHardwareMonitorLib + its deps into `lib/` and exit
+- `--no-lhm-lib` — disable the in-process LibreHardwareMonitorLib APU source
 
-Temperature comes from one of (tried in this order):
+Temperature **and** the AMD APU power-limit breathe come from one of (tried in
+this order):
 
-- [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)
-  running with *Options → Remote Web Server / WMI provider* enabled —
-  **preferred**: it is read from the same cached sensor snapshot used for the
-  APU power-limit breathe (its CPU package-power sensor), so it costs no extra
-  work and never spawns a process,
+- **LibreHardwareMonitorLib in-process** (recommended) — `pip install pythonnet`,
+  then run `python host\fw16_sysmon.py --fetch-lhm` once to download the engine
+  DLLs into `lib/` (gitignored). The script then reads CPU package power, load
+  and temperature directly — no separate app and no WMI provider. It loads a
+  ring0 driver to read the CPU, so the script must run **elevated**; if Windows
+  *Core Isolation → Memory Integrity* is enabled it may block that driver (the
+  same limitation the LHM app hits). Disable with `--no-lhm-lib`. With
+  `--verbose`, a `limits …` line shows `cpu(pkg_w=… load=…)` so you can confirm
+  the sensors are feeding data.
+- the [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)
+  **app** running with its WMI provider enabled — fallback when the in-process
+  lib isn't set up; same CPU package-power sensor.
 - [framework_tool](https://github.com/FrameworkComputer/framework-system)
   on PATH (`winget install FrameworkComputer.framework_tool`) — throttled
-  fallback that reads the APU die temperature straight from the EC; needs the
-  script to run elevated. Also used (every 60 s) to read the battery max-charge
-  cap so the battery bar scales to the cap,
+  fallback for temperature only (APU die temperature from the EC; needs the
+  script elevated). Also used (every 60 s) to read the battery max-charge cap so
+  the battery bar scales to the cap.
 - a working ACPI thermal zone — last resort; the FW16 exposes zones that
   *look* valid but report frozen values (a constant ~63 °C), and reading them
-  needs admin rights anyway. The row stays dark if no source is available.
+  needs admin rights anyway. Temperature stays dark, and the APU power-limit
+  breathe is unavailable, if no source provides the data.
 
 ### Start at login (no service required)
 
