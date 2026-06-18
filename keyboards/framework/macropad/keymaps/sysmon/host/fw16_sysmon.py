@@ -3,16 +3,25 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Stream system stats to a Framework 16 RGB Macropad running the `sysmon` keymap.
 
-Sends one 32-byte packet per interval over the VIA raw HID endpoint, using a
-private VIA "custom value" channel the firmware listens on. LED brightness is
-derived from the laptop screen brightness so the macropad dims with the screen.
+Protocol v2: the host is the producer of *all* monitoring policy. The firmware
+is a generic render engine that draws six 4-segment bars from per-row 8-byte
+descriptors plus a globals block. Every threshold, color, cadence and mapping
+that used to live in the firmware now lives here as a tunable module-level
+constant. LED brightness is derived from the laptop screen brightness so the
+macropad dims with the screen.
+
+Each tick sends TWO 32-byte VIA "custom set value" raw-HID reports on a private
+VIA channel (0x42):
+    value_id 0x01 = FRAME A: rows 0,1,2
+    value_id 0x02 = FRAME B: rows 3,4,5 + globals
 
 Dependencies (Windows):
     pip install hidapi psutil wmi
 
 Temperature sources, tried in order:
-    1. Framework EC via framework_tool --thermal (APU die temperature)
-    2. LibreHardwareMonitor (if running with its WMI provider enabled)
+    1. LibreHardwareMonitor (preferred; comes free with the cached LHM snapshot
+       used for CPU power, so no subprocess and no per-tick stall)
+    2. Framework EC via framework_tool --thermal (throttled fallback)
     3. ACPI thermal zone (MSAcpi_ThermalZoneTemperature; static on the FW16,
        so only a last resort)
 
@@ -40,22 +49,207 @@ try:
 except ImportError:
     win32pdh = None
 
+try:
+    import pynvml  # nvidia-ml-py / pynvml; NVIDIA dGPU power & throttle reasons
+except ImportError:
+    pynvml = None
+
 VID = 0x32AC
 PID_MACROPAD = 0x0013
 RAW_USAGE_PAGE = 0xFF60  # QMK raw HID (VIA) interface
 RAW_USAGE = 0x61
 REPORT_LEN = 32
 
+# ---------------------------------------------------------------------------
+# FROZEN WIRE PROTOCOL v2 (sysmon) — both sides MUST match byte-for-byte.
+#
+# Transport: VIA "custom set value" raw-HID report on private channel 0x42.
+# Each report is 32 bytes. Host writes b"\x00" + 32-byte report (the leading
+# 0x00 is the HID report id; the firmware never sees it).
+#
+# Report header (every report):
+#   data[0] = 0x07   (VIA id_custom_set_value)
+#   data[1] = 0x42   (SYSMON_CHANNEL)
+#   data[2] = value_id
+#   data[3..] = payload
+#
+# Two FRAME reports per tick:
+#   value_id 0x01 = FRAME A : rows 0,1,2          (24-byte payload, 5 pad bytes)
+#   value_id 0x02 = FRAME B : rows 3,4,5 + globals (24-byte payload + globals)
+#
+# Per-row descriptor = EXACTLY 8 bytes:
+#   +0 level         uint8 0..255 fraction of the 4-segment bar (0=empty,255=full)
+#   +1 row_val       uint8 0..255 base row brightness (normally 255)
+#   +2 hue0          uint8 0..255 QMK hue: solid color, or gradient start
+#   +3 hue1          uint8 0..255 gradient end hue (ignored unless gradient bit)
+#   +4 flags         uint8 bit0    color_gradient: 0=solid hue0, 1=hue0->hue1
+#                          bits1-2 envelope_type: 0=none,1=blink,2=breathe
+#                          bits3-4 overlay_shape: 0=none,1=trap-rise,2=trap-fall,3=sine
+#                          bit5    overlay_dir: 0=boundary upward, 1=downward
+#                          bits6-7 reserved (0)
+#   +5 overlay_count uint8 0=overlay off; 1..4 = segments from the boundary
+#   +6 period        uint8 units of 32ms; period of this row's timed effect
+#   +7 floor         uint8 0..255 breathe trough / sine amplitude floor
+#
+# FRAME A payload (data[3..26]) = row0[8] ++ row1[8] ++ row2[8] (24 bytes;
+#   data[27..31] unused/zero).
+# FRAME B payload (data[3..26]) = row3[8] ++ row4[8] ++ row5[8] (24 bytes),
+#   then globals:
+#     data[27] = brightness uint8 0..255 (overall; drives GCC via the slew)
+#     data[28] = glide      uint8 units of 4ms   (default 300ms => 75)
+#     data[29] = timeout    uint8 units of 100ms (default 5000ms => 50)
+# ---------------------------------------------------------------------------
+
 VIA_CMD_CUSTOM_SET_VALUE = 0x07
 SYSMON_CHANNEL = 0x42
-SYSMON_VALUE_STATS = 0x01
+SYSMON_VALUE_FRAME_A = 0x01  # rows 0,1,2
+SYSMON_VALUE_FRAME_B = 0x02  # rows 3,4,5 + globals
 
-FLAG_AC_CONNECTED = 1 << 0
-FLAG_BATTERY = 1 << 1
-FLAG_DGPU = 1 << 2
-FLAG_TEMP = 1 << 3
-FLAG_CHARGING = 1 << 4
-FLAG_DISCHARGING = 1 << 5
+ROW_DESC_LEN = 8
+
+# Fixed row order (matches sysmon_row_leds; do NOT change).
+ROW_BATTERY = 0
+ROW_CPU = 1
+ROW_MEM = 2
+ROW_IGPU = 3
+ROW_DGPU = 4
+ROW_TEMP = 5
+
+# flags byte bit fields ------------------------------------------------------
+FLAG_GRADIENT = 1 << 0  # bit0
+
+ENV_NONE = 0
+ENV_BLINK = 1
+ENV_BREATHE = 2
+ENV_SHIFT = 1  # bits1-2
+
+OVL_NONE = 0
+OVL_TRAP_RISE = 1
+OVL_TRAP_FALL = 2
+OVL_SINE = 3
+OVL_SHIFT = 3  # bits3-4
+
+OVL_DIR_UP = 0
+OVL_DIR_DOWN = 1
+OVL_DIR_SHIFT = 5  # bit5
+
+# Globals defaults -----------------------------------------------------------
+GLIDE_MS_DEFAULT = 300         # per-row level glide on device
+TIMEOUT_MS_DEFAULT = 5000      # no-data fallback to stock RGB effect
+
+# Period encoding reference: every period byte is in units of 32ms, so the
+# values below are the pre-encoded byte values (e.g. 32 -> 1024ms full cycle).
+PERIOD_BLINK = 32          # ~1Hz full-cycle 1024ms (reproduces timer&512)
+PERIOD_BREATHE_FAST = 48   # ~1.5s, power/TDP-cap cadence
+PERIOD_BREATHE_SLOW = 128  # ~4s, power-source cadence
+PERIOD_PULSE = 128         # charge/discharge trapezoid, 4096ms
+PERIOD_SINE = 128          # drift sine tell, 4096ms
+
+# ---------------------------------------------------------------------------
+# Render policy constants (moved from firmware keymap.c)
+# ---------------------------------------------------------------------------
+
+# QMK hues (0-255)
+HUE_RED = 0
+HUE_AMBER = 28      # AC battery-assist discharge ("plugged but draining")
+HUE_GOLD = 36       # memory
+HUE_GREEN = 85      # full battery / dGPU
+HUE_TEMP_LO = 85    # temperature gradient start (green, cool)
+HUE_TEMP_HI = 0     # temperature gradient end (red, hot)
+HUE_CHARGE_FULL = 85  # charging hue at 100% (pct*85/100, red->green)
+
+# Brightness levels (base row_val)
+ROW_VAL_FULL = 255
+ROW_VAL_BATT_IDLE = 80   # AC-idle dim green; firmware lifts via visible_pwm
+
+# Battery policy
+BATT_CRITICAL_PCT = 15   # raw % below which a discharging battery blinks red
+ASSIST_MIN_W = 10        # battery-assist drain meaning a real power deficit;
+                         # below this on AC is just EC cap-drift housekeeping
+
+# Battery drift breathe tell (the faint AC cap-drift sine). The firmware's old
+# tell breathed 68..92 around the dim-80 fill; encode that as a sine overlay
+# whose floor is the trough. Floor maps onto the 0..row_val sine range.
+BATT_DRIFT_FLOOR = 68    # trough of the faint drift breathe (peak = row_val 80)
+
+# Memory / temperature critical blink thresholds (gated on RAW value)
+MEM_CRITICAL_PCT = 90
+TEMP_CRITICAL_C = 90
+
+# Temperature bar scaling: clamp(t,30,90) -> 0..255 level.
+TEMP_MIN_C = 30
+TEMP_MAX_C = 90
+
+# Breathe overlay floor for power-limited rows (~43% of 255: dim but readable).
+LIMIT_FLOOR = 110
+
+# Inference thresholds (all heuristic; tune as needed).
+CPU_LOAD_HIGH = 80      # % CPU load above which APU power limits are evaluated
+CPU_POWER_FLOOR_W = 15  # ignore APU power-cap inference below this package power
+NV_ACTIVE_MIN_W = 15    # dGPU draw above which it counts as actively loaded
+CEIL_NEAR = 0.95        # fraction of the (known/observed) ceiling read as "at it"
+
+# Charge/discharge overlay segment counts by power flow (watts).
+RATE_SEG_W1 = 20
+RATE_SEG_W2 = 45
+RATE_SEG_W3 = 75
+
+# Source cache TTLs (seconds). Most ticks reuse cached slow readings so the
+# ~0.4s loop stays light.
+TTL_BRIGHTNESS = 4.0
+TTL_BATTERY = 1.0
+TTL_CPU_POWER = 1.0
+TTL_TEMP = 2.0
+TTL_LHM_SNAPSHOT = 1.0   # one LHM enumeration feeding both temp and cpu power
+TTL_EC_THERMAL = 2.5     # throttled framework_tool --thermal fallback
+
+
+def clamp(value, lo, hi):
+    return max(lo, min(hi, int(round(value))))
+
+
+def clamp8(value):
+    return clamp(value, 0, 255)
+
+
+def pct_to_level(pct):
+    """Map a 0..100 metric percentage onto the firmware's 0..255 bar fraction.
+
+    The wire `level` byte is a full-scale 0..255 fraction of the 4-segment bar
+    (the firmware fills level*4 across the 0..1020 segment range), so a raw
+    0..100 percentage must be rescaled here or a "full" bar only fills ~40%.
+    """
+    return clamp(pct * 255 / 100, 0, 255)
+
+
+class Cached:
+    """Memoize a zero-arg callable for `ttl` seconds (time.monotonic based).
+
+    Keeps slow sources off the hot path: the first call after expiry fetches,
+    every call within the TTL returns the cached value. A fetch that raises is
+    not cached; the previous value (if any) is returned instead.
+    """
+
+    def __init__(self, fn, ttl):
+        self._fn = fn
+        self._ttl = ttl
+        self._value = None
+        self._expires = 0.0
+        self._primed = False
+
+    def __call__(self):
+        now = time.monotonic()
+        if self._primed and now < self._expires:
+            return self._value
+        try:
+            self._value = self._fn()
+        except Exception:
+            if self._primed:
+                return self._value
+            raise
+        self._primed = True
+        self._expires = now + self._ttl
+        return self._value
 
 
 def find_device_path():
@@ -152,13 +346,157 @@ class GpuMonitor:
         return min(100, igpu), min(100, dgpu), self.dgpu_present
 
 
+class NvGpuLimits:
+    """dGPU power & throttle state for NVIDIA cards via NVML.
+
+    NVIDIA exposes authoritative throttle reasons (no inference needed):
+    nvmlDeviceGetCurrentClocksThrottleReasons returns a bitmask, and the
+    enforced power limit drops on battery. Disables itself permanently if
+    pynvml is missing, NVML won't init, or there's no NVIDIA GPU.
+    """
+
+    def __init__(self, enabled=True):
+        self.available = False
+        self.handle = None
+        if not enabled:
+            return
+        if pynvml is None:
+            print("pynvml not installed; dGPU limit detection disabled",
+                  file=sys.stderr)
+            return
+        try:
+            pynvml.nvmlInit()
+            if pynvml.nvmlDeviceGetCount() < 1:
+                return
+            self.handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            # constant names were renamed Throttle -> Event across versions
+            self._sw_power = getattr(
+                pynvml, "nvmlClocksThrottleReasonSwPowerCap",
+                getattr(pynvml, "nvmlClocksEventReasonSwPowerCap", 0))
+            self._hw_brake = getattr(
+                pynvml, "nvmlClocksThrottleReasonHwPowerBrakeSlowdown",
+                getattr(pynvml, "nvmlClocksEventReasonHwPowerBrakeSlowdown", 0))
+            self._reasons_fn = (
+                getattr(pynvml, "nvmlDeviceGetCurrentClocksThrottleReasons", None)
+                or getattr(pynvml, "nvmlDeviceGetCurrentClocksEventReasons", None))
+            self.available = self._reasons_fn is not None
+        except Exception as err:
+            print(f"NVML init failed; dGPU limit detection disabled: {err}",
+                  file=sys.stderr)
+            self.available = False
+
+    def evaluate(self, on_ac, weak_charger):
+        """Return (power_limited, psrc_limited) for the dGPU.
+
+        Only the weak-charger (battery-assisting-on-AC) case is surfaced as a
+        power-source limit; plain battery operation is left to the battery row.
+        """
+        if not self.available:
+            return False, False
+        try:
+            reasons = self._reasons_fn(self.handle)
+            draw = pynvml.nvmlDeviceGetPowerUsage(self.handle) / 1000.0
+            enforced = pynvml.nvmlDeviceGetEnforcedPowerLimit(self.handle) / 1000.0
+            try:
+                default = pynvml.nvmlDeviceGetPowerManagementDefaultLimit(
+                    self.handle) / 1000.0
+            except Exception:
+                default = enforced
+        except Exception:
+            return False, False
+
+        sw_cap = bool(reasons & self._sw_power)
+        hw_brake = bool(reasons & self._hw_brake)
+        capped_below_stock = default > 0 and enforced < 0.9 * default
+        if weak_charger:
+            # supply-bound: a loaded GPU capped while the charger can't keep up
+            active = draw >= NV_ACTIVE_MIN_W
+            return False, active and (sw_cap or hw_brake or capped_below_stock)
+        if on_ac:
+            # chip-bound: the driver/board is actively capping power on AC
+            return (sw_cap or hw_brake), False
+        # plain battery: not surfaced here (the battery row covers it)
+        return False, False
+
+
+class ApuLimits:
+    """Infer APU (CPU+iGPU) power state from LibreHardwareMonitor.
+
+    AMD exposes no throttle flags, so "at the power cap" is inferred: under
+    sustained high load the package power plateaus at the chip's sustained
+    PPT. The ceiling is taken from an explicit cap when given, otherwise
+    auto-calibrated as the highest package power seen on AC (approximate; the
+    explicit cap is the reliable path). Fails safe -- asserts nothing when the
+    reading is missing or the chip clearly isn't being pushed.
+    """
+
+    def __init__(self, cap_watts=None):
+        self.cap = cap_watts
+        self.ceiling = 0.0
+        self.prev = 0.0
+
+    def evaluate(self, reading, on_ac, weak_charger):
+        """Return (power_limited, psrc_limited) for the APU.
+
+        reading is (package_watts, load_pct) from LHM, or None. Only the
+        weak-charger (battery-assisting-on-AC) case is surfaced as a
+        power-source limit; plain battery operation is left to the battery row.
+        """
+        if reading is None:
+            return False, False
+        pkg_w, load = reading
+        if load is None or load < CPU_LOAD_HIGH:
+            self.prev = pkg_w or 0.0
+            return False, False
+        if weak_charger:
+            self.prev = pkg_w or 0.0
+            return False, True
+        if not on_ac:
+            # plain battery: not surfaced here (the battery row covers it)
+            self.prev = pkg_w or 0.0
+            return False, False
+        # on AC under high load: power-capped if package power has plateaued
+        # at (near) the ceiling rather than still climbing toward it
+        if pkg_w is None or pkg_w < CPU_POWER_FLOOR_W:
+            self.prev = pkg_w or 0.0
+            return False, False
+        prev_ceiling = self.cap if self.cap else self.ceiling
+        self.ceiling = max(self.ceiling, pkg_w)
+        climbing = pkg_w > self.prev + 1.0
+        self.prev = pkg_w
+        power = prev_ceiling > 0 and not climbing and pkg_w >= CEIL_NEAR * prev_ceiling
+        return power, False
+
+
+def run_framework_tool(*tool_args):
+    """Run framework_tool and return its stdout, or None on transient failure.
+
+    Raises FileNotFoundError if the tool is not installed, so callers can
+    disable themselves permanently.
+    """
+    try:
+        # stdin must be DEVNULL: under CREATE_NO_WINDOW framework_tool
+        # sees a fresh console and waits for ENTER before exiting
+        return subprocess.run(
+            ["framework_tool", *tool_args],
+            capture_output=True, text=True, timeout=2,
+            stdin=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW).stdout
+    except (subprocess.TimeoutExpired, OSError) as err:
+        if isinstance(err, FileNotFoundError):
+            raise
+        return None
+
+
 class EcThermal:
     """CPU temperature from the Framework EC via framework_tool.
 
-    The EC reports live die temperatures; the FW16's ACPI thermal zones
-    return frozen values, so this is the only trustworthy source without
-    LibreHardwareMonitor running. Needs framework_tool on PATH and an
-    elevated process for the EC driver.
+    Fallback source: used only when LibreHardwareMonitor's temperature is
+    unavailable. The EC reports live die temperatures; the FW16's ACPI thermal
+    zones return frozen values. Needs framework_tool on PATH and an elevated
+    process for the EC driver. Each call spawns a subprocess, so it is wrapped
+    in a TTL cache by the caller; this class additionally holds the last good
+    reading across transient failures.
     """
 
     _LINE_RE = re.compile(r"^\s*(?P<name>[^:]+?):\s+(?P<val>-?\d+)\s*C\s*$")
@@ -172,22 +510,13 @@ class EcThermal:
         """Return temperature in degrees C, or None if unavailable."""
         if not self.available:
             return None
-        out = None
         try:
-            # stdin must be DEVNULL: under CREATE_NO_WINDOW framework_tool
-            # sees a fresh console and waits for ENTER before exiting
-            out = subprocess.run(
-                ["framework_tool", "--thermal"],
-                capture_output=True, text=True, timeout=2,
-                stdin=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW).stdout
+            out = run_framework_tool("--thermal")
         except FileNotFoundError:
             print("framework_tool not found; EC temperature disabled",
                   file=sys.stderr)
             self.available = False
             return None
-        except (subprocess.TimeoutExpired, OSError):
-            pass
         if out is not None:
             temps = {}
             for line in out.splitlines():
@@ -206,8 +535,48 @@ class EcThermal:
         return None
 
 
+class EcChargeLimit:
+    """Battery max-charge cap from the Framework EC via framework_tool.
+
+    `framework_tool --charge-limit` prints "Minimum N%, Maximum N%". The cap
+    rarely changes, so it is re-read every _REFRESH_SECS rather than every
+    packet (each read spawns a process). Defaults to 100 (uncapped) when
+    unreadable, e.g. when the tool is missing or the process isn't elevated.
+    """
+
+    _MAX_RE = re.compile(r"Maximum\s+(\d+)\s*%")
+    _REFRESH_SECS = 60
+
+    def __init__(self):
+        self.available = True
+        self._cap = 100
+        self._next_read = 0.0
+
+    def cap(self):
+        """Return the max charge percentage, 1-100."""
+        if not self.available or time.monotonic() < self._next_read:
+            return self._cap
+        self._next_read = time.monotonic() + self._REFRESH_SECS
+        try:
+            out = run_framework_tool("--charge-limit")
+        except FileNotFoundError:
+            print("framework_tool not found; charge cap assumed 100%",
+                  file=sys.stderr)
+            self.available = False
+            return self._cap
+        m = self._MAX_RE.search(out or "")
+        if m and 0 < int(m.group(1)) <= 100:
+            self._cap = int(m.group(1))
+        return self._cap
+
+
 class WmiSources:
-    """Lazily connected WMI namespaces; every query degrades gracefully."""
+    """Lazily connected WMI namespaces; every query degrades gracefully.
+
+    The two LibreHardwareMonitor enumerations (temperature + CPU power) are
+    collapsed into a single `lhm_snapshot()` walk so a tick touches the WMI
+    provider once, not twice.
+    """
 
     def __init__(self):
         self._wmi_ns = None
@@ -226,36 +595,70 @@ class WmiSources:
                 return None
         return getattr(self, attr)
 
-    def temperature(self):
-        """Return temperature in degrees C, or None if unavailable."""
+    def lhm_snapshot(self):
+        """One LibreHardwareMonitor walk -> (temp_c, cpu_pkg_w, cpu_load_pct).
+
+        Any field may be None if that sensor is absent or LHM is unavailable.
+        This replaces the two separate Sensor() enumerations that previously
+        backed temperature() and cpu_power_state(): a single pass extracts the
+        CPU temperature, CPU package power and total CPU load together. Wrapped
+        in a TTL cache by the caller so it runs at most once per snapshot
+        interval regardless of how many consumers read it.
+        """
         lhm = self._connect("_lhm", "root\\LibreHardwareMonitor")
-        if lhm is not None:
-            try:
-                sensors = [s for s in lhm.Sensor() if s.SensorType == "Temperature"]
-                if sensors:
-                    preferred = [s for s in sensors
-                                 if s.Name in ("CPU Package", "Core (Tctl/Tdie)", "Tctl")]
-                    pick = preferred or sensors
-                    return max(s.Value for s in pick)
-            except Exception:
-                pass
+        if lhm is None:
+            return None, None, None
+        try:
+            sensors = lhm.Sensor()
+        except Exception:
+            return None, None, None
+
+        temps = []          # CPU/general temperature sensors (Value, is_preferred)
+        pkg_w = None
+        load = None
+        for s in sensors:
+            stype = s.SensorType
+            name = s.Name or ""
+            parent = (s.Parent or "").lower()
+            if stype == "Temperature":
+                preferred = name in ("CPU Package", "Core (Tctl/Tdie)", "Tctl")
+                try:
+                    temps.append((float(s.Value), preferred))
+                except (TypeError, ValueError):
+                    pass
+            elif "cpu" in parent and stype == "Power" and "package" in name.lower():
+                pkg_w = s.Value
+            elif "cpu" in parent and stype == "Load" and name == "CPU Total":
+                load = s.Value
+
+        temp_c = None
+        if temps:
+            preferred = [v for v, p in temps if p]
+            temp_c = max(preferred) if preferred else max(v for v, _ in temps)
+        return temp_c, pkg_w, load
+
+    def acpi_temperature(self):
+        """Last-resort ACPI thermal-zone temperature (static on the FW16)."""
         ns = self._connect("_wmi_ns", "root\\wmi")
-        if ns is not None:
-            try:
-                zones = ns.MSAcpi_ThermalZoneTemperature()
-                if zones:
-                    # value is tenths of Kelvin
-                    return max(z.CurrentTemperature for z in zones) / 10.0 - 273.15
-            except Exception:
-                pass
+        if ns is None:
+            return None
+        try:
+            zones = ns.MSAcpi_ThermalZoneTemperature()
+            if zones:
+                # value is tenths of Kelvin
+                return max(z.CurrentTemperature for z in zones) / 10.0 - 273.15
+        except Exception:
+            pass
         return None
 
     def battery_state(self):
-        """Return (charging, discharging) booleans, or None if unavailable.
+        """Return (charging, discharging, rate_watts), or None if unavailable.
 
-        Both False means the battery is idle — typically plugged in and held
-        at a charge cap. The ACPI BatteryStatus class reports this directly,
-        unlike psutil which only sees plugged/unplugged.
+        Both booleans False means the battery is idle — typically plugged in
+        and held at a charge cap. rate_watts is the active charge or
+        discharge power (ACPI reports it in mW). The BatteryStatus class
+        gives all of this directly, unlike psutil which only sees
+        plugged/unplugged.
         """
         ns = self._connect("_wmi_ns", "root\\wmi")
         if ns is None:
@@ -263,11 +666,13 @@ class WmiSources:
         try:
             statuses = ns.BatteryStatus()
             if statuses:
-                charging = any(bool(s.Charging) or (s.ChargeRate or 0) > 0
-                               for s in statuses)
-                discharging = any(bool(s.Discharging) or (s.DischargeRate or 0) > 0
-                                  for s in statuses)
-                return charging, discharging
+                charge_mw = sum(s.ChargeRate or 0 for s in statuses)
+                discharge_mw = sum(s.DischargeRate or 0 for s in statuses)
+                charging = any(bool(s.Charging) for s in statuses) or charge_mw > 0
+                discharging = (any(bool(s.Discharging) for s in statuses)
+                               or discharge_mw > 0)
+                rate_mw = discharge_mw if discharging else charge_mw
+                return charging, discharging, clamp(rate_mw / 1000, 0, 255)
         except Exception:
             pass
         return None
@@ -286,79 +691,340 @@ class WmiSources:
         return None
 
 
-def clamp(value, lo, hi):
-    return max(lo, min(hi, int(round(value))))
+# ---------------------------------------------------------------------------
+# Descriptor builder + per-row render policy
+# ---------------------------------------------------------------------------
+
+class RowDesc:
+    """An 8-byte per-row descriptor matching the frozen wire layout.
+
+    Fields default to "off" / "no effect"; the row policy functions set only
+    what they need. pack() emits the bytes in the documented order.
+    """
+
+    def __init__(self, level=0, row_val=ROW_VAL_FULL, hue0=0, hue1=0,
+                 gradient=False, envelope=ENV_NONE,
+                 overlay_shape=OVL_NONE, overlay_dir=OVL_DIR_UP,
+                 overlay_count=0, period=0, floor=0):
+        self.level = level
+        self.row_val = row_val
+        self.hue0 = hue0
+        self.hue1 = hue1
+        self.gradient = gradient
+        self.envelope = envelope
+        self.overlay_shape = overlay_shape
+        self.overlay_dir = overlay_dir
+        self.overlay_count = overlay_count
+        self.period = period
+        self.floor = floor
+
+    def flags_byte(self):
+        f = 0
+        if self.gradient:
+            f |= FLAG_GRADIENT
+        f |= (self.envelope & 0x3) << ENV_SHIFT
+        f |= (self.overlay_shape & 0x3) << OVL_SHIFT
+        f |= (self.overlay_dir & 0x1) << OVL_DIR_SHIFT
+        return f & 0xFF
+
+    def pack(self):
+        return bytes((
+            clamp8(self.level),
+            clamp8(self.row_val),
+            clamp8(self.hue0),
+            clamp8(self.hue1),
+            self.flags_byte(),
+            clamp8(self.overlay_count),
+            clamp8(self.period),
+            clamp8(self.floor),
+        ))
+
+    def __repr__(self):
+        env = {ENV_NONE: "none", ENV_BLINK: "blink", ENV_BREATHE: "breathe"}[self.envelope]
+        ovl = {OVL_NONE: "none", OVL_TRAP_RISE: "rise",
+               OVL_TRAP_FALL: "fall", OVL_SINE: "sine"}[self.overlay_shape]
+        grad = f" grad->{self.hue1}" if self.gradient else ""
+        ovls = "" if self.overlay_shape == OVL_NONE else (
+            f" ovl={ovl}x{self.overlay_count}"
+            f"{'down' if self.overlay_dir else 'up'}")
+        envs = "" if self.envelope == ENV_NONE else f" env={env}@{self.period}"
+        flr = f" floor={self.floor}" if (self.envelope == ENV_BREATHE
+                                         or self.overlay_shape == OVL_SINE) else ""
+        return (f"lvl={self.level} val={self.row_val} hue={self.hue0}{grad}"
+                f"{envs}{ovls}{flr}")
 
 
-def build_packet(stats):
-    data = bytearray(REPORT_LEN)
-    data[0] = VIA_CMD_CUSTOM_SET_VALUE
-    data[1] = SYSMON_CHANNEL
-    data[2] = SYSMON_VALUE_STATS
-    data[3] = stats["flags"]
-    data[4] = stats["battery"]
-    data[5] = stats["cpu"]
-    data[6] = stats["mem"]
-    data[7] = stats["igpu"]
-    data[8] = stats["dgpu"]
-    data[9] = stats["temp"]
-    data[10] = stats["brightness"]
-    return bytes(data)
+def rate_segments(rate_w):
+    """Overlay segment count from charge/discharge power: 1 + (>=20)+(>=45)+(>=75)."""
+    return 1 + (rate_w >= RATE_SEG_W1) + (rate_w >= RATE_SEG_W2) + (rate_w >= RATE_SEG_W3)
 
 
-def gather(sources, gpu, ec, args):
-    flags = 0
+def breathe_period(psrc):
+    """Breathe cadence: psrc wins (slow ~4s), else power-cap (fast ~1.5s).
 
-    battery = 0
+    Only psrc decides the cadence: when both power and psrc are set, psrc wins
+    (the supply is the bigger story), mirroring the old firmware behaviour.
+    """
+    return PERIOD_BREATHE_SLOW if psrc else PERIOD_BREATHE_FAST
+
+
+def build_battery_row(m):
+    """row0: battery level + charge/discharge/idle/critical effects.
+
+    m carries: has_batt, ac, charging, discharging, raw_pct, cap, rate_w.
+    """
+    if not m["has_batt"]:
+        return RowDesc(level=0)
+
+    ac = m["ac"]
+    charging = m["charging"]
+    discharging = m["discharging"]
+    raw_pct = m["raw_pct"]
+    rate_w = m["rate_w"]
+
+    # Unplugged always drains.
+    if not ac and not charging:
+        discharging = True
+
+    # Cap rescale FIRST: charged-to-cap reads as a full (green) bar.
+    cap = m["cap"]
+    if cap <= 0 or cap > 100:
+        cap = 100
+    pct = min(100, raw_pct * 100 // cap)
+
+    # Drift fold: on AC, a sub-ASSIST_MIN_W drain is the EC holding the cap,
+    # not a real discharge. Treat it as idle; remember it for the faint tell.
+    drift = ac and discharging and rate_w < ASSIST_MIN_W
+    if drift:
+        discharging = False
+
+    # Critical (gated on RAW %, not rescaled): full red row blinking ~1Hz.
+    if discharging and raw_pct < BATT_CRITICAL_PCT:
+        return RowDesc(level=255, row_val=ROW_VAL_FULL, hue0=HUE_RED,
+                       envelope=ENV_BLINK, period=PERIOD_BLINK)
+
+    if charging:
+        # red->green by charge level; trap-rise overlay grows from the boundary
+        # upward, more segments the faster the charge.
+        hue = raw_pct_to_charge_hue(pct)
+        return RowDesc(level=pct_to_level(pct), row_val=ROW_VAL_FULL, hue0=hue,
+                       overlay_shape=OVL_TRAP_RISE, overlay_dir=OVL_DIR_UP,
+                       overlay_count=rate_segments(rate_w), period=PERIOD_PULSE)
+
+    if discharging:
+        # Real discharge: unplugged (red) or AC battery-assist (amber).
+        # trap-fall overlay drains from the boundary downward.
+        hue = HUE_AMBER if ac else HUE_RED
+        return RowDesc(level=pct_to_level(pct), row_val=ROW_VAL_FULL, hue0=hue,
+                       overlay_shape=OVL_TRAP_FALL, overlay_dir=OVL_DIR_DOWN,
+                       overlay_count=rate_segments(rate_w), period=PERIOD_PULSE)
+
+    # AC idle / held at cap: whole row steady dim green. If this is drift, add
+    # a faint sine overlay on the boundary segment (the cap-drift tell).
+    desc = RowDesc(level=255, row_val=ROW_VAL_BATT_IDLE, hue0=HUE_GREEN)
+    if drift:
+        desc.overlay_shape = OVL_SINE
+        desc.overlay_dir = OVL_DIR_UP
+        desc.overlay_count = 1
+        desc.period = PERIOD_SINE
+        desc.floor = BATT_DRIFT_FLOOR
+    return desc
+
+
+def raw_pct_to_charge_hue(pct):
+    """Charging hue: red (0) at empty -> green (85) at full."""
+    return clamp(pct * HUE_CHARGE_FULL // 100, 0, HUE_CHARGE_FULL)
+
+
+def build_cpu_row(m):
+    """row1: CPU usage, solid red; breathe when APU power-limited."""
+    desc = RowDesc(level=pct_to_level(m["cpu"]), hue0=HUE_RED)
+    if m["cpu_power"] or m["cpu_psrc"]:
+        desc.envelope = ENV_BREATHE
+        desc.floor = LIMIT_FLOOR
+        desc.period = breathe_period(m["cpu_psrc"])
+    return desc
+
+
+def build_mem_row(m):
+    """row2: memory usage, solid gold; blink when RAW mem >= 90."""
+    desc = RowDesc(level=pct_to_level(m["mem"]), hue0=HUE_GOLD)
+    if m["raw_mem"] >= MEM_CRITICAL_PCT:
+        desc.envelope = ENV_BLINK
+        desc.period = PERIOD_BLINK
+    return desc
+
+
+def build_igpu_row(m):
+    """row3: iGPU usage, solid red; no envelope/overlay."""
+    return RowDesc(level=pct_to_level(m["igpu"]), hue0=HUE_RED)
+
+
+def build_dgpu_row(m):
+    """row4: dGPU usage, solid green; breathe when dGPU power-limited."""
+    if not m["dgpu_present"]:
+        return RowDesc(level=0)
+    desc = RowDesc(level=pct_to_level(m["dgpu"]), hue0=HUE_GREEN)
+    if m["dgpu_power"] or m["dgpu_psrc"]:
+        desc.envelope = ENV_BREATHE
+        desc.floor = LIMIT_FLOOR
+        desc.period = breathe_period(m["dgpu_psrc"])
+    return desc
+
+
+def build_temp_row(m):
+    """row5: temperature bar, green->red gradient; blink when RAW temp > 90."""
+    if not m["has_temp"]:
+        return RowDesc(level=0)
+    t = m["temp_c"]
+    tc = max(TEMP_MIN_C, min(TEMP_MAX_C, t))
+    level = clamp((tc - TEMP_MIN_C) * 255 // (TEMP_MAX_C - TEMP_MIN_C), 0, 255)
+    desc = RowDesc(level=level, hue0=HUE_TEMP_LO, hue1=HUE_TEMP_HI, gradient=True)
+    if m["raw_temp"] > TEMP_CRITICAL_C:
+        # bar still shows its level, but the whole row blinks as an alert
+        desc.envelope = ENV_BLINK
+        desc.period = PERIOD_BLINK
+    return desc
+
+
+ROW_BUILDERS = [
+    build_battery_row,   # 0
+    build_cpu_row,       # 1
+    build_mem_row,       # 2
+    build_igpu_row,      # 3
+    build_dgpu_row,      # 4
+    build_temp_row,      # 5
+]
+
+
+def build_frame(rows, brightness, glide_ms=GLIDE_MS_DEFAULT,
+                timeout_ms=TIMEOUT_MS_DEFAULT):
+    """Build the two 32-byte reports for one tick.
+
+    rows is the list of six RowDesc objects in fixed row order. Returns
+    [frame_a, frame_b]; the caller writes each as b"\\x00" + report.
+    """
+    assert len(rows) == 6
+
+    frame_a = bytearray(REPORT_LEN)
+    frame_a[0] = VIA_CMD_CUSTOM_SET_VALUE
+    frame_a[1] = SYSMON_CHANNEL
+    frame_a[2] = SYSMON_VALUE_FRAME_A
+    off = 3
+    for r in rows[0:3]:
+        frame_a[off:off + ROW_DESC_LEN] = r.pack()
+        off += ROW_DESC_LEN
+    # data[27..31] unused/zero (already zero)
+
+    frame_b = bytearray(REPORT_LEN)
+    frame_b[0] = VIA_CMD_CUSTOM_SET_VALUE
+    frame_b[1] = SYSMON_CHANNEL
+    frame_b[2] = SYSMON_VALUE_FRAME_B
+    off = 3
+    for r in rows[3:6]:
+        frame_b[off:off + ROW_DESC_LEN] = r.pack()
+        off += ROW_DESC_LEN
+    # globals
+    frame_b[27] = clamp8(brightness)
+    frame_b[28] = clamp(glide_ms / 4, 0, 255)      # 4ms units
+    frame_b[29] = clamp(timeout_ms / 100, 0, 255)  # 100ms units
+
+    return [bytes(frame_a), bytes(frame_b)]
+
+
+def gather(sources, gpu, charge_limit, apu, nv, args, cache):
+    """Collect metrics and turn them into six row descriptors + globals.
+
+    cache is the dict of Cached wrappers around the slow sources.
+    """
+    flags_ac = charging = discharging = has_batt = False
+    raw_pct = 0
+    batt_rate = 0
+    batt_cap = 100
     batt = psutil.sensors_battery()
     if batt is not None:
-        flags |= FLAG_BATTERY
-        battery = clamp(batt.percent, 0, 100)
-        if batt.power_plugged:
-            flags |= FLAG_AC_CONNECTED
-        state = sources.battery_state()
+        has_batt = True
+        raw_pct = clamp(batt.percent, 0, 100)
+        batt_cap = charge_limit.cap()
+        flags_ac = bool(batt.power_plugged)
+        state = cache["battery"]()
         if state is None:
-            # crude fallback: can't tell "charging" from "held at a cap"
-            state = (batt.power_plugged and battery < 100, not batt.power_plugged)
-        if state[0]:
-            flags |= FLAG_CHARGING
-        if state[1]:
-            flags |= FLAG_DISCHARGING
+            # crude fallback: can't tell "charging" from "held at a cap",
+            # and the rate is unknown (0 = minimal animation on the pad)
+            state = (batt.power_plugged and raw_pct < 100,
+                     not batt.power_plugged, 0)
+        charging = bool(state[0])
+        discharging = bool(state[1])
+        batt_rate = state[2]
 
     cpu = clamp(psutil.cpu_percent(interval=None), 0, 100)
-    mem = clamp(psutil.virtual_memory().percent, 0, 100)
+    raw_mem = psutil.virtual_memory().percent
+    mem = clamp(raw_mem, 0, 100)
 
     igpu, dgpu, dgpu_present = gpu.read()
-    if dgpu_present:
-        flags |= FLAG_DGPU
 
-    temp = ec.temperature()
-    if temp is None:
-        temp = sources.temperature()
-    if temp is not None:
-        flags |= FLAG_TEMP
-        temp = clamp(temp, 0, 254)
-    else:
-        temp = 0
+    # One LHM snapshot feeds both temperature and CPU power this tick.
+    lhm_temp, cpu_pkg_w, cpu_load = cache["lhm"]()
 
-    brightness_pct = sources.screen_brightness()
+    # Temperature: prefer LHM (free, from the snapshot); fall back to the
+    # throttled EC framework_tool, then static ACPI as a last resort.
+    temp_c = lhm_temp
+    if temp_c is None:
+        temp_c = cache["ec_temp"]()
+    if temp_c is None:
+        temp_c = sources.acpi_temperature()
+    has_temp = temp_c is not None
+    raw_temp = temp_c if has_temp else 0
+
+    # Brightness -> LED global current value (host-side gamma).
+    brightness_pct = cache["brightness"]()
     if brightness_pct is None:
         brightness_pct = args.fallback_brightness
-    # gamma bends the curve between the pinned min/max endpoints; screens use
-    # perceptual brightness steps, so a linear map runs too bright mid-range
     frac = (brightness_pct / 100.0) ** args.led_gamma
     led_val = clamp(
         args.min_led + (args.max_led - args.min_led) * frac,
         args.min_led, args.max_led)
 
+    # Weak / overloaded charger: battery assisting on AC (a genuine deficit,
+    # not the sub-ASSIST_MIN_W cap drift). The only power-source state surfaced
+    # on the component rows; it now selects a breathe cadence, not a flag.
+    on_ac = flags_ac
+    weak_charger = on_ac and discharging and batt_rate >= ASSIST_MIN_W
+
+    cpu_power, cpu_psrc = apu.evaluate(
+        (cpu_pkg_w, cpu_load) if (cpu_pkg_w is not None or cpu_load is not None)
+        else None, on_ac, weak_charger)
+    dgpu_power, dgpu_psrc = nv.evaluate(on_ac, weak_charger)
+    if not dgpu_present:
+        dgpu_power = dgpu_psrc = False
+
     return {
-        "flags": flags,
-        "battery": battery,
+        "has_batt": has_batt,
+        "ac": flags_ac,
+        "charging": charging,
+        "discharging": discharging,
+        "raw_pct": raw_pct,
+        "cap": batt_cap,
+        "rate_w": batt_rate,
+
         "cpu": cpu,
+        "cpu_power": cpu_power,
+        "cpu_psrc": cpu_psrc,
+
+        "raw_mem": raw_mem,
         "mem": mem,
+
         "igpu": clamp(igpu, 0, 100),
+
         "dgpu": clamp(dgpu, 0, 100),
-        "temp": temp,
+        "dgpu_present": dgpu_present,
+        "dgpu_power": dgpu_power,
+        "dgpu_psrc": dgpu_psrc,
+
+        "has_temp": has_temp,
+        "temp_c": clamp(raw_temp, 0, 254) if has_temp else 0,
+        "raw_temp": raw_temp,
+
         "brightness": led_val,
     }
 
@@ -381,8 +1047,14 @@ def main():
                         help="regex matching the iGPU adapter name")
     parser.add_argument("--dgpu-match", default=r"NVIDIA|GeForce|RTX|GTX|Radeon RX",
                         help="regex matching the dGPU adapter name")
+    parser.add_argument("--cpu-power-cap", type=float, default=None,
+                        help="APU sustained power ceiling in watts for "
+                             "power-limit detection; auto-calibrated (approx) "
+                             "if unset")
+    parser.add_argument("--no-nvml", action="store_true",
+                        help="disable NVIDIA dGPU power/throttle detection")
     parser.add_argument("--verbose", action="store_true",
-                        help="print each packet's values")
+                        help="print each tick's per-row descriptors")
     parser.add_argument("--bootloader", action="store_true",
                         help="reboot the macropad into its UF2 bootloader "
                              "(RPI-RP2 drive) and exit")
@@ -403,7 +1075,20 @@ def main():
 
     sources = WmiSources()
     ec = EcThermal()
+    charge_limit = EcChargeLimit()
     gpu = GpuMonitor(args.igpu_match, args.dgpu_match)
+    apu = ApuLimits(cap_watts=args.cpu_power_cap)
+    nv = NvGpuLimits(enabled=not args.no_nvml)
+
+    # Slow sources behind TTL caches so most ~0.4s ticks stay light. The LHM
+    # snapshot is shared between temperature and CPU power (one enumeration).
+    cache = {
+        "brightness": Cached(sources.screen_brightness, TTL_BRIGHTNESS),
+        "battery": Cached(sources.battery_state, TTL_BATTERY),
+        "lhm": Cached(sources.lhm_snapshot, TTL_LHM_SNAPSHOT),
+        "ec_temp": Cached(ec.temperature, TTL_EC_THERMAL),
+    }
+
     if args.verbose:
         for luid, name in gpu.luid_names.items():
             kind = "dGPU" if gpu.dgpu_re.search(name) else \
@@ -421,10 +1106,15 @@ def main():
                     continue
                 print("Connected to macropad")
 
-            stats = gather(sources, gpu, ec, args)
+            m = gather(sources, gpu, charge_limit, apu, nv, args, cache)
+            rows = [ROW_BUILDERS[i](m) for i in range(6)]
             if args.verbose:
-                print(stats)
-            dev.write(b"\x00" + build_packet(stats))
+                names = ["batt", "cpu", "mem", "igpu", "dgpu", "temp"]
+                print(f"bright={m['brightness']}")
+                for name, r in zip(names, rows):
+                    print(f"  {name:5s} {r!r}")
+            for rep in build_frame(rows, m["brightness"]):
+                dev.write(b"\x00" + rep)
             # drain the VIA echo so the report buffer doesn't fill up
             while dev.read(REPORT_LEN):
                 pass
