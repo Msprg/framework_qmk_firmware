@@ -6,12 +6,43 @@ normally — the stats ride on a private custom-value channel, `0x42`):
 
 | Row | Indicator | Colors |
 |-----|-----------|--------|
-| 1 (top, small keys) | Battery | charging: level bar (red→green by level) with a pulse on the filling segment; discharging: red bar with a draining pulse, blinks below 15%; idle at the charge cap: whole row steady dim green |
-| 2 | CPU usage | red bar |
-| 3 | Memory usage | gold bar |
+| 1 (top, small keys) | Battery | charging: level bar (red→green by level), segments from the filling one upward pulse in sync; discharging: level bar (red unplugged, amber when the battery is assisting an overloaded charger on AC), segments from the boundary downward flare and fade in sync, blinks below 15%; the charge/discharge power decides how many segments animate (1 segment for a trickle up to all 4 at ≥75 W); idle on AC: whole row steady dim green — a sub-10 W cap-drift drain counts as idle, with the boundary segment breathing faintly as a tell; the bar is rescaled against the max-charge cap, so charged-to-cap shows completely full |
+| 2 | CPU usage | red bar; breathes when the APU is power-limited (see below) |
+| 3 | Memory usage | gold bar; whole row blinks at ~1 Hz when usage is critically high (≥90%) |
 | 4 | iGPU usage | red bar |
-| 5 | dGPU usage | green bar (dark if no dGPU) |
-| 6 | System temperature | fixed green→deep-red gradient across the row; bar length scales 30–85 °C |
+| 5 | dGPU usage | green bar (dark if no dGPU); breathes when the dGPU is power-limited (see below) |
+| 6 | System temperature | fixed green→deep-red gradient across the row; bar length scales 30–90 °C; whole row blinks at ~1 Hz above 90 °C |
+
+## Power-limit indication
+
+The CPU (row 2, whole APU) and dGPU (row 5) rows **breathe** when the component
+is running at reduced capacity because of a *power* limit. The bar stays
+visible (it dips to a dim floor, not off — that's reserved for the critical
+blinks), and the cadence says which kind of limit:
+
+- **Brisk breathe (~1.5 s)** — the chip is at its own power/TDP ceiling on AC
+  (chip-bound).
+- **Slow breathe (~4 s)** — the *power source* is the bottleneck: the battery
+  is assisting an overloaded/undersized charger on AC, so a loaded component is
+  being throttled to fit. This pairs with the battery row turning **amber** in
+  the same situation (the battery row says the charger is overloaded; the
+  component breathe says which component it's choking). Plain battery operation
+  is *not* shown here — the battery row's discharging colour already conveys it.
+
+Thermal throttling is intentionally not shown here — the temperature row's
+>90 °C blink already covers it.
+
+Detection sources (per component, degrades gracefully if absent):
+
+- **dGPU** — NVIDIA only, via **NVML** (`pip install pynvml`): authoritative
+  throttle reasons (`SwPowerCap`, `HwPowerBrakeSlowdown`) plus the enforced
+  power limit. No NVIDIA card / no pynvml → no dGPU limit indication.
+- **APU (CPU/iGPU)** — AMD exposes no throttle flags, so this is *inferred*
+  from **LibreHardwareMonitor** package power + CPU load: a power cap is
+  flagged when, under sustained high load on AC, package power plateaus at the
+  ceiling. The ceiling auto-calibrates (approximate); pass `--cpu-power-cap
+  <watts>` for a deterministic threshold. Needs LHM running (see below); with
+  no LHM the CPU row never breathes.
 
 LED brightness follows the laptop screen brightness (scaled, capped well
 below full brightness). If no stats arrive for 5 seconds (script stopped,
@@ -48,9 +79,11 @@ USB drive that appears.
 ## Host script (Windows)
 
 ```powershell
-pip install hidapi psutil wmi
+pip install hidapi psutil wmi pynvml
 python host\fw16_sysmon.py --verbose
 ```
+
+(`pynvml` is optional — only needed for NVIDIA dGPU power-limit indication.)
 
 Useful flags:
 
@@ -60,19 +93,25 @@ Useful flags:
 - `--igpu-match / --dgpu-match` — regexes that classify GPU adapters by
   name (run with `--verbose` to see the detected adapters; defaults handle
   AMD iGPU + NVIDIA or Radeon RX dGPU)
+- `--cpu-power-cap 54` — APU sustained power ceiling (watts) for the CPU
+  power-limit breathe; auto-calibrated (approximately) if unset
+- `--no-nvml` — disable NVIDIA dGPU power/throttle detection
 
-Temperature needs one of (tried in this order):
+Temperature comes from one of (tried in this order):
 
-- [framework_tool](https://github.com/FrameworkComputer/framework-system)
-  on PATH (`winget install FrameworkComputer.framework_tool`) — reads the
-  APU die temperature straight from the EC; needs the script to run
-  elevated (best source),
 - [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)
-  running with *Options → Remote Web Server / WMI provider* enabled, or
-- a working ACPI thermal zone — beware: the FW16 exposes zones that
-  *look* valid but report frozen values (a constant ~63 °C), and reading
-  them needs admin rights anyway. The row stays dark if no source is
-  available.
+  running with *Options → Remote Web Server / WMI provider* enabled —
+  **preferred**: it is read from the same cached sensor snapshot used for the
+  APU power-limit breathe (its CPU package-power sensor), so it costs no extra
+  work and never spawns a process,
+- [framework_tool](https://github.com/FrameworkComputer/framework-system)
+  on PATH (`winget install FrameworkComputer.framework_tool`) — throttled
+  fallback that reads the APU die temperature straight from the EC; needs the
+  script to run elevated. Also used (every 60 s) to read the battery max-charge
+  cap so the battery bar scales to the cap,
+- a working ACPI thermal zone — last resort; the FW16 exposes zones that
+  *look* valid but report frozen values (a constant ~63 °C), and reading them
+  needs admin rights anyway. The row stays dark if no source is available.
 
 ### Start at login (no service required)
 
@@ -83,20 +122,57 @@ Task Scheduler → Create Task:
 - Check *Run only when user is logged on* (WMI brightness/GPU counters are
   per-session)
 
-## Protocol
+## Tuning (no reflash)
 
-One 32-byte VIA packet per interval:
+The firmware is a generic render engine — it holds *no* monitoring policy, so
+every threshold, colour, mapping and cadence is a constant near the top of
+`host/fw16_sysmon.py`. Edit and restart the script; no recompile or reflash:
 
+- **thresholds**: `BATT_CRITICAL_PCT`, `MEM_CRITICAL_PCT`, `TEMP_CRITICAL_C`,
+  `TEMP_MIN_C` / `TEMP_MAX_C`, `ASSIST_MIN_W`
+- **colours**: the `HUE_*` constants and the temperature gradient endpoints
+- **mappings**: `RATE_SEG_W1/2/3` (watts → animated segments),
+  `ROW_VAL_BATT_IDLE`, `BATT_DRIFT_FLOOR`, `LIMIT_FLOOR`
+- **cadences**: the `PERIOD_*` constants (blink / breathe / pulse, in 32 ms units)
+- **globals**: `GLIDE_MS_DEFAULT`, `TIMEOUT_MS_DEFAULT`
+- **polling**: the `TTL_*` source-cache lifetimes (how often each slow sensor is read)
+
+Only the wire protocol below is shared with the firmware; everything else lives
+on the host.
+
+## Protocol (v2)
+
+Two 32-byte VIA "custom set value" reports are sent per interval on channel
+`0x42`. The host describes each row fully; the firmware just draws it.
+
+```text
+[0]   0x07  id_custom_set_value
+[1]   0x42  sysmon channel
+[2]   value_id: 0x01 = FRAME A (rows 0,1,2)
+               0x02 = FRAME B (rows 3,4,5 + globals)
+[3..] payload: three back-to-back 8-byte row descriptors
+
+row descriptor (8 bytes):
+  +0 level         0-255  fraction of the 4-segment bar (0=empty, 255=full)
+  +1 row_val       0-255  base row brightness (normally 255)
+  +2 hue0          0-255  solid colour, or gradient start
+  +3 hue1          0-255  gradient end hue (only when the gradient bit is set)
+  +4 flags         bit0    gradient: 0=solid hue0, 1=hue0->hue1 across segments
+                   bits1-2 envelope: 0=none, 1=blink, 2=breathe
+                   bits3-4 overlay:  0=none, 1=trap-rise, 2=trap-fall, 3=sine
+                   bit5    overlay direction: 0=up from boundary, 1=down
+  +5 overlay_count 0=off; 1-4 = segments animated from the fill boundary
+  +6 period        units of 32 ms (the row's envelope/overlay cadence)
+  +7 floor         0-255  breathe trough / sine-tell floor
+
+FRAME B appends three globals after its three row descriptors:
+  [27] brightness  0-255           overall brightness (drives the LED global current)
+  [28] glide       units of 4 ms   per-row level glide   (default 300 ms => 75)
+  [29] timeout     units of 100 ms no-data fallback       (default 5000 ms => 50)
 ```
-[0]  0x07  id_custom_set_value
-[1]  0x42  sysmon channel
-[2]  0x01  stats value id
-[3]  flags: bit0 AC connected, bit1 battery present, bit2 dGPU present,
-     bit3 temp valid, bit4 charging, bit5 discharging
-     (bit4+bit5 both clear while on AC = battery idle / held at a cap)
-[4]  battery %   [5] cpu %   [6] mem %   [7] igpu %   [8] dgpu %
-[9]  temperature °C
-[10] LED brightness 0-255
-```
 
-The firmware ACKs by VIA's normal echo of the buffer.
+The firmware glides each row's `level`, fills the bar (solid or gradient),
+applies the envelope to the whole-row brightness, then paints any overlay
+segments from the fill boundary — all timed off its own clock, so the bars stay
+smooth between the host's updates. After `timeout` with no frame it restores the
+stock global current and lets the regular RGB effect run. VIA's echo is the ACK.
