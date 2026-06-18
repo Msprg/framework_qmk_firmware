@@ -17,12 +17,17 @@ VIA channel (0x42):
 
 Dependencies (Windows):
     pip install hidapi psutil wmi
+    optional: pynvml (NVIDIA dGPU power/throttle), pythonnet (in-process
+    LibreHardwareMonitorLib for AMD APU power+temperature -- run --fetch-lhm once)
 
-Temperature sources, tried in order:
-    1. LibreHardwareMonitor (preferred; comes free with the cached LHM snapshot
-       used for CPU power, so no subprocess and no per-tick stall)
-    2. Framework EC via framework_tool --thermal (throttled fallback)
-    3. ACPI thermal zone (MSAcpi_ThermalZoneTemperature; static on the FW16,
+Temperature / APU-power sources, tried in order:
+    1. LibreHardwareMonitorLib in-process via pythonnet (preferred; no app and
+       no WMI provider needed -- run --fetch-lhm to install the DLLs; the engine
+       loads a ring0 driver, so the script must be elevated)
+    2. LibreHardwareMonitor WMI provider (only if its app is running with the
+       WMI provider enabled)
+    3. Framework EC via framework_tool --thermal (throttled; temperature only)
+    4. ACPI thermal zone (MSAcpi_ThermalZoneTemperature; static on the FW16,
        so only a last resort)
 
 Run it in a console first to verify, then schedule with Task Scheduler
@@ -30,6 +35,7 @@ Run it in a console first to verify, then schedule with Task Scheduler
 """
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -188,6 +194,13 @@ CPU_LOAD_HIGH = 80      # % CPU load above which APU power limits are evaluated
 CPU_POWER_FLOOR_W = 15  # ignore APU power-cap inference below this package power
 NV_ACTIVE_MIN_W = 15    # dGPU draw above which it counts as actively loaded
 CEIL_NEAR = 0.95        # fraction of the (known/observed) ceiling read as "at it"
+NV_NEAR_CAP = 0.92      # dGPU draw as a fraction of its enforced limit to count
+                        # as genuinely power-capped -- filters NVIDIA's eager
+                        # SwPowerCap (set even near idle), which made the dGPU
+                        # breathe flicker on/off every few seconds
+NV_DEBOUNCE_READS = 3   # consecutive evaluations a dGPU limit flag must hold
+                        # before it flips, so a single-tick NVML blip can't flash
+                        # the breathe on and off
 
 # Charge/discharge overlay segment counts by power flow (watts).
 RATE_SEG_W1 = 20
@@ -195,13 +208,36 @@ RATE_SEG_W2 = 45
 RATE_SEG_W3 = 75
 
 # Source cache TTLs (seconds). Most ticks reuse cached slow readings so the
-# ~0.4s loop stays light.
-TTL_BRIGHTNESS = 4.0
+# ~0.4s loop stays light. Brightness is kept short so the LEDs track a screen
+# brightness change promptly (a longer TTL makes the macropad visibly lag the
+# screen); set it to 0 to re-read every tick.
+TTL_BRIGHTNESS = 0.5
 TTL_BATTERY = 1.0
 TTL_CPU_POWER = 1.0
 TTL_TEMP = 2.0
 TTL_LHM_SNAPSHOT = 1.0   # one LHM enumeration feeding both temp and cpu power
 TTL_EC_THERMAL = 2.5     # throttled framework_tool --thermal fallback
+
+# LibreHardwareMonitorLib: the .NET engine inside LibreHardwareMonitor, loaded
+# in-process via pythonnet so the APU package-power/load/temperature sensors can
+# be read directly -- no separate LHM app and no WMI provider. The native DLLs
+# are fetched into lib/ with `--fetch-lhm` (that directory is gitignored).
+LHM_LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
+LHM_DLL = "LibreHardwareMonitorLib.dll"
+HIDSHARP_DLL = "HidSharp.dll"
+# NuGet packages the DLLs come from (flat v2 API gives the latest stable).
+LHM_NUGET = "LibreHardwareMonitorLib"
+HIDSHARP_NUGET = "HidSharp"
+# LibreHardwareMonitorLib's net472 build also needs the netstandard2.0 BCL-compat
+# assemblies (Span<T> etc.) that aren't in-box on .NET Framework; fetch them too
+# and resolve them from lib/ via an AssemblyResolve handler at load time.
+LHM_DEP_NUGETS = (
+    "System.Memory",
+    "System.Buffers",
+    "System.Runtime.CompilerServices.Unsafe",
+    "System.Numerics.Vectors",
+    "System.Threading.Tasks.Extensions",
+)
 
 
 def clamp(value, lo, hi):
@@ -358,6 +394,7 @@ class NvGpuLimits:
     def __init__(self, enabled=True):
         self.available = False
         self.handle = None
+        self._deb = [(False, 0), (False, 0)]  # debounce state for (power, psrc)
         if not enabled:
             return
         if pynvml is None:
@@ -392,7 +429,7 @@ class NvGpuLimits:
         power-source limit; plain battery operation is left to the battery row.
         """
         if not self.available:
-            return False, False
+            return self._stabilize(False, False)
         try:
             reasons = self._reasons_fn(self.handle)
             draw = pynvml.nvmlDeviceGetPowerUsage(self.handle) / 1000.0
@@ -403,20 +440,45 @@ class NvGpuLimits:
             except Exception:
                 default = enforced
         except Exception:
-            return False, False
+            return self._stabilize(False, False)
 
         sw_cap = bool(reasons & self._sw_power)
         hw_brake = bool(reasons & self._hw_brake)
         capped_below_stock = default > 0 and enforced < 0.9 * default
+        # NVIDIA sets SwPowerCap eagerly -- it can be set even near idle, when the
+        # GPU is nowhere near its limit, which made the breathe flicker. Only
+        # honour it as a real power cap when the GPU is actually drawing near its
+        # enforced limit. HwPowerBrake is a genuine hardware brake; keep it as-is.
+        near_cap = enforced > 0 and draw >= NV_NEAR_CAP * enforced
         if weak_charger:
             # supply-bound: a loaded GPU capped while the charger can't keep up
             active = draw >= NV_ACTIVE_MIN_W
-            return False, active and (sw_cap or hw_brake or capped_below_stock)
+            return self._stabilize(
+                False,
+                active and (hw_brake or (sw_cap and near_cap) or capped_below_stock))
         if on_ac:
             # chip-bound: the driver/board is actively capping power on AC
-            return (sw_cap or hw_brake), False
+            return self._stabilize(hw_brake or (sw_cap and near_cap), False)
         # plain battery: not surfaced here (the battery row covers it)
-        return False, False
+        return self._stabilize(False, False)
+
+    def _stabilize(self, power, psrc):
+        """Debounce the (power, psrc) flags: a changed value must repeat for
+        NV_DEBOUNCE_READS consecutive evaluations before it is adopted, so an
+        isolated single-tick NVML blip can't flash the breathe on and off.
+        """
+        out = []
+        for i, raw in enumerate((power, psrc)):
+            cur, cnt = self._deb[i]
+            if raw == cur:
+                cnt = 0
+            else:
+                cnt += 1
+                if cnt >= NV_DEBOUNCE_READS:
+                    cur, cnt = raw, 0
+            self._deb[i] = (cur, cnt)
+            out.append(cur)
+        return out[0], out[1]
 
 
 class ApuLimits:
@@ -689,6 +751,186 @@ class WmiSources:
         except Exception:
             pass
         return None
+
+
+def fetch_lhm_dlls(dest=LHM_LIB_DIR):
+    """Download LibreHardwareMonitorLib + HidSharp DLLs from NuGet into dest.
+
+    A NuGet .nupkg is a zip; we pull the latest stable of each package and copy
+    out the .NET Framework build of each DLL. Run once via `--fetch-lhm`.
+    """
+    import urllib.request
+    import zipfile
+    import tempfile
+    import glob
+    import shutil
+
+    os.makedirs(dest, exist_ok=True)
+
+    def grab(pkg, dll):
+        with tempfile.TemporaryDirectory() as tmp:
+            nupkg = os.path.join(tmp, pkg + ".nupkg")
+            urllib.request.urlretrieve(
+                f"https://www.nuget.org/api/v2/package/{pkg}", nupkg)
+            with zipfile.ZipFile(nupkg) as zf:
+                zf.extractall(tmp)
+            hits = glob.glob(os.path.join(tmp, "**", dll), recursive=True)
+            # Pick the runtime implementation, never a ref/ assembly (metadata
+            # only -> BadImageFormat), and never a wrong-architecture build.
+            # Newer LibreHardwareMonitorLib ships per-RID DLLs under
+            # runtimes/win-<arch>/lib/<tfm>/; match this process's architecture.
+            import platform
+            want_rid = "win-arm64" if "arm" in platform.machine().lower() else "win-x64"
+            bad_tfm = ("netcoreapp", "/netstandard1.", "/net5", "/net6",
+                       "/net7", "/net8", "/net9")
+            impl = []
+            for h in hits:
+                n = h.replace("\\", "/").lower()
+                if "/ref/" in n:
+                    continue
+                if "/runtimes/" in n and f"/runtimes/{want_rid}/" not in n:
+                    continue  # a different architecture's runtime build
+                if any(b in n for b in bad_tfm):
+                    continue  # needs .NET Core / .NET 5+, not .NET Framework
+                if "/lib/" in n or f"/runtimes/{want_rid}/" in n:
+                    impl.append(h)
+            candidates = impl or hits
+            pick = None
+            for pref in ("net472", "net471", "net47", "net462", "net461",
+                         "net46", "net452", "net45", "net48", "netstandard2.0"):
+                pick = next((h for h in candidates
+                             if pref + "/" in h.replace("\\", "/").lower()), None)
+                if pick:
+                    break
+            pick = pick or (candidates[0] if candidates else None)
+            if not pick:
+                raise RuntimeError(f"{dll} not found in the {pkg} package")
+            shutil.copy2(pick, os.path.join(dest, dll))
+            print(f"  fetched {dll}  <- {os.path.relpath(pick, tmp)}")
+
+    grab(LHM_NUGET, LHM_DLL)
+    grab(HIDSHARP_NUGET, HIDSHARP_DLL)
+    for dep in LHM_DEP_NUGETS:
+        grab(dep, dep + ".dll")
+    print(f"LibreHardwareMonitorLib + deps installed in {dest}")
+
+
+class LhmLibSource:
+    """APU sensors via LibreHardwareMonitorLib loaded in-process (pythonnet).
+
+    Reads CPU package power, total load and temperature straight from the
+    LibreHardwareMonitor engine -- no separate app, no WMI provider. Needs the
+    DLLs in lib/ (run `--fetch-lhm`) and an elevated process, since the engine
+    loads a ring0 driver to read the CPU MSRs/power. Degrades to `available =
+    False` (and the caller falls back to the WMI provider / EC) otherwise.
+
+    Open the driver once at start-up and Close() it at exit; snapshot() only
+    calls Update(), so it is cheap enough to sit behind the same TTL cache as
+    the WMI snapshot.
+    """
+
+    def __init__(self, enabled=True, lib_dir=LHM_LIB_DIR):
+        self.available = False
+        self._computer = None
+        self._cpu_hw = []
+        self._resolver = None
+        lhm_dll = os.path.join(lib_dir, LHM_DLL)
+        hid_dll = os.path.join(lib_dir, HIDSHARP_DLL)
+        if not enabled:
+            return
+        if not os.path.exists(lhm_dll):
+            print(f"LibreHardwareMonitorLib not found in {lib_dir}; run "
+                  f"`python fw16_sysmon.py --fetch-lhm` (or enable the LHM WMI "
+                  f"provider). In-process APU detection disabled.", file=sys.stderr)
+            return
+        try:
+            import clr  # pythonnet
+            from System import AppDomain, ResolveEventHandler
+            from System.Reflection import Assembly
+
+            # Resolve LibreHardwareMonitorLib's transitive deps (System.Memory
+            # and friends, fetched into lib/) by simple name, sidestepping .NET
+            # Framework's strict version binding (AssemblyResolve results bypass
+            # the version check, so any compatible build in lib/ satisfies them).
+            def _resolve(sender, ev_args):
+                short = ev_args.Name.split(",", 1)[0]
+                cand = os.path.join(lib_dir, short + ".dll")
+                if os.path.exists(cand):
+                    return Assembly.LoadFrom(cand)
+                return None
+
+            self._resolver = ResolveEventHandler(_resolve)
+            AppDomain.CurrentDomain.AssemblyResolve += self._resolver
+
+            if os.path.exists(hid_dll):
+                clr.AddReference(hid_dll)
+            clr.AddReference(lhm_dll)
+            from LibreHardwareMonitor.Hardware import Computer
+
+            comp = Computer()
+            comp.IsCpuEnabled = True
+            comp.Open()
+            self._computer = comp
+            self._cpu_hw = [hw for hw in comp.Hardware
+                            if str(hw.HardwareType) == "Cpu"]
+            self.available = bool(self._cpu_hw)
+            if not self.available:
+                print("LibreHardwareMonitorLib opened but exposed no CPU hardware "
+                      "(elevated? supported CPU?); in-process APU detection "
+                      "disabled.", file=sys.stderr)
+                self.close()
+        except Exception as err:
+            print(f"LibreHardwareMonitorLib init failed ({err}); in-process APU "
+                  f"detection disabled.", file=sys.stderr)
+            self.close()
+
+    def snapshot(self):
+        """Return (temp_c, cpu_pkg_w, cpu_load); any field None if absent.
+
+        Same shape as WmiSources.lhm_snapshot() so it is a drop-in source.
+        """
+        if not self.available:
+            return None, None, None
+        temps = []
+        pkg_w = None
+        load = None
+        try:
+            for hw in self._cpu_hw:
+                hw.Update()
+                for s in hw.Sensors:
+                    val = s.Value
+                    if val is None:
+                        continue
+                    st = str(s.SensorType)
+                    name = s.Name or ""
+                    if st == "Temperature":
+                        # a live CPU is never at 0 C; 0 means the ring0 driver
+                        # is not loaded (process not elevated) -> no reading
+                        if val > 0:
+                            preferred = name in ("CPU Package", "Core (Tctl/Tdie)", "Tctl")
+                            temps.append((float(val), preferred))
+                    elif st == "Power" and "package" in name.lower():
+                        if val > 0:  # 0 W package power == no driver reading
+                            pkg_w = float(val)
+                    elif st == "Load" and name == "CPU Total":
+                        load = float(val)
+        except Exception:
+            return None, None, None
+        temp_c = None
+        if temps:
+            preferred = [v for v, p in temps if p]
+            temp_c = max(preferred) if preferred else max(v for v, _ in temps)
+        return temp_c, pkg_w, load
+
+    def close(self):
+        try:
+            if self._computer is not None:
+                self._computer.Close()
+        except Exception:
+            pass
+        self._computer = None
+        self._cpu_hw = []
+        self.available = False
 
 
 # ---------------------------------------------------------------------------
@@ -1010,6 +1252,10 @@ def gather(sources, gpu, charge_limit, apu, nv, args, cache):
         "cpu": cpu,
         "cpu_power": cpu_power,
         "cpu_psrc": cpu_psrc,
+        # raw limit-detection inputs, surfaced for --verbose diagnostics
+        "cpu_pkg_w": cpu_pkg_w,
+        "cpu_load": cpu_load,
+        "weak_charger": weak_charger,
 
         "raw_mem": raw_mem,
         "mem": mem,
@@ -1053,12 +1299,22 @@ def main():
                              "if unset")
     parser.add_argument("--no-nvml", action="store_true",
                         help="disable NVIDIA dGPU power/throttle detection")
+    parser.add_argument("--no-lhm-lib", action="store_true",
+                        help="disable the in-process LibreHardwareMonitorLib APU "
+                             "source (fall back to the LHM WMI provider / EC)")
+    parser.add_argument("--fetch-lhm", action="store_true",
+                        help="download LibreHardwareMonitorLib + HidSharp DLLs "
+                             "into lib/ and exit (needs pythonnet at runtime)")
     parser.add_argument("--verbose", action="store_true",
                         help="print each tick's per-row descriptors")
     parser.add_argument("--bootloader", action="store_true",
                         help="reboot the macropad into its UF2 bootloader "
                              "(RPI-RP2 drive) and exit")
     args = parser.parse_args()
+
+    if args.fetch_lhm:
+        fetch_lhm_dlls()
+        return
 
     if args.bootloader:
         dev = open_device()
@@ -1079,13 +1335,23 @@ def main():
     gpu = GpuMonitor(args.igpu_match, args.dgpu_match)
     apu = ApuLimits(cap_watts=args.cpu_power_cap)
     nv = NvGpuLimits(enabled=not args.no_nvml)
+    lhmlib = LhmLibSource(enabled=not args.no_lhm_lib)
+
+    def lhm_snapshot():
+        # Prefer the in-process LibreHardwareMonitorLib (no app, no WMI); fall
+        # back to the LHM WMI provider when the lib is unavailable or silent.
+        if lhmlib.available:
+            snap = lhmlib.snapshot()
+            if snap != (None, None, None):
+                return snap
+        return sources.lhm_snapshot()
 
     # Slow sources behind TTL caches so most ~0.4s ticks stay light. The LHM
-    # snapshot is shared between temperature and CPU power (one enumeration).
+    # snapshot is shared between temperature and CPU power (one read).
     cache = {
         "brightness": Cached(sources.screen_brightness, TTL_BRIGHTNESS),
         "battery": Cached(sources.battery_state, TTL_BATTERY),
-        "lhm": Cached(sources.lhm_snapshot, TTL_LHM_SNAPSHOT),
+        "lhm": Cached(lhm_snapshot, TTL_LHM_SNAPSHOT),
         "ec_temp": Cached(ec.temperature, TTL_EC_THERMAL),
     }
 
@@ -1113,6 +1379,14 @@ def main():
                 print(f"bright={m['brightness']}")
                 for name, r in zip(names, rows):
                     print(f"  {name:5s} {r!r}")
+                # limit-detection diagnostics: shows whether the APU/dGPU
+                # power-limit sources are feeding data and whether a limit is
+                # currently flagged. cpu pkg_w/load = None means LHM is not
+                # running (no APU breathe possible); dgpu power/psrc need pynvml.
+                print(f"  limits ac={m['ac']} weak={m['weak_charger']} "
+                      f"cpu(pkg_w={m['cpu_pkg_w']} load={m['cpu_load']})"
+                      f"->power={m['cpu_power']},psrc={m['cpu_psrc']} "
+                      f"dgpu->power={m['dgpu_power']},psrc={m['dgpu_psrc']}")
             for rep in build_frame(rows, m["brightness"]):
                 dev.write(b"\x00" + rep)
             # drain the VIA echo so the report buffer doesn't fill up
@@ -1133,6 +1407,7 @@ def main():
 
     if dev is not None:
         dev.close()
+    lhmlib.close()
 
 
 if __name__ == "__main__":
