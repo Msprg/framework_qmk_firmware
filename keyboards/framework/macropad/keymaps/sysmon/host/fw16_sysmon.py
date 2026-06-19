@@ -17,18 +17,29 @@ VIA channel (0x42):
 
 Dependencies (Windows):
     pip install hidapi psutil wmi
-    optional: pynvml (NVIDIA dGPU power/throttle), pythonnet (in-process
-    LibreHardwareMonitorLib for AMD APU power+temperature -- run --fetch-lhm once)
+    optional:
+      pynvml    -- NVIDIA dGPU power/throttle reasons (authoritative)
+      ryzenadj  -- AMD APU STAPM/PPT power limits + Tctl read straight from the
+                   SMU power-metrics table via its libryzenadj.dll (the same
+                   source HWiNFO reads for "APU STAPM Limit"). Install the
+                   `ryzenadj` tool (e.g. `scoop install ryzenadj`); the DLL is
+                   auto-discovered, or point --ryzenadj-dir at it.
+      pythonnet -- in-process LibreHardwareMonitorLib for AMD APU package power
+                   + temperature (run --fetch-lhm once)
 
-Temperature / APU-power sources, tried in order:
-    1. LibreHardwareMonitorLib in-process via pythonnet (preferred; no app and
-       no WMI provider needed -- run --fetch-lhm to install the DLLs; the engine
-       loads a ring0 driver, so the script must be elevated)
-    2. LibreHardwareMonitor WMI provider (only if its app is running with the
-       WMI provider enabled)
-    3. Framework EC via framework_tool --thermal (throttled; temperature only)
-    4. ACPI thermal zone (MSAcpi_ThermalZoneTemperature; static on the FW16,
+APU power-limit detection (CPU-row breathe), in order:
+    1. ryzenadj / libryzenadj SMU table: STAPM/PPT value-vs-limit (authoritative)
+    2. LibreHardwareMonitor package-power plateau heuristic (fallback)
+
+Temperature sources, tried in order:
+    1. LibreHardwareMonitorLib in-process via pythonnet (run --fetch-lhm)
+    2. ryzenadj Tctl (in-process; free once libryzenadj is loaded for limits)
+    3. LibreHardwareMonitor WMI provider (only if its app is running)
+    4. Framework EC via framework_tool --thermal (throttled; temperature only)
+    5. ACPI thermal zone (MSAcpi_ThermalZoneTemperature; static on the FW16,
        so only a last resort)
+
+The ring0 sources (ryzenadj, LibreHardwareMonitorLib) need the script elevated.
 
 Run it in a console first to verify, then schedule with Task Scheduler
 (pythonw.exe) to have it start at login. No service needed.
@@ -189,7 +200,20 @@ TEMP_MAX_C = 90
 # Breathe overlay floor for power-limited rows (~43% of 255: dim but readable).
 LIMIT_FLOOR = 110
 
-# Inference thresholds (all heuristic; tune as needed).
+# APU power-limit detection via the SMU table (libryzenadj; authoritative).
+APU_LIMIT_NEAR = 0.95   # a STAPM/PPT limit counts as binding when its live
+                        # value reaches this fraction of the limit (the value
+                        # sits right at the limit when the chip is power-capped)
+APU_LIMIT_SIGNALS = ("stapm", "slow")  # which SMU limits trigger the CPU-row
+                        # breathe. STAPM (skin-temp-aware sustained budget --
+                        # the "APU STAPM Limit" HWiNFO shows) and the slow PPT
+                        # are sustained, so they give a steady signal; the fast
+                        # PPT is the short boost window and would flicker, so it
+                        # is read for diagnostics but not used to trigger. Add
+                        # "fast" here to include it.
+
+# Inference thresholds (the LHM package-power fallback used only when ryzenadj
+# is unavailable; all heuristic; tune as needed).
 CPU_LOAD_HIGH = 80      # % CPU load above which APU power limits are evaluated
 CPU_POWER_FLOOR_W = 15  # ignore APU power-cap inference below this package power
 NV_ACTIVE_MIN_W = 15    # dGPU draw above which it counts as actively loaded
@@ -213,7 +237,7 @@ RATE_SEG_W3 = 75
 # screen); set it to 0 to re-read every tick.
 TTL_BRIGHTNESS = 0.5
 TTL_BATTERY = 1.0
-TTL_CPU_POWER = 1.0
+TTL_RYZENADJ = 1.0       # one ryzenadj SMU refresh feeding APU limits + Tctl
 TTL_TEMP = 2.0
 TTL_LHM_SNAPSHOT = 1.0   # one LHM enumeration feeding both temp and cpu power
 TTL_EC_THERMAL = 2.5     # throttled framework_tool --thermal fallback
@@ -497,13 +521,28 @@ class ApuLimits:
         self.ceiling = 0.0
         self.prev = 0.0
 
-    def evaluate(self, reading, on_ac, weak_charger):
+    def evaluate(self, reading, on_ac, weak_charger, limited=None):
         """Return (power_limited, psrc_limited) for the APU.
 
-        reading is (package_watts, load_pct) from LHM, or None. Only the
-        weak-charger (battery-assisting-on-AC) case is surfaced as a
-        power-source limit; plain battery operation is left to the battery row.
+        `limited`, when not None, is an authoritative chip-power-cap boolean
+        (ryzenadj reporting a STAPM/PPT limit binding); the package-power
+        plateau heuristic below is then bypassed entirely. When None (no
+        ryzenadj), fall back to inferring the cap from LHM `reading` =
+        (package_watts, load_pct). Either way, only the weak-charger
+        (battery-assisting-on-AC) case is surfaced as a power-source limit;
+        plain battery operation is left to the battery row.
         """
+        if limited is not None:
+            # Authoritative path: route the SMU verdict the same way the
+            # heuristic result is routed -- weak charger -> power-source (slow)
+            # breathe; else on AC -> chip (fast) breathe; plain battery is the
+            # battery row's job.
+            if weak_charger:
+                return False, bool(limited)
+            if on_ac:
+                return bool(limited), False
+            return False, False
+        # ---- fallback heuristic (no ryzenadj): LHM package-power plateau ----
         if reading is None:
             return False, False
         pkg_w, load = reading
@@ -933,6 +972,207 @@ class LhmLibSource:
         self.available = False
 
 
+# RyzenAdj / libryzenadj: the AMD SMU power-metrics table -- the same source
+# HWiNFO reads for "APU STAPM Limit" et al. The DLL ships with the `ryzenadj`
+# tool (e.g. a scoop install) alongside its WinRing0 ring0 driver.
+RYZENADJ_DLL = "libryzenadj.dll"
+RYZENADJ_DRIVER = "WinRing0x64.sys"
+
+
+def find_ryzenadj_dir(explicit=None):
+    """Locate the directory holding libryzenadj.dll (+ its WinRing0 driver).
+
+    Order: an explicit --ryzenadj-dir; the real install dir behind a `ryzenadj`
+    shim on PATH (scoop writes a `.shim` sidecar whose `path =` points at the
+    actual exe, which is NOT where the shim lives); then the conventional scoop
+    location. Returns None if the DLL isn't found anywhere.
+    """
+    import shutil
+    cands = []
+    if explicit:
+        cands.append(explicit)
+    exe = shutil.which("ryzenadj")
+    if exe:
+        cands.append(os.path.dirname(exe))
+        shim = (exe[:-4] if exe.lower().endswith(".exe") else exe) + ".shim"
+        try:
+            with open(shim, "r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    if line.strip().lower().startswith("path"):
+                        real = line.split("=", 1)[1].strip().strip('"')
+                        cands.append(os.path.dirname(real))
+        except OSError:
+            pass
+    profile = os.environ.get("USERPROFILE")
+    if profile:
+        cands.append(os.path.join(profile, "scoop", "apps", "ryzenadj",
+                                  "current"))
+    for d in cands:
+        if d and os.path.isfile(os.path.join(d, RYZENADJ_DLL)):
+            return d
+    return None
+
+
+class RyzenAdjSource:
+    """AMD APU power-limit + die-temperature from libryzenadj (the SMU table).
+
+    Reads the same STAPM / PPT-fast / PPT-slow limit+value pairs HWiNFO shows,
+    so "the APU is at a power limit" is authoritative rather than inferred from
+    a package-power plateau: a limit is binding when its live value reaches
+    (within APU_LIMIT_NEAR of) the limit. Also exposes the Tctl die temperature
+    as an in-process temperature source. libryzenadj is loaded once via ctypes
+    with a persistent handle; it loads the WinRing0 ring0 driver to read the
+    SMU, so the process must be elevated. Degrades to available=False (the
+    caller then falls back to the LHM package-power heuristic / other temp
+    sources) when the DLL, driver, or CPU isn't supported.
+
+    Open the handle once at start-up and cleanup() at exit; snapshot() only
+    refreshes the table, so it is cheap enough to sit behind a TTL cache.
+    """
+
+    def __init__(self, enabled=True, dll_dir=None):
+        self.available = False
+        self._lib = None
+        self._ry = None
+        if not enabled:
+            return
+        d = find_ryzenadj_dir(dll_dir)
+        if d is None:
+            print("libryzenadj.dll not found (install the `ryzenadj` tool or "
+                  "pass --ryzenadj-dir); authoritative APU STAPM/PPT limit "
+                  "detection disabled -- falling back to the LHM heuristic.",
+                  file=sys.stderr)
+            return
+        try:
+            from ctypes import cdll, c_void_p, c_float, c_int
+
+            # WinRing0x64.dll / inpoutx64.dll sit beside the lib; the ring0
+            # driver (.sys) is loaded relative to the host executable, so make
+            # sure a copy is next to it (mirrors ryzenadj's pmtable-example.py).
+            os.add_dll_directory(d)
+            self._ensure_driver(d)
+            lib = cdll.LoadLibrary(os.path.join(d, RYZENADJ_DLL))
+
+            lib.init_ryzenadj.restype = c_void_p
+            lib.cleanup_ryzenadj.argtypes = [c_void_p]
+            lib.init_table.argtypes = [c_void_p]
+            lib.init_table.restype = c_int
+            lib.refresh_table.argtypes = [c_void_p]
+            lib.refresh_table.restype = c_int
+            for name in ("get_stapm_limit", "get_stapm_value", "get_fast_limit",
+                         "get_fast_value", "get_slow_limit", "get_slow_value",
+                         "get_tctl_temp"):
+                fn = getattr(lib, name)
+                fn.restype = c_float
+                fn.argtypes = [c_void_p]
+
+            ry = lib.init_ryzenadj()
+            if not ry:
+                print("init_ryzenadj failed (elevated? supported CPU?); "
+                      "authoritative APU STAPM/PPT limit detection disabled.",
+                      file=sys.stderr)
+                return
+            self._lib = lib
+            self._ry = ry
+            # init_table maps the SMU power table; some libryzenadj versions
+            # return nonzero here yet still work, so verify via a real refresh
+            # rather than trusting its result.
+            try:
+                lib.init_table(ry)
+            except Exception:
+                pass
+            if lib.refresh_table(ry) != 0:
+                print("ryzenadj refresh_table failed; authoritative APU "
+                      "STAPM/PPT limit detection disabled.", file=sys.stderr)
+                self.close()
+                return
+            self.available = True
+        except Exception as err:
+            print(f"libryzenadj init failed ({err}); authoritative APU "
+                  f"STAPM/PPT limit detection disabled.", file=sys.stderr)
+            self.close()
+
+    @staticmethod
+    def _ensure_driver(dll_dir):
+        """Best-effort: place WinRing0x64.sys next to the host executable.
+
+        WinRing0 loads its kernel driver from a path relative to the process
+        image; when libryzenadj is hosted by python that's the interpreter dir.
+        Copy the .sys there if it's missing (if the copy can't happen, init
+        just fails and the caller falls back).
+        """
+        try:
+            import shutil
+            src = os.path.join(dll_dir, RYZENADJ_DRIVER)
+            dst = os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
+                               RYZENADJ_DRIVER)
+            if os.path.isfile(src) and not os.path.isfile(dst):
+                shutil.copyfile(src, dst)
+        except OSError:
+            pass
+
+    def snapshot(self):
+        """Return {'stapm':(val,lim), 'fast':.., 'slow':.., 'tctl':temp_or_None}.
+
+        Each (value, limit) pair is in watts; pairs whose limit is non-positive
+        or NaN (unsupported on this CPU) are dropped so they can't read as a
+        binding limit. Returns None on a refresh failure (caller falls back).
+        One SMU refresh, so it sits behind the snapshot TTL cache.
+        """
+        if not self.available:
+            return None
+        g, ry = self._lib, self._ry
+        try:
+            if g.refresh_table(ry) != 0:
+                return None
+            raw = {
+                "stapm": (g.get_stapm_value(ry), g.get_stapm_limit(ry)),
+                "fast": (g.get_fast_value(ry), g.get_fast_limit(ry)),
+                "slow": (g.get_slow_value(ry), g.get_slow_limit(ry)),
+            }
+            tctl = g.get_tctl_temp(ry)
+        except Exception:
+            return None
+        out = {}
+        for key, (val, lim) in raw.items():
+            # x == x is False only for NaN (unsupported sensor); a 0/negative
+            # limit means "not reported" and must not count as binding.
+            if lim == lim and val == val and lim > 0:
+                out[key] = (float(val), float(lim))
+        out["tctl"] = float(tctl) if (tctl == tctl and tctl > 0) else None
+        return out
+
+    @staticmethod
+    def power_limited(snap):
+        """True if any APU_LIMIT_SIGNALS limit is binding (value >= near*limit).
+
+        Returns None when there's no snapshot (source unavailable or a transient
+        refresh failure) so the caller can fall back to the heuristic that tick.
+        """
+        if snap is None:
+            return None
+        for key in APU_LIMIT_SIGNALS:
+            pair = snap.get(key)
+            if pair and pair[1] > 0 and pair[0] >= APU_LIMIT_NEAR * pair[1]:
+                return True
+        return False
+
+    @staticmethod
+    def temperature(snap):
+        """Tctl die temperature from a snapshot, or None."""
+        return snap.get("tctl") if snap else None
+
+    def close(self):
+        try:
+            if self._lib is not None and self._ry:
+                self._lib.cleanup_ryzenadj(self._ry)
+        except Exception:
+            pass
+        self._lib = None
+        self._ry = None
+        self.available = False
+
+
 # ---------------------------------------------------------------------------
 # Descriptor builder + per-row render policy
 # ---------------------------------------------------------------------------
@@ -1174,7 +1414,7 @@ def build_frame(rows, brightness, glide_ms=GLIDE_MS_DEFAULT,
     return [bytes(frame_a), bytes(frame_b)]
 
 
-def gather(sources, gpu, charge_limit, apu, nv, args, cache):
+def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
     """Collect metrics and turn them into six row descriptors + globals.
 
     cache is the dict of Cached wrappers around the slow sources.
@@ -1208,9 +1448,15 @@ def gather(sources, gpu, charge_limit, apu, nv, args, cache):
     # One LHM snapshot feeds both temperature and CPU power this tick.
     lhm_temp, cpu_pkg_w, cpu_load = cache["lhm"]()
 
-    # Temperature: prefer LHM (free, from the snapshot); fall back to the
-    # throttled EC framework_tool, then static ACPI as a last resort.
+    # One ryzenadj SMU refresh feeds both the authoritative APU power-limit
+    # verdict and an in-process Tctl temperature fallback.
+    rj = cache["ryzenadj"]() if ryzen.available else None
+
+    # Temperature: prefer LHM (validated), then ryzenadj Tctl (in-process,
+    # authoritative), then the throttled EC framework_tool, then static ACPI.
     temp_c = lhm_temp
+    if temp_c is None:
+        temp_c = RyzenAdjSource.temperature(rj)
     if temp_c is None:
         temp_c = cache["ec_temp"]()
     if temp_c is None:
@@ -1233,9 +1479,12 @@ def gather(sources, gpu, charge_limit, apu, nv, args, cache):
     on_ac = flags_ac
     weak_charger = on_ac and discharging and batt_rate >= ASSIST_MIN_W
 
+    # APU power-limit: authoritative ryzenadj STAPM/PPT binding when available,
+    # else the LHM package-power plateau heuristic (limited=None).
+    cpu_limited = RyzenAdjSource.power_limited(rj)
     cpu_power, cpu_psrc = apu.evaluate(
         (cpu_pkg_w, cpu_load) if (cpu_pkg_w is not None or cpu_load is not None)
-        else None, on_ac, weak_charger)
+        else None, on_ac, weak_charger, limited=cpu_limited)
     dgpu_power, dgpu_psrc = nv.evaluate(on_ac, weak_charger)
     if not dgpu_present:
         dgpu_power = dgpu_psrc = False
@@ -1255,6 +1504,7 @@ def gather(sources, gpu, charge_limit, apu, nv, args, cache):
         # raw limit-detection inputs, surfaced for --verbose diagnostics
         "cpu_pkg_w": cpu_pkg_w,
         "cpu_load": cpu_load,
+        "cpu_limits": rj,  # ryzenadj SMU snapshot (stapm/fast/slow) or None
         "weak_charger": weak_charger,
 
         "raw_mem": raw_mem,
@@ -1299,6 +1549,14 @@ def main():
                              "if unset")
     parser.add_argument("--no-nvml", action="store_true",
                         help="disable NVIDIA dGPU power/throttle detection")
+    parser.add_argument("--no-ryzenadj", action="store_true",
+                        help="disable the in-process libryzenadj APU STAPM/PPT "
+                             "power-limit + Tctl source (fall back to the LHM "
+                             "package-power heuristic)")
+    parser.add_argument("--ryzenadj-dir", default=None,
+                        help="directory containing libryzenadj.dll + "
+                             "WinRing0x64.sys (auto-discovered from a ryzenadj "
+                             "install / scoop shim if unset)")
     parser.add_argument("--no-lhm-lib", action="store_true",
                         help="disable the in-process LibreHardwareMonitorLib APU "
                              "source (fall back to the LHM WMI provider / EC)")
@@ -1336,6 +1594,8 @@ def main():
     apu = ApuLimits(cap_watts=args.cpu_power_cap)
     nv = NvGpuLimits(enabled=not args.no_nvml)
     lhmlib = LhmLibSource(enabled=not args.no_lhm_lib)
+    ryzen = RyzenAdjSource(enabled=not args.no_ryzenadj,
+                           dll_dir=args.ryzenadj_dir)
 
     def lhm_snapshot():
         # Prefer the in-process LibreHardwareMonitorLib (no app, no WMI); fall
@@ -1352,6 +1612,7 @@ def main():
         "brightness": Cached(sources.screen_brightness, TTL_BRIGHTNESS),
         "battery": Cached(sources.battery_state, TTL_BATTERY),
         "lhm": Cached(lhm_snapshot, TTL_LHM_SNAPSHOT),
+        "ryzenadj": Cached(ryzen.snapshot, TTL_RYZENADJ),
         "ec_temp": Cached(ec.temperature, TTL_EC_THERMAL),
     }
 
@@ -1372,20 +1633,30 @@ def main():
                     continue
                 print("Connected to macropad")
 
-            m = gather(sources, gpu, charge_limit, apu, nv, args, cache)
+            m = gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache)
             rows = [ROW_BUILDERS[i](m) for i in range(6)]
             if args.verbose:
                 names = ["batt", "cpu", "mem", "igpu", "dgpu", "temp"]
                 print(f"bright={m['brightness']}")
                 for name, r in zip(names, rows):
                     print(f"  {name:5s} {r!r}")
-                # limit-detection diagnostics: shows whether the APU/dGPU
-                # power-limit sources are feeding data and whether a limit is
-                # currently flagged. cpu pkg_w/load = None means LHM is not
-                # running (no APU breathe possible); dgpu power/psrc need pynvml.
+                # limit-detection diagnostics: shows which source drove the APU
+                # verdict. With ryzenadj it prints the SMU value/limit watt
+                # pairs (the * marks a limit in APU_LIMIT_SIGNALS that is
+                # binding); otherwise it shows the LHM heuristic inputs (pkg_w/
+                # load = None means LHM isn't running -> no APU breathe). dgpu
+                # power/psrc need pynvml.
+                rj = m["cpu_limits"]
+                if rj:
+                    pairs = " ".join(
+                        f"{k}={rj[k][0]:.1f}/{rj[k][1]:.1f}W"
+                        f"{'*' if (k in APU_LIMIT_SIGNALS and rj[k][1] > 0 and rj[k][0] >= APU_LIMIT_NEAR * rj[k][1]) else ''}"
+                        for k in ("stapm", "fast", "slow") if k in rj)
+                    cpu_src = f"ryzenadj[{pairs}]"
+                else:
+                    cpu_src = f"heuristic(pkg_w={m['cpu_pkg_w']} load={m['cpu_load']})"
                 print(f"  limits ac={m['ac']} weak={m['weak_charger']} "
-                      f"cpu(pkg_w={m['cpu_pkg_w']} load={m['cpu_load']})"
-                      f"->power={m['cpu_power']},psrc={m['cpu_psrc']} "
+                      f"cpu {cpu_src} ->power={m['cpu_power']},psrc={m['cpu_psrc']} "
                       f"dgpu->power={m['dgpu_power']},psrc={m['dgpu_psrc']}")
             for rep in build_frame(rows, m["brightness"]):
                 dev.write(b"\x00" + rep)
@@ -1408,6 +1679,7 @@ def main():
     if dev is not None:
         dev.close()
     lhmlib.close()
+    ryzen.close()
 
 
 if __name__ == "__main__":

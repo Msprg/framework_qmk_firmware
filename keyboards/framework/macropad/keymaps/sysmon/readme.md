@@ -37,12 +37,21 @@ Detection sources (per component, degrades gracefully if absent):
 - **dGPU** — NVIDIA only, via **NVML** (`pip install pynvml`): authoritative
   throttle reasons (`SwPowerCap`, `HwPowerBrakeSlowdown`) plus the enforced
   power limit. No NVIDIA card / no pynvml → no dGPU limit indication.
-- **APU (CPU/iGPU)** — AMD exposes no throttle flags, so this is *inferred*
-  from **LibreHardwareMonitor** package power + CPU load: a power cap is
-  flagged when, under sustained high load on AC, package power plateaus at the
-  ceiling. The ceiling auto-calibrates (approximate); pass `--cpu-power-cap
-  <watts>` for a deterministic threshold. Needs LHM running (see below); with
-  no LHM the CPU row never breathes.
+- **APU (CPU/iGPU)** — read **authoritatively** from the AMD SMU power-metrics
+  table via **`ryzenadj`** (its `libryzenadj.dll`, loaded in-process). This is
+  the same source HWiNFO reads for *APU STAPM Limit* etc.: the CPU row breathes
+  when a power limit is *binding* — its live value has reached the limit. STAPM
+  (the skin-temperature-aware sustained budget) and the slow PPT are checked
+  (the short fast-PPT boost window is read for diagnostics but not used to
+  trigger, so brief boosts don't flicker — see `APU_LIMIT_SIGNALS`). Install
+  the tool (`scoop install ryzenadj`); the DLL is auto-discovered, or point
+  `--ryzenadj-dir` at it. It loads a ring0 driver, so the script must be
+  **elevated**.
+  - *Fallback (no ryzenadj):* AMD exposes no throttle flags, so the cap is
+    *inferred* from **LibreHardwareMonitor** package power + CPU load — flagged
+    when, under sustained high load on AC, package power plateaus at the
+    ceiling (auto-calibrated; pass `--cpu-power-cap <watts>` to pin it). With
+    neither ryzenadj nor LHM the CPU row never breathes.
 
 LED brightness follows the laptop screen brightness (scaled, capped well
 below full brightness). If no stats arrive for 5 seconds (script stopped,
@@ -80,13 +89,17 @@ USB drive that appears.
 
 ```powershell
 pip install hidapi psutil wmi pynvml pythonnet
+scoop install ryzenadj                    # AMD APU STAPM/PPT limits + Tctl (authoritative)
 python host\fw16_sysmon.py --fetch-lhm   # one-time: download LibreHardwareMonitorLib into lib/
 python host\fw16_sysmon.py --verbose
 ```
 
-(`pynvml` enables the NVIDIA dGPU power-limit breathe; `pythonnet` + `--fetch-lhm`
-enable the in-process AMD APU power-limit breathe and temperature — see below.
-Both are optional; the core bars work without them.)
+(`pynvml` enables the NVIDIA dGPU power-limit breathe; `ryzenadj` enables the
+authoritative AMD APU power-limit breathe (and an in-process temperature
+source); `pythonnet` + `--fetch-lhm` enable the LibreHardwareMonitor APU
+package-power + temperature path. All optional; the core bars work without
+them. The AMD limit + temperature sources load a ring0 driver, so run the
+script **elevated**.)
 
 Useful flags:
 
@@ -96,14 +109,25 @@ Useful flags:
 - `--igpu-match / --dgpu-match` — regexes that classify GPU adapters by
   name (run with `--verbose` to see the detected adapters; defaults handle
   AMD iGPU + NVIDIA or Radeon RX dGPU)
-- `--cpu-power-cap 54` — APU sustained power ceiling (watts) for the CPU
-  power-limit breathe; auto-calibrated (approximately) if unset
+- `--cpu-power-cap 54` — APU sustained power ceiling (watts) for the *fallback*
+  package-power heuristic; auto-calibrated (approximately) if unset (ignored
+  when ryzenadj is providing the authoritative limit)
 - `--no-nvml` — disable NVIDIA dGPU power/throttle detection
+- `--no-ryzenadj` — disable the authoritative libryzenadj APU STAPM/PPT limit +
+  Tctl source (falls back to the LHM package-power heuristic)
+- `--ryzenadj-dir DIR` — directory holding `libryzenadj.dll` + `WinRing0x64.sys`
+  (auto-discovered from a `ryzenadj` install / scoop shim if unset)
 - `--fetch-lhm` — download LibreHardwareMonitorLib + its deps into `lib/` and exit
 - `--no-lhm-lib` — disable the in-process LibreHardwareMonitorLib APU source
 
-Temperature **and** the AMD APU power-limit breathe come from one of (tried in
-this order):
+The **AMD APU power-limit breathe** comes from `ryzenadj`/`libryzenadj` (the SMU
+table; authoritative) with the LibreHardwareMonitor package-power heuristic as
+fallback — see [Power-limit indication](#power-limit-indication) above. With
+`--verbose`, the `limits …` line shows either `cpu ryzenadj[stapm=…/…W slow=…/…W
+…]` (a `*` marks a binding limit) or `cpu heuristic(pkg_w=… load=…)`, so you can
+confirm which source is driving the CPU row.
+
+**Temperature** comes from one of (tried in this order):
 
 - **LibreHardwareMonitorLib in-process** (recommended) — `pip install pythonnet`,
   then run `python host\fw16_sysmon.py --fetch-lhm` once to download the engine
@@ -111,9 +135,11 @@ this order):
   and temperature directly — no separate app and no WMI provider. It loads a
   ring0 driver to read the CPU, so the script must run **elevated**; if Windows
   *Core Isolation → Memory Integrity* is enabled it may block that driver (the
-  same limitation the LHM app hits). Disable with `--no-lhm-lib`. With
-  `--verbose`, a `limits …` line shows `cpu(pkg_w=… load=…)` so you can confirm
-  the sensors are feeding data.
+  same limitation the LHM app hits). Disable with `--no-lhm-lib`.
+- **ryzenadj Tctl** — when `ryzenadj` is installed for the power-limit breathe,
+  its die temperature (Tctl) is read from the same in-process SMU handle for
+  free, so the APU power-limit feature alone is enough to light the temperature
+  row even without LibreHardwareMonitor. Also elevated-only.
 - the [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)
   **app** running with its WMI provider enabled — fallback when the in-process
   lib isn't set up; same CPU package-power sensor.
@@ -124,8 +150,7 @@ this order):
   the battery bar scales to the cap.
 - a working ACPI thermal zone — last resort; the FW16 exposes zones that
   *look* valid but report frozen values (a constant ~63 °C), and reading them
-  needs admin rights anyway. Temperature stays dark, and the APU power-limit
-  breathe is unavailable, if no source provides the data.
+  needs admin rights anyway. Temperature stays dark if no source provides data.
 
 ### Start at login (no service required)
 
@@ -144,6 +169,9 @@ every threshold, colour, mapping and cadence is a constant near the top of
 
 - **thresholds**: `BATT_CRITICAL_PCT`, `MEM_CRITICAL_PCT`, `TEMP_CRITICAL_C`,
   `TEMP_MIN_C` / `TEMP_MAX_C`, `ASSIST_MIN_W`
+- **APU power limit**: `APU_LIMIT_NEAR` (how close to a limit counts as
+  binding) and `APU_LIMIT_SIGNALS` (which SMU limits — `stapm`/`slow`/`fast` —
+  trigger the breathe)
 - **colours**: the `HUE_*` constants and the temperature gradient endpoints
 - **mappings**: `RATE_SEG_W1/2/3` (watts → animated segments),
   `ROW_VAL_BATT_IDLE`, `BATT_DRIFT_FLOOR`, `LIMIT_FLOOR`
