@@ -18,7 +18,9 @@ VIA channel (0x42):
 Dependencies (Windows):
     pip install hidapi psutil wmi
     optional:
-      pynvml    -- NVIDIA dGPU power/throttle reasons (authoritative)
+      pynvml    -- NVIDIA dGPU utilization (preferred over the PDH 3D-engine
+                   counter: matches nvidia-smi, counts compute/encode/copy
+                   engines too) + power/throttle reasons (authoritative)
       ryzenadj  -- AMD APU STAPM/PPT power limits + Tctl read straight from the
                    SMU power-metrics table via its libryzenadj.dll (the same
                    source HWiNFO reads for "APU STAPM Limit"). Install the
@@ -358,7 +360,16 @@ class GpuMonitor:
 
     Roughly Task Manager's headline GPU number, and ~1ms per read instead
     of the seconds a Win32_PerfFormattedData WMI query takes.
+
+    When launched at boot (Task Scheduler) the graphics stack may not be up
+    yet: the "GPU Engine" counter set can be unregistered, and the DirectX
+    registry key still holds only the previous boot's adapter LUIDs (LUIDs
+    are per-boot, so the stale entries never match live counters). Both are
+    transient, so failures here are retried from read() instead of disabling
+    GPU reporting for the life of the process.
     """
+
+    RETRY_S = 10  # min seconds between PDH-open / registry-rescan attempts
 
     def __init__(self, igpu_pattern, dgpu_pattern):
         self.igpu_re = re.compile(igpu_pattern, re.IGNORECASE)
@@ -366,21 +377,43 @@ class GpuMonitor:
         self.luid_names = adapter_luid_names()
         self.dgpu_present = any(self.dgpu_re.search(n) for n in self.luid_names.values())
         self.query = None
+        self._open_failed = False
+        self._next_open = 0.0
+        self._next_rescan = 0.0
         if win32pdh is None:
             print("win32pdh not available; GPU usage disabled", file=sys.stderr)
             return
+        self._open_query()
+
+    def _open_query(self):
+        self._next_open = time.monotonic() + self.RETRY_S
         try:
-            self.query = win32pdh.OpenQuery()
+            query = win32pdh.OpenQuery()
             self.counter = win32pdh.AddEnglishCounter(
-                self.query, r"\GPU Engine(*engtype_3D)\Utilization Percentage")
-            win32pdh.CollectQueryData(self.query)  # prime; % counters need two samples
+                query, r"\GPU Engine(*engtype_3D)\Utilization Percentage")
+            win32pdh.CollectQueryData(query)  # prime; % counters need two samples
+            self.query = query
+            if self._open_failed:
+                print("GPU counters now available", file=sys.stderr)
         except Exception as err:
-            print(f"GPU counters unavailable: {err}", file=sys.stderr)
-            self.query = None
+            if not self._open_failed:
+                print(f"GPU counters unavailable (will retry): {err}", file=sys.stderr)
+                self._open_failed = True
+
+    def _rescan_adapters(self):
+        """Re-read the LUID->name map; drivers register adapters after boot."""
+        self._next_rescan = time.monotonic() + self.RETRY_S
+        fresh = adapter_luid_names()
+        if fresh:
+            self.luid_names.update(fresh)
+            self.dgpu_present = any(
+                self.dgpu_re.search(n) for n in self.luid_names.values())
 
     def read(self):
         """Return (igpu_pct, dgpu_pct, dgpu_present)."""
         if self.query is None:
+            if win32pdh is not None and time.monotonic() >= self._next_open:
+                self._open_query()
             return 0, 0, self.dgpu_present
         try:
             win32pdh.CollectQueryData(self.query)
@@ -395,6 +428,10 @@ class GpuMonitor:
                 continue
             luid = (int(m.group(1), 16) << 32) | int(m.group(2), 16)
             per_luid[luid] = per_luid.get(luid, 0.0) + value
+
+        if (any(l not in self.luid_names for l in per_luid)
+                and time.monotonic() >= self._next_rescan):
+            self._rescan_adapters()
 
         igpu = dgpu = 0.0
         for luid, total in per_luid.items():
@@ -411,23 +448,36 @@ class NvGpuLimits:
 
     NVIDIA exposes authoritative throttle reasons (no inference needed):
     nvmlDeviceGetCurrentClocksThrottleReasons returns a bitmask, and the
-    enforced power limit drops on battery. Disables itself permanently if
-    pynvml is missing, NVML won't init, or there's no NVIDIA GPU.
+    enforced power limit drops on battery. Disables itself if pynvml is
+    missing or there's no NVIDIA GPU; an NVML init failure is retried from
+    evaluate() because at boot (Task Scheduler) the NVIDIA driver service
+    may simply not be running yet.
     """
+
+    RETRY_S = 10  # min seconds between NVML init attempts
 
     def __init__(self, enabled=True):
         self.available = False
         self.handle = None
         self._deb = [(False, 0), (False, 0)]  # debounce state for (power, psrc)
+        self._retryable = False
+        self._init_failed = False
+        self._next_init = 0.0
         if not enabled:
             return
         if pynvml is None:
             print("pynvml not installed; dGPU limit detection disabled",
                   file=sys.stderr)
             return
+        self._retryable = True
+        self._try_init()
+
+    def _try_init(self):
+        self._next_init = time.monotonic() + self.RETRY_S
         try:
             pynvml.nvmlInit()
             if pynvml.nvmlDeviceGetCount() < 1:
+                self._retryable = False  # driver is up but no NVIDIA GPU
                 return
             self.handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             # constant names were renamed Throttle -> Event across versions
@@ -441,10 +491,34 @@ class NvGpuLimits:
                 getattr(pynvml, "nvmlDeviceGetCurrentClocksThrottleReasons", None)
                 or getattr(pynvml, "nvmlDeviceGetCurrentClocksEventReasons", None))
             self.available = self._reasons_fn is not None
+            self._retryable = False
+            if self.available and self._init_failed:
+                print("NVML now initialized; dGPU limit detection active",
+                      file=sys.stderr)
         except Exception as err:
-            print(f"NVML init failed; dGPU limit detection disabled: {err}",
-                  file=sys.stderr)
             self.available = False
+            if not self._init_failed:
+                print(f"NVML init failed; dGPU limit detection "
+                      f"{'will retry' if self._retryable else 'disabled'}: {err}",
+                      file=sys.stderr)
+                self._init_failed = True
+
+    def utilization(self):
+        """Device-wide dGPU busy percentage via NVML, or None if unavailable.
+
+        Preferred over the PDH 3D-engine sum for the dGPU row: it is what
+        nvidia-smi reports, counts every engine (compute/encode/copy, which
+        engtype_3D misses), and needs no LUID->adapter mapping.
+        """
+        if not self.available:
+            if self._retryable and time.monotonic() >= self._next_init:
+                self._try_init()
+            if not self.available:
+                return None
+        try:
+            return pynvml.nvmlDeviceGetUtilizationRates(self.handle).gpu
+        except Exception:
+            return None
 
     def evaluate(self, on_ac, weak_charger):
         """Return (power_limited, psrc_limited) for the dGPU.
@@ -453,7 +527,10 @@ class NvGpuLimits:
         power-source limit; plain battery operation is left to the battery row.
         """
         if not self.available:
-            return self._stabilize(False, False)
+            if self._retryable and time.monotonic() >= self._next_init:
+                self._try_init()
+            if not self.available:
+                return self._stabilize(False, False)
         try:
             reasons = self._reasons_fn(self.handle)
             draw = pynvml.nvmlDeviceGetPowerUsage(self.handle) / 1000.0
@@ -1445,6 +1522,13 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
 
     igpu, dgpu, dgpu_present = gpu.read()
 
+    # dGPU: prefer NVML's device-wide utilization over the PDH 3D-engine sum
+    # (see NvGpuLimits.utilization). PDH stays as the fallback and still
+    # covers the iGPU, which NVML can't see.
+    nv_util = nv.utilization()
+    if nv_util is not None:
+        dgpu, dgpu_present = nv_util, True
+
     # One LHM snapshot feeds both temperature and CPU power this tick.
     lhm_temp, cpu_pkg_w, cpu_load = cache["lhm"]()
 
@@ -1514,6 +1598,7 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
 
         "dgpu": clamp(dgpu, 0, 100),
         "dgpu_present": dgpu_present,
+        "dgpu_src": "nvml" if nv_util is not None else "pdh",
         "dgpu_power": dgpu_power,
         "dgpu_psrc": dgpu_psrc,
 
@@ -1657,7 +1742,8 @@ def main():
                     cpu_src = f"heuristic(pkg_w={m['cpu_pkg_w']} load={m['cpu_load']})"
                 print(f"  limits ac={m['ac']} weak={m['weak_charger']} "
                       f"cpu {cpu_src} ->power={m['cpu_power']},psrc={m['cpu_psrc']} "
-                      f"dgpu->power={m['dgpu_power']},psrc={m['dgpu_psrc']}")
+                      f"dgpu[{m['dgpu_src']}]->power={m['dgpu_power']},"
+                      f"psrc={m['dgpu_psrc']}")
             for rep in build_frame(rows, m["brightness"]):
                 dev.write(b"\x00" + rep)
             # drain the VIA echo so the report buffer doesn't fill up
