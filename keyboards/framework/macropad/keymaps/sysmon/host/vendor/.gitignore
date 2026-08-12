@@ -1,0 +1,7 @@
+# libryzenadj.dll + its WinRing0 ring0 driver are fetched on demand, not
+# committed (LGPL-3.0 / OpenLibSys native binaries). Populate this directory
+# with:
+#   packaging\fetch-vendor.ps1
+# This .gitignore keeps the otherwise-empty directory in the tree.
+*
+!.gitignore

@@ -58,6 +58,75 @@ below full brightness). If no stats arrive for 5 seconds (script stopped,
 reboot, etc.) the macropad falls back to the regular RGB matrix effect, so
 set a calm/dim effect via VIA as the fallback.
 
+## Install
+
+Download `FW16-Sysmon-Setup-<version>.exe` and run it. It bundles everything —
+there is no Python to install, no `pip`, no `scoop`.
+
+The installer:
+
+- checks the machine first and tells you what will and will not work here
+  (macropad attached? AMD or Intel? Memory Integrity blocking the sensor
+  driver? `framework_tool` present?), and offers to install the one optional
+  dependency it can fetch for you (`framework_tool`, via winget);
+- installs the host as a **Windows service running as LocalSystem, set to start
+  at boot** — the bars are live at the login screen, not just after you sign in;
+- optionally **flashes the bundled firmware** onto the macropad (tick the box on
+  the "After installing" page, or run *Flash firmware onto the macropad* from
+  the Start menu later);
+- writes a fully commented `sysmon.ini` you can retune without rebuilding
+  anything;
+- removes the old `FW16 Macropad Sysmon` scheduled task if you were running the
+  mod that way. This matters: the macropad has a single raw-HID endpoint, and
+  two processes writing it fight over it.
+
+The installer is **not code-signed**, so SmartScreen shows
+"Windows protected your PC" on first run — *More info* → *Run anyway*.
+
+### After installing
+
+| Where | What |
+| ----- | ---- |
+| `C:\Program Files\FW16 Macropad Sysmon\` | the program and its bundled DLLs |
+| `C:\ProgramData\FW16Sysmon\sysmon.ini` | every tunable (see [Tuning](#tuning-no-reflash)) |
+| `C:\ProgramData\FW16Sysmon\sysmon.log` | rotating service log |
+| Start menu | self-test, live console view, edit settings, view log, flash firmware, restart service |
+
+Managing the service:
+
+```powershell
+sc query FW16Sysmon
+sc stop FW16Sysmon
+sc start FW16Sysmon          # also: the "Restart the service" Start-menu item
+```
+
+If a row is dark and you want to know why, run the **self-test** — it probes
+every sensor and dependency and prints a remedy for anything missing:
+
+```powershell
+fw16-sysmon.exe --selftest
+```
+
+## Known limitations
+
+sysmon degrades one row at a time rather than refusing to run, so most of these
+cost you a single indicator:
+
+- **Memory Integrity / the vulnerable-driver blocklist.** Both the AMD SMU
+  reader (`libryzenadj`) and LibreHardwareMonitor get at the CPU through the
+  WinRing0 ring0 driver, which Windows blocks when Core Isolation → Memory
+  Integrity is on. You lose the CPU-row power-limit breathe and the in-process
+  temperature; temperature still comes from the EC via `framework_tool`.
+  `--selftest` says plainly when this is what is happening.
+- **Intel Framework 16s.** No AMD SMU, so no `ryzenadj` path; CPU power and
+  temperature come from LibreHardwareMonitor instead. Everything else is
+  unchanged.
+- **No dGPU / no NVIDIA card.** Row 5 stays dark by design. An AMD dGPU still
+  shows *usage* (via the PDH counters) but not the power-limit breathe, which
+  needs NVML.
+- **`framework_tool` not installed.** The battery bar is scaled to 100% instead
+  of the EC's charge cap, and one temperature fallback is unavailable. Optional.
+
 ## Build and flash the firmware
 
 ```sh
@@ -73,33 +142,89 @@ $env:MSYSTEM='MINGW64'
 & C:\QMK_MSYS\usr\bin\bash.exe -l -c "cd /c/Users/Msprg/repo/framework_qmk_firmware && make -r -R -f builddefs/build_keyboard.mk -j8 KEYBOARD=framework/macropad KEYMAP=sysmon TARGET=framework_macropad_sysmon QMK_BIN=qmk SILENT=false"
 ```
 
-Flash by holding the **top-left + bottom-left keys while inserting the
-module**, or — much easier — send the bootloader-jump packet from the host
-script (same mechanism Framework's official updater uses: VIA command
-`0x0B` padded with `0xFE`):
+Flashing is one command — it jumps to the bootloader, waits for the `RPI-RP2`
+drive, copies the image and waits for the module to come back (pausing the
+service around it, since both want the same raw-HID endpoint):
 
 ```powershell
-python host\fw16_sysmon.py --bootloader
+fw16-sysmon.exe --flash                       # the bundled image
+fw16-sysmon.exe --flash path\to\custom.uf2    # or your own build
 ```
 
-Then copy the built `framework_macropad_sysmon.uf2` onto the `RPI-RP2`
-USB drive that appears.
+The bootloader jump is the same mechanism Framework's official updater uses:
+VIA command `0x0B` padded with `0xFE`. If the module is not attached, or you
+would rather do it by hand, hold the **top-left + bottom-left keys while
+inserting the module** and copy the `.uf2` onto the drive that appears.
+`--bootloader` still exists if you only want the jump.
 
-## Host script (Windows)
+## Building the installer
+
+```powershell
+host\packaging\build.ps1                 # -Clean, -BuildFirmware, -SkipVendor
+```
+
+One command, from a clean checkout to `host\dist\FW16-Sysmon-Setup-<ver>.exe`:
+it creates an isolated build venv, downloads the redistributable native
+libraries (`libryzenadj` + WinRing0, LibreHardwareMonitorLib — see
+[packaging/THIRD-PARTY-NOTICES.md](host/packaging/THIRD-PARTY-NOTICES.md)),
+freezes the host with PyInstaller, smoke-tests the result and wraps it with
+Inno Setup (installing Inno via winget if it is missing). `-BuildFirmware`
+rebuilds the `.uf2` through QMK MSYS first; otherwise the existing
+`.build\framework_macropad_sysmon.uf2` is reused.
+
+The bundle is deliberately **onedir**, not onefile: this runs as a boot-start
+service, so a self-extracting bundle would pay a ~30 MB unpack on every boot,
+and — more importantly — WinRing0 loads its kernel driver from a path relative
+to the running executable, which only a stable directory provides.
+
+## Running the host from source (development)
+
+Only needed to hack on the host itself — end users install the packaged build.
 
 ```powershell
 pip install hidapi psutil wmi pynvml pythonnet
-scoop install ryzenadj                    # AMD APU STAPM/PPT limits + Tctl (authoritative)
-python host\fw16_sysmon.py --fetch-lhm   # one-time: download LibreHardwareMonitorLib into lib/
+host\packaging\fetch-vendor.ps1           # libryzenadj + WinRing0 -> vendor\, LHM -> lib\
+host\dev.ps1                              # the iteration loop
+```
+
+`dev.ps1` is the fast path, because three things otherwise have to be
+remembered every single time:
+
+- the macropad has **one** raw-HID endpoint, so the installed service has to be
+  stopped or it fights the source run — `dev.ps1` stops it and restarts it on
+  exit, **including on Ctrl+C**, which is how a live view normally ends;
+- the ring0 sensors need elevation and `.venv\Scripts\python.exe` is manifested
+  `requireAdministrator`, so it cannot be launched from a normal shell at all —
+  `dev.ps1` self-elevates rather than failing with `code 740`;
+- a source run resolves the firmware image to `.build\framework_macropad_sysmon.uf2`,
+  so `-Flash` always flashes what was just built.
+
+```powershell
+host\dev.ps1                       # live view (--verbose)
+host\dev.ps1 -Build -Flash         # rebuild firmware via QMK MSYS, then flash it
+host\dev.ps1 -SelfTest             # probe sensors from the source tree
+host\dev.ps1 -- --interval 1.0     # anything after -- goes to fw16_sysmon.py
+```
+
+Or run the script directly, if you would rather manage the service yourself:
+
+```powershell
 python host\fw16_sysmon.py --verbose
 ```
 
-(`pynvml` enables the NVIDIA dGPU power-limit breathe; `ryzenadj` enables the
-authoritative AMD APU power-limit breathe (and an in-process temperature
-source); `pythonnet` + `--fetch-lhm` enable the LibreHardwareMonitor APU
-package-power + temperature path. All optional; the core bars work without
-them. The AMD limit + temperature sources load a ring0 driver, so run the
-script **elevated**.)
+(`pynvml` enables the NVIDIA dGPU power-limit breathe; `libryzenadj` enables the
+authoritative AMD APU power-limit breathe and an in-process temperature source;
+`pythonnet` + the LHM DLLs enable the LibreHardwareMonitor APU package-power +
+temperature path. All optional; the core bars work without them. The AMD limit
+and temperature sources load a ring0 driver, so run the script **elevated**.)
+
+A source checkout keeps everything local — `sysmon.ini` and `sysmon.log` sit
+next to the script rather than in `%ProgramData%`, so a checkout never collides
+with an installed copy. The layout rules live in
+[`host/paths.py`](host/paths.py).
+
+The service can be exercised before packaging too: `--install-service` registers
+the interpreter plus the script, so `sc start FW16Sysmon` runs the working tree.
 
 Useful flags:
 
@@ -116,9 +241,23 @@ Useful flags:
 - `--no-ryzenadj` — disable the authoritative libryzenadj APU STAPM/PPT limit +
   Tctl source (falls back to the LHM package-power heuristic)
 - `--ryzenadj-dir DIR` — directory holding `libryzenadj.dll` + `WinRing0x64.sys`
-  (auto-discovered from a `ryzenadj` install / scoop shim if unset)
-- `--fetch-lhm` — download LibreHardwareMonitorLib + its deps into `lib/` and exit
+  (the bundled copy beside the executable is used first, then a `ryzenadj`
+  install / scoop shim)
+- `--fetch-lhm` — download LibreHardwareMonitorLib + its deps into `lib/` and
+  exit; add `--force` to refresh files that are already there
 - `--no-lhm-lib` — disable the in-process LibreHardwareMonitorLib APU source
+
+Deployment flags (also used by the installer):
+
+- `--selftest` — probe every sensor and dependency, print a remedy for anything
+  missing; `--json` emits the same as machine-readable output
+- `--flash [UF2]` — bootloader jump, wait for `RPI-RP2`, copy, wait for the
+  module to return (defaults to the bundled image)
+- `--install-service` / `--uninstall-service` / `--start-service` /
+  `--stop-service` — manage the LocalSystem boot-start service
+- `--config PATH` — use a specific tunables INI
+- `--write-default-config` — write the fully commented default INI (never
+  overwrites an existing one)
 
 The **AMD APU power-limit breathe** comes from `ryzenadj`/`libryzenadj` (the SMU
 table; authoritative) with the LibreHardwareMonitor package-power heuristic as
@@ -152,20 +291,44 @@ confirm which source is driving the CPU row.
   *look* valid but report frozen values (a constant ~63 °C), and reading them
   needs admin rights anyway. Temperature stays dark if no source provides data.
 
-### Start at login (no service required)
+### Starting automatically
 
-Task Scheduler → Create Task:
+The installer registers a **LocalSystem service set to Automatic start**, so the
+macropad is live at the login screen rather than after sign-in. Running as
+LocalSystem also means the process is already elevated, which is what the ring0
+sensors need — the old Task Scheduler job had to ask for "highest privileges" to
+get the same.
 
-- Trigger: *At log on*
-- Action: `pythonw.exe C:\path\to\fw16_sysmon.py`
-- Check *Run only when user is logged on* (WMI brightness/GPU counters are
-  per-session)
+The service stops cleanly on shutdown and handles resume from sleep (the module
+re-enumerates and the SMU table mapping does not reliably survive S0ix, so both
+are rebuilt). Nothing is sent on the way out: the firmware's own no-data timeout
+restores the stock RGB effect a few seconds later, which is also what happens on
+a crash or a yanked module, so there is only one fallback path to reason about.
+
+If you would rather not use a service, `fw16-sysmon.exe` still runs perfectly
+well in the foreground, and a Task Scheduler *At log on* job pointed at it works
+exactly as it always did.
 
 ## Tuning (no reflash)
 
 The firmware is a generic render engine — it holds *no* monitoring policy, so
-every threshold, colour, mapping and cadence is a constant near the top of
-`host/fw16_sysmon.py`. Edit and restart the script; no recompile or reflash:
+every threshold, colour, mapping and cadence lives on the host. In an installed
+copy they are all in
+
+```text
+C:\ProgramData\FW16Sysmon\sysmon.ini
+```
+
+which is generated fully commented, with the units and the reasoning for each
+value. Edit it and restart the service (*Restart the service* in the Start menu,
+or `sc stop FW16Sysmon` / `sc start FW16Sysmon`) — no rebuild, no reflash. A
+malformed value is reported in `sysmon.log` and ignored rather than being fatal,
+so a typo can never stop a boot-start service from coming up.
+
+Running from source, the same file is written next to the script; create it with
+`--write-default-config`. The values are still ordinary module constants in
+`host/fw16_sysmon.py` — the INI simply rebinds them at start-up — so editing
+either works during development. What is available:
 
 - **thresholds**: `BATT_CRITICAL_PCT`, `MEM_CRITICAL_PCT`, `TEMP_CRITICAL_C`,
   `TEMP_MIN_C` / `TEMP_MAX_C`, `ASSIST_MIN_W`
@@ -178,6 +341,8 @@ every threshold, colour, mapping and cadence is a constant near the top of
 - **cadences**: the `PERIOD_*` constants (blink / breathe / pulse, in 32 ms units)
 - **globals**: `GLIDE_MS_DEFAULT`, `TIMEOUT_MS_DEFAULT`
 - **polling**: the `TTL_*` source-cache lifetimes (how often each slow sensor is read)
+- **`[cli]`**: defaults for every command-line option (`max-led`, `interval`,
+  `igpu-match`, …). An explicitly passed flag still wins over the file.
 
 Only the wire protocol below is shared with the firmware; everything else lives
 on the host.
