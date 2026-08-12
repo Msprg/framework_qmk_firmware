@@ -52,11 +52,17 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import winreg
 
 import hid  # hidapi package
 import psutil
+
+import paths
+from applog import log, pause_if_own_console
+
+__version__ = "1.0.0"
 
 try:
     import wmi as wmi_module
@@ -248,7 +254,10 @@ TTL_EC_THERMAL = 2.5     # throttled framework_tool --thermal fallback
 # in-process via pythonnet so the APU package-power/load/temperature sensors can
 # be read directly -- no separate LHM app and no WMI provider. The native DLLs
 # are fetched into lib/ with `--fetch-lhm` (that directory is gitignored).
-LHM_LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
+#
+# Resolved through paths.lhm_lib_dir() rather than __file__: when frozen,
+# __file__ points into PyInstaller's per-run temp extraction directory, which is
+# a different path on every start and is deleted at exit.
 LHM_DLL = "LibreHardwareMonitorLib.dll"
 HIDSHARP_DLL = "HidSharp.dll"
 # NuGet packages the DLLs come from (flat v2 API gives the latest stable).
@@ -869,11 +878,15 @@ class WmiSources:
         return None
 
 
-def fetch_lhm_dlls(dest=LHM_LIB_DIR):
+def fetch_lhm_dlls(dest=None, force=False):
     """Download LibreHardwareMonitorLib + HidSharp DLLs from NuGet into dest.
 
     A NuGet .nupkg is a zip; we pull the latest stable of each package and copy
     out the .NET Framework build of each DLL. Run once via `--fetch-lhm`.
+
+    Existing files are left alone unless `force`. That keeps re-runs cheap, and
+    avoids the common failure of trying to overwrite a DLL that a running
+    sysmon service still has mapped in-process.
     """
     import urllib.request
     import zipfile
@@ -881,9 +894,15 @@ def fetch_lhm_dlls(dest=LHM_LIB_DIR):
     import glob
     import shutil
 
+    if dest is None:
+        dest = paths.lhm_lib_dir()
     os.makedirs(dest, exist_ok=True)
 
     def grab(pkg, dll):
+        target = os.path.join(dest, dll)
+        if os.path.exists(target) and not force:
+            print(f"  have    {dll}")
+            return
         with tempfile.TemporaryDirectory() as tmp:
             nupkg = os.path.join(tmp, pkg + ".nupkg")
             urllib.request.urlretrieve(
@@ -921,7 +940,13 @@ def fetch_lhm_dlls(dest=LHM_LIB_DIR):
             pick = pick or (candidates[0] if candidates else None)
             if not pick:
                 raise RuntimeError(f"{dll} not found in the {pkg} package")
-            shutil.copy2(pick, os.path.join(dest, dll))
+            try:
+                shutil.copy2(pick, target)
+            except PermissionError as err:
+                raise RuntimeError(
+                    f"cannot write {target}: {err}. A running sysmon service or "
+                    f"scheduled task still has this DLL loaded -- stop it "
+                    f"(sc stop FW16Sysmon) and retry.") from err
             print(f"  fetched {dll}  <- {os.path.relpath(pick, tmp)}")
 
     grab(LHM_NUGET, LHM_DLL)
@@ -945,11 +970,13 @@ class LhmLibSource:
     the WMI snapshot.
     """
 
-    def __init__(self, enabled=True, lib_dir=LHM_LIB_DIR):
+    def __init__(self, enabled=True, lib_dir=None):
         self.available = False
         self._computer = None
         self._cpu_hw = []
         self._resolver = None
+        if lib_dir is None:
+            lib_dir = paths.lhm_lib_dir()
         lhm_dll = os.path.join(lib_dir, LHM_DLL)
         hid_dll = os.path.join(lib_dir, HIDSHARP_DLL)
         if not enabled:
@@ -1059,15 +1086,23 @@ RYZENADJ_DRIVER = "WinRing0x64.sys"
 def find_ryzenadj_dir(explicit=None):
     """Locate the directory holding libryzenadj.dll (+ its WinRing0 driver).
 
-    Order: an explicit --ryzenadj-dir; the real install dir behind a `ryzenadj`
-    shim on PATH (scoop writes a `.shim` sidecar whose `path =` points at the
-    actual exe, which is NOT where the shim lives); then the conventional scoop
-    location. Returns None if the DLL isn't found anywhere.
+    Order: an explicit --ryzenadj-dir; the bundled copy shipped beside the
+    executable; the real install dir behind a `ryzenadj` shim on PATH (scoop
+    writes a `.shim` sidecar whose `path =` points at the actual exe, which is
+    NOT where the shim lives); then the conventional scoop location. Returns
+    None if the DLL isn't found anywhere.
+
+    The bundled copy must be tried before the PATH/scoop probes, because those
+    two are inherently user-scoped and both fail under the service: as
+    LocalSystem, %USERPROFILE% is C:\\Windows\\system32\\config\\systemprofile
+    and a user's scoop shims are not on the machine PATH. Shipping the DLL is
+    what makes the APU power-limit breathe work from session 0.
     """
     import shutil
     cands = []
     if explicit:
         cands.append(explicit)
+    cands.append(paths.vendor_dir())
     exe = shutil.which("ryzenadj")
     if exe:
         cands.append(os.path.dirname(exe))
@@ -1177,12 +1212,18 @@ class RyzenAdjSource:
         image; when libryzenadj is hosted by python that's the interpreter dir.
         Copy the .sys there if it's missing (if the copy can't happen, init
         just fails and the caller falls back).
+
+        The target is the *process image* directory in both layouts -- the venv
+        interpreter's directory in a source run, the bundle's exe directory when
+        frozen. In the installed layout that makes this a no-op by design:
+        paths.vendor_dir() already is the exe's directory, so src == dst, the
+        installer's copy is in the right place, and the service never writes
+        into Program Files.
         """
         try:
             import shutil
             src = os.path.join(dll_dir, RYZENADJ_DRIVER)
-            dst = os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
-                               RYZENADJ_DRIVER)
+            dst = os.path.join(paths.process_image_dir(), RYZENADJ_DRIVER)
             if os.path.isfile(src) and not os.path.isfile(dst):
                 shutil.copyfile(src, dst)
         except OSError:
@@ -1456,14 +1497,21 @@ ROW_BUILDERS = [
 ]
 
 
-def build_frame(rows, brightness, glide_ms=GLIDE_MS_DEFAULT,
-                timeout_ms=TIMEOUT_MS_DEFAULT):
+def build_frame(rows, brightness, glide_ms=None, timeout_ms=None):
     """Build the two 32-byte reports for one tick.
 
     rows is the list of six RowDesc objects in fixed row order. Returns
     [frame_a, frame_b]; the caller writes each as b"\\x00" + report.
+
+    The two globals resolve from the module constants in the body, not as
+    default arguments: default arguments bind once at import, which would
+    freeze them before config.py has had a chance to apply the INI.
     """
     assert len(rows) == 6
+    if glide_ms is None:
+        glide_ms = GLIDE_MS_DEFAULT
+    if timeout_ms is None:
+        timeout_ms = TIMEOUT_MS_DEFAULT
 
     frame_a = bytearray(REPORT_LEN)
     frame_a[0] = VIA_CMD_CUSTOM_SET_VALUE
@@ -1610,7 +1658,13 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
     }
 
 
-def main():
+def build_parser():
+    """Build the CLI parser.
+
+    Split out of main() so config.py can rewrite the defaults from the INI
+    before parsing (an explicit flag then still wins over the file) and so the
+    service and installer entry points can reuse the exact same options.
+    """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--interval", type=float, default=0.4,
                         help="seconds between updates (default: 0.4)")
@@ -1647,30 +1701,151 @@ def main():
                              "source (fall back to the LHM WMI provider / EC)")
     parser.add_argument("--fetch-lhm", action="store_true",
                         help="download LibreHardwareMonitorLib + HidSharp DLLs "
-                             "into lib/ and exit (needs pythonnet at runtime)")
+                             "into lib/ and exit (needs pythonnet at runtime); "
+                             "files already present are kept")
+    parser.add_argument("--force", action="store_true",
+                        help="with --fetch-lhm: re-download even if the DLLs "
+                             "are already there")
     parser.add_argument("--verbose", action="store_true",
                         help="print each tick's per-row descriptors")
     parser.add_argument("--bootloader", action="store_true",
                         help="reboot the macropad into its UF2 bootloader "
                              "(RPI-RP2 drive) and exit")
-    args = parser.parse_args()
+    parser.add_argument("--version", action="version",
+                        version=f"fw16-sysmon {__version__}")
+
+    deployment = parser.add_argument_group(
+        "deployment", "packaging, service and firmware management")
+    deployment.add_argument("--config", default=None, metavar="PATH",
+                            help="tunables INI to load (default: "
+                                 "%%ProgramData%%\\FW16Sysmon\\sysmon.ini when "
+                                 "installed, else sysmon.ini beside the script)")
+    deployment.add_argument("--write-default-config", action="store_true",
+                            help="write a fully commented default INI to the "
+                                 "config path and exit (never overwrites)")
+    deployment.add_argument("--selftest", action="store_true",
+                            help="probe every data source and dependency, "
+                                 "report what works and how to fix what does not")
+    deployment.add_argument("--json", action="store_true",
+                            help="with --selftest: emit machine-readable JSON "
+                                 "(consumed by the installer)")
+    deployment.add_argument("--flash", nargs="?", const=True, default=None,
+                            metavar="UF2",
+                            help="flash firmware onto the macropad: jump to the "
+                                 "bootloader, wait for the RPI-RP2 drive, copy "
+                                 "the image, wait for it to come back "
+                                 "(default: the bundled .uf2)")
+    deployment.add_argument("--service", action="store_true",
+                            help=argparse.SUPPRESS)  # SCM entry point
+    deployment.add_argument("--install-service", action="store_true",
+                            help="register the boot-start LocalSystem service")
+    deployment.add_argument("--uninstall-service", action="store_true",
+                            help="stop and deregister the service")
+    deployment.add_argument("--start-service", action="store_true",
+                            help="start the installed service")
+    deployment.add_argument("--stop-service", action="store_true",
+                            help="stop the installed service")
+    deployment.add_argument("--restart-service", action="store_true",
+                            help="restart the service (apply sysmon.ini changes)")
+    return parser
+
+
+def bootloader_jump(dev):
+    """Reboot the macropad into its UF2 bootloader over the open raw-HID handle.
+
+    VIA id_bootloader_jump; the 0xFE padding doubles as Framework's factory
+    f_bootloader command, the same trick their official updater uses.
+    """
+    dev.write(b"\x00\x0b" + b"\xfe" * (REPORT_LEN - 1))
+
+
+def main(argv=None, stop_event=None, resume_check=None):
+    # --service is dispatched before anything else: the SCM expects the process
+    # to hand itself to the control dispatcher promptly, and the engine run it
+    # subsequently starts loads the config itself.
+    if "--service" in (argv if argv is not None else sys.argv[1:]):
+        import service
+        return service.run_dispatcher()
+
+    parser = build_parser()
+    import config
+    # Pass this module object explicitly: run as a script it is registered as
+    # __main__, so config could not find it by name without importing a second,
+    # unused copy whose rebound constants nobody would read.
+    config_file = config.apply(parser, argv, sys.modules[__name__])
+    args = parser.parse_args(argv)
+
+    if args.write_default_config:
+        path = config.write_default(args.config, sys.modules[__name__])
+        print(f"Wrote default config to {path}")
+        return
 
     if args.fetch_lhm:
-        fetch_lhm_dlls()
+        fetch_lhm_dlls(force=args.force)
         return
+
+    # The one-shot actions below are what shortcuts and the installer launch.
+    # Each ends with pause_if_own_console() so the window sticks around long
+    # enough to read: an elevated child always gets a fresh console of its own,
+    # which Windows destroys the moment the process returns.
+    if args.selftest:
+        import deps
+        rc = deps.run_selftest(args)
+        if not args.json:
+            pause_if_own_console()
+        return rc
+
+    if args.install_service or args.uninstall_service or \
+            args.start_service or args.stop_service or args.restart_service:
+        import service
+        rc = service.handle_cli(args)
+        # Only --restart-service is user-facing (it is a Start-menu item, and
+        # is how an edited sysmon.ini gets applied). The other four are driven
+        # by Setup, which runs them hidden and waits for them: pausing there
+        # would stall the installer behind an invisible prompt.
+        if args.restart_service:
+            pause_if_own_console()
+        return rc
+
+    if args.flash is not None:
+        import flash
+        rc = flash.flash(None if args.flash is True else args.flash)
+        pause_if_own_console()
+        return rc
 
     if args.bootloader:
         dev = open_device()
         if dev is None:
             print("Macropad not found", file=sys.stderr)
+            pause_if_own_console()
             sys.exit(1)
-        # VIA id_bootloader_jump; 0xFE padding doubles as Framework's
-        # factory f_bootloader command, same trick their updater uses
-        dev.write(b"\x00\x0b" + b"\xfe" * (REPORT_LEN - 1))
+        bootloader_jump(dev)
         dev.close()
         print("Sent bootloader jump; RPI-RP2 drive should appear, then copy "
               "the .uf2 onto it")
+        pause_if_own_console()
         return
+
+    if config_file:
+        log(f"Loaded config from {config_file}")
+    return run(args, stop_event, resume_check)
+
+
+def run(args, stop_event=None, resume_check=None):
+    """The poll loop: gather, build six rows, send two frames, repeat.
+
+    stop_event is a threading.Event the service sets from SvcStop; in console
+    mode it is an Event that is never set, so waiting on it behaves exactly like
+    the time.sleep() this replaced. Blocking on the event rather than sleeping
+    is what makes a service stop prompt instead of taking up to a full interval.
+
+    resume_check, when given, is polled once per tick and returns True after the
+    machine has woken from sleep. The macropad re-enumerates across suspend (so
+    the old handle is stale) and the ryzenadj SMU table mapping does not reliably
+    survive S0ix, so both are torn down and rebuilt rather than waited out.
+    """
+    if stop_event is None:
+        stop_event = threading.Event()
 
     sources = WmiSources()
     ec = EcThermal()
@@ -1709,12 +1884,26 @@ def main():
     psutil.cpu_percent(interval=None)  # prime; first call always returns 0
 
     dev = None
-    while True:
+    while not stop_event.is_set():
         try:
+            if resume_check is not None and resume_check():
+                if dev is not None:
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+                    dev = None
+                if ryzen.available:
+                    ryzen.close()
+                    ryzen = RyzenAdjSource(enabled=not args.no_ryzenadj,
+                                           dll_dir=args.ryzenadj_dir)
+                    cache["ryzenadj"] = Cached(ryzen.snapshot, TTL_RYZENADJ)
             if dev is None:
                 dev = open_device()
                 if dev is None:
-                    time.sleep(5)
+                    # module unplugged / not enumerated yet (the service starts
+                    # before the USB stack has necessarily settled)
+                    stop_event.wait(5)
                     continue
                 print("Connected to macropad")
 
@@ -1758,14 +1947,18 @@ def main():
             except Exception:
                 pass
             dev = None
-            time.sleep(2)
+            stop_event.wait(2)
             continue
-        time.sleep(args.interval)
+        stop_event.wait(args.interval)
 
     if dev is not None:
         dev.close()
     lhmlib.close()
     ryzen.close()
+    # Nothing is sent on the way out on purpose: the firmware's own no-data
+    # timeout (TIMEOUT_MS_DEFAULT) restores the stock RGB effect a few seconds
+    # later, which is also what happens on a crash or an abrupt power loss, so
+    # there is only one fallback path to reason about.
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+# PyInstaller output: the frozen bundle and the Inno Setup installer.
+# Build artifacts, never committed -- regenerate with packaging\build.ps1.
+# (The repo-level .gitignore already covers build/, PyInstaller's work dir.)
+dist/
+
+# Local venv used to run the host from source.
+.venv/
+
+__pycache__/
+*.pyc
