@@ -10,10 +10,12 @@ that used to live in the firmware now lives here as a tunable module-level
 constant. LED brightness is derived from the laptop screen brightness so the
 macropad dims with the screen.
 
-Each tick sends TWO 32-byte VIA "custom set value" raw-HID reports on a private
-VIA channel (0x42):
+Each tick sends THREE 32-byte VIA "custom set value" raw-HID reports on a
+private VIA channel (0x42):
     value_id 0x01 = FRAME A: rows 0,1,2
     value_id 0x02 = FRAME B: rows 3,4,5 + globals
+    value_id 0x03 = FRAME C: optional per-row ghost bars (the NPU on the iGPU
+                    row); older firmware ignores it
 
 Dependencies (Windows):
     pip install hidapi psutil wmi
@@ -123,14 +125,30 @@ REPORT_LEN = 32
 #     data[27] = brightness uint8 0..255 (overall; drives GCC via the slew)
 #     data[28] = glide      uint8 units of 4ms   (default 300ms => 75)
 #     data[29] = timeout    uint8 units of 100ms (default 5000ms => 50)
+#
+# FRAME C (value_id 0x03, optional) = six 4-byte ghost descriptors, row0..row5
+#   (data[3..26]; data[27..31] unused/zero). A ghost is a second, dimmer bar
+#   drawn behind the main one, visible only where it reaches past the main fill:
+#   +0 level  uint8 0..255 fraction of the 4-segment bar (0 = no ghost)
+#   +1 hue    uint8 0..255 QMK hue of the ghost
+#   +2 val    uint8 0..255 ghost brightness (the row's envelope scales it too)
+#   +3 flags  uint8 reserved (0)
+#   Firmware without ghost support ignores value_id 0x03; firmware with it
+#   fades the ghosts out if FRAME C stops arriving within the timeout, and sets
+#   data[27] = 0x01 in its FRAME C echo (older firmware echoes it unchanged),
+#   which is how --selftest tells whether a reflash is needed.
 # ---------------------------------------------------------------------------
 
 VIA_CMD_CUSTOM_SET_VALUE = 0x07
 SYSMON_CHANNEL = 0x42
 SYSMON_VALUE_FRAME_A = 0x01  # rows 0,1,2
 SYSMON_VALUE_FRAME_B = 0x02  # rows 3,4,5 + globals
+SYSMON_VALUE_FRAME_C = 0x03  # ghost bars, rows 0..5
 
 ROW_DESC_LEN = 8
+GHOST_DESC_LEN = 4
+GHOST_ACK_OFFSET = 27   # FRAME C echo byte the firmware marks when it draws ghosts
+GHOST_ACK = 0x01
 
 # Fixed row order (matches sysmon_row_leds; do NOT change).
 ROW_BATTERY = 0
@@ -182,10 +200,12 @@ HUE_GREEN = 85      # full battery / dGPU
 HUE_TEMP_LO = 85    # temperature gradient start (green, cool)
 HUE_TEMP_HI = 0     # temperature gradient end (red, hot)
 HUE_CHARGE_FULL = 85  # charging hue at 100% (pct*85/100, red->green)
+HUE_NPU = 128       # NPU ghost bar on the iGPU row (cyan)
 
 # Brightness levels (base row_val)
 ROW_VAL_FULL = 255
 ROW_VAL_BATT_IDLE = 80   # AC-idle dim green; firmware lifts via visible_pwm
+ROW_VAL_NPU_GHOST = 96   # NPU ghost bar: dim, so the bright iGPU bar reads first
 
 # Battery policy
 BATT_CRITICAL_PCT = 15   # raw % below which a discharging battery blinks red
@@ -369,6 +389,83 @@ def adapter_luid_names():
     return names
 
 
+def compute_only_adapter_luids():
+    """LUIDs of the compute-only (MCDM) adapters, i.e. NPUs, via D3DKMT.
+
+    An NPU is not a display adapter: it is missing from the DirectX registry
+    key adapter_luid_names() reads, so it has no name to match a regex
+    against. The kernel does flag it, though -- D3DKMT_ADAPTERTYPE.ComputeOnly
+    -- and D3DKMTEnumAdapters3 only lists such adapters when asked to with
+    IncludeComputeOnly. That flag is what Task Manager keys its NPU graph on,
+    so it is vendor-neutral (AMD XDNA, Intel AI Boost, ...) with no name
+    matching. Verified non-elevated; expected to work from session 0 as well
+    (a dxgkrnl call, not session-scoped) -- the service records `npu_present`
+    in service-state.json, which is the ground truth for that.
+
+    Returns a set (empty if there is no NPU), or None if the API is missing
+    (Windows older than 10 2004), so the caller can stop asking.
+    """
+    import ctypes
+    from ctypes import wintypes as wt
+
+    try:
+        gdi = ctypes.WinDLL("gdi32")
+        enum3 = gdi.D3DKMTEnumAdapters3
+        query_info = gdi.D3DKMTQueryAdapterInfo
+        close = gdi.D3DKMTCloseAdapter
+    except (OSError, AttributeError):
+        return None
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wt.DWORD), ("HighPart", wt.LONG)]
+
+    class ADAPTERINFO(ctypes.Structure):  # D3DKMT_ADAPTERINFO
+        _fields_ = [("hAdapter", wt.UINT), ("AdapterLuid", LUID),
+                    ("NumOfSources", wt.ULONG),
+                    ("bPrecisePresentRegionsPreferred", wt.BOOL)]
+
+    class ENUMADAPTERS3(ctypes.Structure):  # D3DKMT_ENUMADAPTERS3
+        _fields_ = [("Filter", ctypes.c_uint64), ("NumAdapters", wt.ULONG),
+                    ("pAdapters", ctypes.POINTER(ADAPTERINFO))]
+
+    class QUERYADAPTERINFO(ctypes.Structure):  # D3DKMT_QUERYADAPTERINFO
+        _fields_ = [("hAdapter", wt.UINT), ("Type", ctypes.c_int),
+                    ("pPrivateDriverData", ctypes.c_void_p),
+                    ("PrivateDriverDataSize", wt.UINT)]
+
+    class CLOSEADAPTER(ctypes.Structure):
+        _fields_ = [("hAdapter", wt.UINT)]
+
+    FILTER_INCLUDE_COMPUTE_ONLY = 1 << 0
+    KMTQAITYPE_ADAPTERTYPE = 15
+    ADAPTERTYPE_COMPUTE_ONLY = 1 << 11
+
+    # First call (no buffer) reports how many entries to allocate; the second
+    # fills them in and sets NumAdapters to the real count. Every returned
+    # handle is open and must be closed.
+    req = ENUMADAPTERS3(FILTER_INCLUDE_COMPUTE_ONLY, 0, None)
+    if enum3(ctypes.byref(req)) != 0 or req.NumAdapters == 0:
+        return set()
+    arr = (ADAPTERINFO * req.NumAdapters)()
+    req.pAdapters = arr
+    if enum3(ctypes.byref(req)) != 0:
+        return set()
+
+    found = set()
+    for info in arr[:req.NumAdapters]:
+        try:
+            kind = wt.UINT(0)
+            q = QUERYADAPTERINFO(info.hAdapter, KMTQAITYPE_ADAPTERTYPE,
+                                 ctypes.cast(ctypes.byref(kind), ctypes.c_void_p),
+                                 ctypes.sizeof(kind))
+            if query_info(ctypes.byref(q)) == 0 and kind.value & ADAPTERTYPE_COMPUTE_ONLY:
+                luid = info.AdapterLuid
+                found.add(((luid.HighPart & 0xFFFFFFFF) << 32) | luid.LowPart)
+        finally:
+            close(ctypes.byref(CLOSEADAPTER(info.hAdapter)))
+    return found
+
+
 class GpuMonitor:
     """3D engine utilization per adapter via a persistent PDH query.
 
@@ -381,9 +478,20 @@ class GpuMonitor:
     are per-boot, so the stale entries never match live counters). Both are
     transient, so failures here are retried from read() instead of disabling
     GPU reporting for the life of the process.
+
+    NPU utilization rides the same query. The NPU publishes its engines under
+    the same "GPU Engine" counter set, but has no 3D engine (an AMD XDNA NPU
+    exposes a single engtype_Compute engine) and no DirectX registry entry, so
+    it is found by LUID instead -- compute_only_adapter_luids() -- and read
+    through a counter scoped to that LUID. That keeps the per-tick cost to the
+    NPU's own handful of instances rather than widening the 3D counter to every
+    engine of every adapter (roughly double the instances).
     """
 
     RETRY_S = 10  # min seconds between PDH-open / registry-rescan attempts
+    # An NPU driver can register after a boot-start service is already
+    # running, so keep looking for this long before deciding there is none.
+    NPU_DISCOVERY_S = 300
 
     def __init__(self, igpu_pattern, dgpu_pattern):
         self.igpu_re = re.compile(igpu_pattern, re.IGNORECASE)
@@ -394,10 +502,20 @@ class GpuMonitor:
         self._open_failed = False
         self._next_open = 0.0
         self._next_rescan = 0.0
+        self.npu_luids = set()
+        self._npu_counters = []
+        self._npu_searching = True
+        self._npu_deadline = time.monotonic() + self.NPU_DISCOVERY_S
+        self._next_npu_scan = 0.0
         if win32pdh is None:
             print("win32pdh not available; GPU usage disabled", file=sys.stderr)
             return
+        self._discover_npu()
         self._open_query()
+
+    @property
+    def npu_present(self):
+        return bool(self.npu_luids)
 
     def _open_query(self):
         self._next_open = time.monotonic() + self.RETRY_S
@@ -405,14 +523,65 @@ class GpuMonitor:
             query = win32pdh.OpenQuery()
             self.counter = win32pdh.AddEnglishCounter(
                 query, r"\GPU Engine(*engtype_3D)\Utilization Percentage")
-            win32pdh.CollectQueryData(query)  # prime; % counters need two samples
             self.query = query
+            self._npu_counters = []
+            self._add_npu_counters()
+            win32pdh.CollectQueryData(query)  # prime; % counters need two samples
             if self._open_failed:
                 print("GPU counters now available", file=sys.stderr)
         except Exception as err:
+            self.query = None
             if not self._open_failed:
                 print(f"GPU counters unavailable (will retry): {err}", file=sys.stderr)
                 self._open_failed = True
+
+    def _discover_npu(self):
+        """Look for an NPU; once found (or proven absent) stop looking."""
+        now = time.monotonic()
+        self._next_npu_scan = now + self.RETRY_S
+        try:
+            luids = compute_only_adapter_luids()
+        except Exception:
+            luids = set()
+        if luids is None:
+            self._npu_searching = False  # no D3DKMTEnumAdapters3 on this OS
+            return
+        if luids:
+            self.npu_luids = luids
+            self._npu_searching = False
+            log("NPU found: " + ", ".join(f"luid 0x{l:X}" for l in sorted(luids)))
+            if self.query is not None:
+                self._add_npu_counters()
+        elif now >= self._npu_deadline:
+            self._npu_searching = False
+
+    def _add_npu_counters(self):
+        for luid in sorted(self.npu_luids):
+            path = (r"\GPU Engine(*luid_0x%08X_0x%08X*)\Utilization Percentage"
+                    % (luid >> 32, luid & 0xFFFFFFFF))
+            try:
+                self._npu_counters.append(
+                    win32pdh.AddEnglishCounter(self.query, path))
+            except Exception as err:
+                log(f"NPU counter for luid 0x{luid:X} unavailable: {err}")
+
+    def _read_npu(self):
+        """NPU busy % from the last collect: the busiest engine, summed over
+        processes -- the same reduction Task Manager uses for its NPU graph."""
+        per_engine = {}
+        for counter in self._npu_counters:
+            try:
+                items = win32pdh.GetFormattedCounterArray(
+                    counter, win32pdh.PDH_FMT_DOUBLE)
+            except Exception:
+                continue  # first sample after adding, or no instances yet
+            for name, value in items.items():
+                m = re.search(r"luid_0x([0-9A-Fa-f]+)_0x([0-9A-Fa-f]+)_phys_(\d+)_eng_(\d+)",
+                              name)
+                if m:
+                    key = m.groups()
+                    per_engine[key] = per_engine.get(key, 0.0) + value
+        return min(100, max(per_engine.values(), default=0.0))
 
     def _rescan_adapters(self):
         """Re-read the LUID->name map; drivers register adapters after boot."""
@@ -424,16 +593,24 @@ class GpuMonitor:
                 self.dgpu_re.search(n) for n in self.luid_names.values())
 
     def read(self):
-        """Return (igpu_pct, dgpu_pct, dgpu_present)."""
+        """Return (igpu_pct, dgpu_pct, dgpu_present, npu_pct).
+
+        npu_pct is None when the machine has no NPU (as opposed to 0 = idle).
+        """
+        if (self._npu_searching and win32pdh is not None
+                and time.monotonic() >= self._next_npu_scan):
+            self._discover_npu()
+        npu_idle = 0 if self.npu_present else None
         if self.query is None:
             if win32pdh is not None and time.monotonic() >= self._next_open:
                 self._open_query()
-            return 0, 0, self.dgpu_present
+            return 0, 0, self.dgpu_present, npu_idle
         try:
             win32pdh.CollectQueryData(self.query)
             items = win32pdh.GetFormattedCounterArray(self.counter, win32pdh.PDH_FMT_DOUBLE)
         except Exception:
-            return 0, 0, self.dgpu_present
+            return 0, 0, self.dgpu_present, npu_idle
+        npu = self._read_npu() if self.npu_present else None
 
         per_luid = {}
         for name, value in items.items():
@@ -454,7 +631,7 @@ class GpuMonitor:
                 dgpu += total
             elif self.igpu_re.search(desc):
                 igpu += total
-        return min(100, igpu), min(100, dgpu), self.dgpu_present
+        return min(100, igpu), min(100, dgpu), self.dgpu_present, npu
 
 
 class NvGpuLimits:
@@ -1421,12 +1598,16 @@ class RowDesc:
 
     Fields default to "off" / "no effect"; the row policy functions set only
     what they need. pack() emits the bytes in the documented order.
+
+    The ghost_* fields are the row's optional FRAME C ghost bar (a dimmer
+    second bar behind the main one); pack_ghost() emits its 4 bytes.
     """
 
     def __init__(self, level=0, row_val=ROW_VAL_FULL, hue0=0, hue1=0,
                  gradient=False, envelope=ENV_NONE,
                  overlay_shape=OVL_NONE, overlay_dir=OVL_DIR_UP,
-                 overlay_count=0, period=0, floor=0):
+                 overlay_count=0, period=0, floor=0,
+                 ghost_level=0, ghost_hue=0, ghost_val=0):
         self.level = level
         self.row_val = row_val
         self.hue0 = hue0
@@ -1438,6 +1619,9 @@ class RowDesc:
         self.overlay_count = overlay_count
         self.period = period
         self.floor = floor
+        self.ghost_level = ghost_level
+        self.ghost_hue = ghost_hue
+        self.ghost_val = ghost_val
 
     def flags_byte(self):
         f = 0
@@ -1460,6 +1644,14 @@ class RowDesc:
             clamp8(self.floor),
         ))
 
+    def pack_ghost(self):
+        return bytes((
+            clamp8(self.ghost_level),
+            clamp8(self.ghost_hue),
+            clamp8(self.ghost_val),
+            0,  # flags, reserved
+        ))
+
     def __repr__(self):
         env = {ENV_NONE: "none", ENV_BLINK: "blink", ENV_BREATHE: "breathe"}[self.envelope]
         ovl = {OVL_NONE: "none", OVL_TRAP_RISE: "rise",
@@ -1471,8 +1663,10 @@ class RowDesc:
         envs = "" if self.envelope == ENV_NONE else f" env={env}@{self.period}"
         flr = f" floor={self.floor}" if (self.envelope == ENV_BREATHE
                                          or self.overlay_shape == OVL_SINE) else ""
+        ghost = (f" ghost={self.ghost_level}@hue{self.ghost_hue}/val{self.ghost_val}"
+                 if self.ghost_level else "")
         return (f"lvl={self.level} val={self.row_val} hue={self.hue0}{grad}"
-                f"{envs}{ovls}{flr}")
+                f"{envs}{ovls}{flr}{ghost}")
 
 
 def rate_segments(rate_w):
@@ -1581,8 +1775,18 @@ def build_mem_row(m):
 
 
 def build_igpu_row(m):
-    """row3: iGPU usage, solid red; no envelope/overlay."""
-    return RowDesc(level=pct_to_level(m["igpu"]), hue0=HUE_RED)
+    """row3: iGPU usage, solid red; NPU usage as a dim cyan ghost bar.
+
+    The NPU sits on the same die as the iGPU and is idle most of the time, so
+    it shares this row rather than claiming one: the ghost is invisible while
+    the NPU is idle, and shows only where the NPU is busier than the iGPU.
+    """
+    desc = RowDesc(level=pct_to_level(m["igpu"]), hue0=HUE_RED)
+    if m["npu"] is not None:
+        desc.ghost_level = pct_to_level(m["npu"])
+        desc.ghost_hue = HUE_NPU
+        desc.ghost_val = ROW_VAL_NPU_GHOST
+    return desc
 
 
 def build_dgpu_row(m):
@@ -1623,10 +1827,13 @@ ROW_BUILDERS = [
 
 
 def build_frame(rows, brightness, glide_ms=None, timeout_ms=None):
-    """Build the two 32-byte reports for one tick.
+    """Build the three 32-byte reports for one tick.
 
     rows is the list of six RowDesc objects in fixed row order. Returns
-    [frame_a, frame_b]; the caller writes each as b"\\x00" + report.
+    [frame_a, frame_b, frame_c]; the caller writes each as b"\\x00" + report.
+    FRAME C (the ghost bars) is sent every tick, all-zero when no row has a
+    ghost: the firmware fades ghosts out when FRAME C goes stale, so a steady
+    stream is what keeps a live ghost on screen.
 
     The two globals resolve from the module constants in the body, not as
     default arguments: default arguments bind once at import, which would
@@ -1661,7 +1868,17 @@ def build_frame(rows, brightness, glide_ms=None, timeout_ms=None):
     frame_b[28] = clamp(glide_ms / 4, 0, 255)      # 4ms units
     frame_b[29] = clamp(timeout_ms / 100, 0, 255)  # 100ms units
 
-    return [bytes(frame_a), bytes(frame_b)]
+    frame_c = bytearray(REPORT_LEN)
+    frame_c[0] = VIA_CMD_CUSTOM_SET_VALUE
+    frame_c[1] = SYSMON_CHANNEL
+    frame_c[2] = SYSMON_VALUE_FRAME_C
+    off = 3
+    for r in rows:
+        frame_c[off:off + GHOST_DESC_LEN] = r.pack_ghost()
+        off += GHOST_DESC_LEN
+    # data[27..31] unused/zero
+
+    return [bytes(frame_a), bytes(frame_b), bytes(frame_c)]
 
 
 def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
@@ -1693,7 +1910,7 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
     raw_mem = psutil.virtual_memory().percent
     mem = clamp(raw_mem, 0, 100)
 
-    igpu, dgpu, dgpu_present = gpu.read()
+    igpu, dgpu, dgpu_present, npu = gpu.read()
 
     # dGPU: prefer NVML's device-wide utilization over the PDH 3D-engine sum
     # (see NvGpuLimits.utilization). PDH stays as the fallback and still
@@ -1785,6 +2002,7 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
         "mem": mem,
 
         "igpu": clamp(igpu, 0, 100),
+        "npu": None if npu is None else clamp(npu, 0, 100),  # None = no NPU
 
         "dgpu": clamp(dgpu, 0, 100),
         "dgpu_present": dgpu_present,
@@ -1998,6 +2216,7 @@ def _publish_service_state(m, lhmlib, ryzen):
             "lhm_available": bool(lhmlib.available),
             "ryzenadj_available": bool(ryzen.available),
             "dgpu_present": bool(m["dgpu_present"]),
+            "npu_present": m["npu"] is not None,
             "brightness": m["brightness"],
         }
         tmp = paths.service_state_path() + ".tmp"
@@ -2009,7 +2228,7 @@ def _publish_service_state(m, lhmlib, ryzen):
 
 
 def run(args, stop_event=None, resume_check=None):
-    """The poll loop: gather, build six rows, send two frames, repeat.
+    """The poll loop: gather, build six rows, send three frames, repeat.
 
     stop_event is a threading.Event the service sets from SvcStop; in console
     mode it is an Event that is never set, so waiting on it behaves exactly like
@@ -2084,6 +2303,8 @@ def run(args, stop_event=None, resume_check=None):
             kind = "dGPU" if gpu.dgpu_re.search(name) else \
                    "iGPU" if gpu.igpu_re.search(name) else "ignored"
             print(f"adapter luid 0x{luid:X}: {name} [{kind}]")
+        for luid in sorted(gpu.npu_luids):
+            print(f"adapter luid 0x{luid:X}: compute-only [NPU -> iGPU row ghost]")
     psutil.cpu_percent(interval=None)  # prime; first call always returns 0
 
     dev = None

@@ -95,6 +95,10 @@ SCHEMA = [
             comment="Temperature gradient, hot end (0 = red)."),
     Setting("HUE_CHARGE_FULL", "colours", INT, lo=0, hi=255,
             comment="Charging hue at 100%; the bar interpolates red -> this."),
+    Setting("HUE_NPU", "colours", INT, lo=0, hi=255,
+            comment="NPU ghost bar on the iGPU row (128 = cyan). Pick a hue\n"
+                    "well away from HUE_RED: a segment the two bars share mixes\n"
+                    "both colors."),
 
     Setting("ROW_VAL_FULL", "levels", INT, lo=1, hi=255,
             comment="Base brightness of a normal row, before the global\n"
@@ -102,6 +106,11 @@ SCHEMA = [
     Setting("ROW_VAL_BATT_IDLE", "levels", INT, lo=1, hi=255,
             comment="Dim green shown when on AC and the battery is idle (held\n"
                     "at its charge cap)."),
+    Setting("ROW_VAL_NPU_GHOST", "levels", INT, lo=1, hi=255,
+            comment="Brightness of the NPU ghost bar behind the iGPU bar. Kept\n"
+                    "dim so the bright iGPU bar reads first; the ghost only\n"
+                    "shows where the NPU is busier than the iGPU. Needs the\n"
+                    "ghost-bar firmware (FRAME C); older firmware ignores it."),
     Setting("BATT_DRIFT_FLOOR", "levels", INT, lo=0, hi=255,
             comment="Trough of the faint cap-drift breathe; the peak is\n"
                     "ROW_VAL_BATT_IDLE. Keep the gap small -- this is meant to\n"
