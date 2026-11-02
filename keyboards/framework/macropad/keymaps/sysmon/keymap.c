@@ -1731,7 +1731,7 @@ static void boot_text_flash(uint16_t t, const char *txt, uint16_t period_ms, uin
     }
 }
 
-// --- the text animations in the table (preview only, not in the pool) ---
+// --- the text animations ---
 
 // 17 FW16 pop
 #define BOOT_TEXT_POP_MS 2800
@@ -1828,7 +1828,7 @@ static const boot_anim_t boot_anims[] = {
     {boot_anim_stack, BOOT_STACK_MS},               // 14
     {boot_anim_spotlight, BOOT_SPOT_MS},            // 15
     {boot_anim_glitch, BOOT_GLITCH_MS},             // 16
-    // preview-only text prototypes (not in the pool)
+    // text
     {boot_anim_text_pop, BOOT_TEXT_POP_MS},         // 17
     {boot_anim_text_fw16, BOOT_TEXT_FW16_MS},       // 18
     {boot_anim_text_framework, BOOT_TEXT_FWK_MS},   // 19
@@ -1840,7 +1840,7 @@ static const boot_anim_t boot_anims[] = {
 
 // The power-up pool: which animations (0-based table indices) a boot may
 // pick. Every animation can be replayed by number; only these play at boot.
-static const uint8_t boot_pool[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+static const uint8_t boot_pool[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21};
 #define BOOT_POOL_COUNT ((uint8_t)(sizeof(boot_pool) / sizeof(boot_pool[0])))
 
 // A variant's length and render, the custom text (BOOT_CTEXT) included.

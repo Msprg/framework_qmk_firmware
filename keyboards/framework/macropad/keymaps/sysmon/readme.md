@@ -18,7 +18,7 @@ normally — the stats ride on a private custom-value channel, `0x42`):
 From power-up until the host first connects, the macropad shows a dim, static
 rainbow running diagonally from red at the top-left key to violet at the
 bottom-right one. It's introduced by a short animation picked from the
-power-up pool (`boot_pool[]` in `keymap.c`), currently 1–16:
+power-up pool (`boot_pool[]` in `keymap.c`), currently all 22:
 
 | # | Animation | |
 |---|-----------|---|
@@ -38,11 +38,6 @@ power-up pool (`boot_pool[]` in `keymap.c`), currently 1–16:
 | 14 | Stack | colours drop in from above like falling blocks, bottom row first, each landing with a flash |
 | 15 | Spotlight | a spotlight wanders the dark pad showing the rainbow where it shines, then widens to light it all |
 | 16 | Glitch | the picture boots like a corrupted video signal until it holds clean |
-
-Text prototypes, built in for previewing but not in the pool:
-
-| # | Animation | |
-|---|-----------|---|
 | 17 | FW16 pop | F, W, 1, 6 pop up one at a time as big letters in the rainbow colours; the rest sparkles in around the 6 |
 | 18 | FW16 scroll | "FW16" scrolls through like an LED ticker, then the rainbow slides in behind it |
 | 19 | FRAMEWORK scroll | the same with "FRAMEWORK", at an easy reading pace (~7.5 s) |
