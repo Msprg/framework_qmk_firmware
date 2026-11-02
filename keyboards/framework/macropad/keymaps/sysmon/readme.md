@@ -45,8 +45,10 @@ Text prototypes, built in for previewing but not in the pool:
 |---|-----------|---|
 | 17 | FW16 pop | F, W, 1, 6 pop up one at a time as big letters in the rainbow colours; the rest sparkles in around the 6 |
 | 18 | FW16 scroll | "FW16" scrolls through like an LED ticker, then the rainbow slides in behind it |
-| 19 | FRAMEWORK scroll | the same with "FRAMEWORK", faster |
+| 19 | FRAMEWORK scroll | the same with "FRAMEWORK", at an easy reading pace (~7.5 s) |
 | 20 | FRAMEWORK flash | white letters flash one at a time like a sign spelling itself out, then the rainbow sputters on like neon |
+| 21 | FRAMEWORK scroll, letter colours | each letter keeps its own colour as it moves, F red through K violet |
+| 22 | FRAMEWORK 16 scroll, letter colours | the same with "FRAMEWORK 16" (~9.5 s) |
 
 Each power-up picks one from a shuffle bag: every cycle of power-ups (one per
 pooled animation) plays each pooled animation once, in a fresh order, never
@@ -64,9 +66,12 @@ If the host later goes away:
 - **It stopped on purpose** (service stop, shutdown, Ctrl+C): the host sends a
   goodbye, and the macropad switches to the regular RGB effect at once.
 - **It vanished** (a crash, a hung process): after the no-data timeout the
-  macropad shows a disconnect warning, a breathing amber triangle with a white
-  "!", for 10 seconds, then falls back to the regular RGB effect. If the host
-  comes back meanwhile, the bars cross-fade back in.
+  macropad shows a disconnect warning for 10 seconds, then falls back to the
+  regular RGB effect. If the host comes back meanwhile, the bars cross-fade
+  back in. The warning is black-and-yellow caution stripes; which variant is
+  `SYSMON_WARN_STYLE` in `keymap.c`: 1 static "/" bands, 2 static "\\" bands,
+  3 static and slowly breathing, 4 blinking slowly, 5 stepping like barrier
+  chaser lights. `bootanim_preview.py warn` previews them.
 - **The laptop slept**: no warning. Silence across a USB suspend is expected.
 
 The goodbye needs the host from this version; an older installed service just
@@ -519,8 +524,9 @@ for previewing (`host/bootanim_preview.py`) and never counts as host data, so
 it doesn't end the pre-connect rainbow:
 
 ```text
-[3] first variant, 1-based (0 = all; 0xFD = status query only;
-    0xFE = the next power-up pick, unnumbered; past the end = stop)
+[3] first variant, 1-based (0 = all; 0xFC = preview warning styles [4]..[5];
+    0xFD = status query only; 0xFE = the next power-up pick, unnumbered;
+    past the end = stop)
 [4] last variant (0 = only the first)
 [5] rounds (0 = 1)
 echo [11..14] boot counter in RAM (u32 LE)   [15] this power-up's pick (1-based)

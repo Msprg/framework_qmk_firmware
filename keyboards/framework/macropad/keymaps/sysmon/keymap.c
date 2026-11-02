@@ -235,9 +235,13 @@ static bool           sysmon_quiet          = false; // suspended since the last
 #define DISP_WARN 3   // the disconnect warning
 static uint8_t sysmon_disp = DISP_EFFECT;
 
+#define SYSMON_WARN_STYLES 5
+static uint8_t warn_prev_first = 0, warn_prev_last = 0; // warning-style preview; 0 = none
+
 // Defined with the boot rainbow below.
 static void boot_replay(const uint8_t *args);
 static void boot_status(uint8_t *out);
+static bool warn_prev_started;
 
 // Decode one 8-byte descriptor at src into sysmon_rows[row].
 static void sysmon_decode_row(uint8_t row, const uint8_t *src) {
@@ -1442,30 +1446,34 @@ static void boot_anim_glitch(uint16_t t) {
 
 // --- text prototypes (preview only) ----------------------------------------
 //
-// A 5-row font drawn on pad rows 1-5, the evenly spaced ones; the
-// half-height top row stays dark until the ending. Glyph rows are bitmaps,
-// bit (w-1-x) = column x. M and W need five columns to read; the lowercase
-// entries are four-column forms for styles that show one letter at a time.
+// Letters are 5 rows tall on pad rows 1-5, the evenly spaced ones; the
+// half-height top row (row 0) stays dark -- except for W, whose outer strokes
+// reach up into it. A W squeezed into the same rows as everything else reads
+// as an H; the tall outer strokes with the joins low down read as a W. Glyph
+// rows are bitmaps, rows[0] = pad row 0, bit (w-1-x) = column x. M and W need
+// five columns to read; the lowercase entries are four-column forms for the
+// styles that show one letter at a time.
 
 typedef struct {
     char    ch;
     uint8_t w;
-    uint8_t rows[5];
+    uint8_t rows[6];
 } boot_glyph_t;
 
 static const boot_glyph_t boot_font[] = {
-    {'F', 4, {0x0F, 0x08, 0x0E, 0x08, 0x08}}, // ####  #...  ###.  #...  #...
-    {'R', 4, {0x0E, 0x09, 0x0E, 0x0A, 0x09}}, // ###.  #..#  ###.  #.#.  #..#
-    {'A', 4, {0x06, 0x09, 0x0F, 0x09, 0x09}}, // .##.  #..#  ####  #..#  #..#
-    {'M', 5, {0x11, 0x1B, 0x15, 0x11, 0x11}}, // #...#  ##.##  #.#.#  #...#  #...#
-    {'E', 4, {0x0F, 0x08, 0x0E, 0x08, 0x0F}}, // ####  #...  ###.  #...  ####
-    {'W', 5, {0x11, 0x11, 0x15, 0x1B, 0x11}}, // #...#  #...#  #.#.#  ##.##  #...#
-    {'O', 4, {0x06, 0x09, 0x09, 0x09, 0x06}}, // .##.  #..#  #..#  #..#  .##.
-    {'K', 4, {0x09, 0x0A, 0x0C, 0x0A, 0x09}}, // #..#  #.#.  ##..  #.#.  #..#
-    {'1', 3, {0x02, 0x06, 0x02, 0x02, 0x07}}, // .#.  ##.  .#.  .#.  ###
-    {'6', 4, {0x06, 0x08, 0x0E, 0x09, 0x06}}, // .##.  #...  ###.  #..#  .##.
-    {'m', 4, {0x09, 0x0F, 0x0F, 0x09, 0x09}}, // #..#  ####  ####  #..#  #..#
-    {'w', 4, {0x09, 0x09, 0x0F, 0x0F, 0x09}}, // #..#  #..#  ####  ####  #..#
+    {'F', 4, {0x00, 0x0F, 0x08, 0x0E, 0x08, 0x08}}, // ####  #...  ###.  #...  #...
+    {'R', 4, {0x00, 0x0E, 0x09, 0x0E, 0x0A, 0x09}}, // ###.  #..#  ###.  #.#.  #..#
+    {'A', 4, {0x00, 0x06, 0x09, 0x0F, 0x09, 0x09}}, // .##.  #..#  ####  #..#  #..#
+    {'M', 5, {0x00, 0x11, 0x1B, 0x15, 0x11, 0x11}}, // #...#  ##.##  #.#.#  #...#  #...#
+    {'E', 4, {0x00, 0x0F, 0x08, 0x0E, 0x08, 0x0F}}, // ####  #...  ###.  #...  ####
+    {'W', 5, {0x11, 0x11, 0x11, 0x15, 0x1B, 0x11}}, // #...#  #...#  #...#  #.#.#  ##.##  #...# (tall)
+    {'O', 4, {0x00, 0x06, 0x09, 0x09, 0x09, 0x06}}, // .##.  #..#  #..#  #..#  .##.
+    {'K', 4, {0x00, 0x09, 0x0A, 0x0C, 0x0A, 0x09}}, // #..#  #.#.  ##..  #.#.  #..#
+    {'1', 3, {0x00, 0x02, 0x06, 0x02, 0x02, 0x07}}, // .#.  ##.  .#.  .#.  ###
+    {'6', 4, {0x00, 0x06, 0x08, 0x0E, 0x09, 0x06}}, // .##.  #...  ###.  #..#  .##.
+    {'m', 4, {0x00, 0x09, 0x0F, 0x0F, 0x09, 0x09}}, // #..#  ####  ####  #..#  #..#
+    {'w', 4, {0x09, 0x09, 0x09, 0x0F, 0x0F, 0x09}}, // #..#  #..#  #..#  ####  ####  #..# (tall)
+    {' ', 2, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
 };
 
 static const boot_glyph_t *boot_glyph(char c) {
@@ -1475,35 +1483,43 @@ static const boot_glyph_t *boot_glyph(char c) {
     return &boot_font[0];
 }
 
-// Is key (r, c) part of glyph g drawn on rows 1-5, centered in the 4 columns?
+// Is key (r, c) part of glyph g, centered in the 4 columns?
 static bool boot_glyph_lit(const boot_glyph_t *g, uint8_t r, uint8_t c) {
     uint8_t x0 = (uint8_t)((4 - g->w + 1) / 2);
-    if (r == 0 || c < x0 || c >= x0 + g->w) return false;
-    return (g->rows[r - 1] >> (g->w - 1 - (c - x0))) & 1;
+    if (c < x0 || c >= x0 + g->w) return false;
+    return (g->rows[r] >> (g->w - 1 - (c - x0))) & 1;
 }
 
 // --- marquee ---
 
-#define BOOT_TEXT_MAXCOLS 64
+#define BOOT_TEXT_MAXCOLS 80
 #define BOOT_TEXT_BLOCK 0x80 // a column of the closing rainbow block (all rows)
-static uint8_t     boot_text_cols[BOOT_TEXT_MAXCOLS]; // bits 0-4 = rows 1-5
+static uint8_t     boot_text_cols[BOOT_TEXT_MAXCOLS]; // bits 0-5 = pad rows 0-5
+static uint8_t     boot_text_hue[BOOT_TEXT_MAXCOLS];  // per-letter color of each column
 static uint8_t     boot_text_ncols;
 static const char *boot_text_built = NULL;
 
 // Lay the text out as columns: each glyph, a blank column, and at the end a
 // 4-column block of the rainbow itself that scrolls in and docks.
+// Each letter also gets its own hue, spread over the rainbow in reading order
+// (spaces don't count), for the per-letter coloring.
 static void boot_text_build(const char *txt) {
     if (boot_text_built == txt) return;
-    uint8_t n = 0;
+    uint8_t letters = 0, k = 0, n = 0;
+    for (const char *p = txt; *p; p++) letters += *p != ' ';
     for (const char *p = txt; *p; p++) {
-        const boot_glyph_t *g = boot_glyph(*p);
+        const boot_glyph_t *g   = boot_glyph(*p);
+        uint8_t             hue = boot_hue_at(letters > 1 ? (int16_t)(k * 255 / (letters - 1)) : 0);
+        k += *p != ' ';
         for (uint8_t x = 0; x < g->w && n < BOOT_TEXT_MAXCOLS - 5; x++) {
             uint8_t m = 0;
-            for (uint8_t r = 0; r < 5; r++) {
+            for (uint8_t r = 0; r < 6; r++) {
                 if ((g->rows[r] >> (g->w - 1 - x)) & 1) m |= 1 << r;
             }
+            boot_text_hue[n]    = hue;
             boot_text_cols[n++] = m;
         }
+        boot_text_hue[n]    = hue;
         boot_text_cols[n++] = 0;
     }
     for (uint8_t k = 0; k < 4; k++) boot_text_cols[n++] = BOOT_TEXT_BLOCK;
@@ -1515,13 +1531,14 @@ static uint8_t boot_text_px(int32_t col, uint8_t r) {
     if (col < 0 || col >= boot_text_ncols) return 0;
     uint8_t m = boot_text_cols[col];
     if (m & BOOT_TEXT_BLOCK) return 255;
-    return (r > 0 && ((m >> (r - 1)) & 1)) ? 255 : 0;
+    return ((m >> r) & 1) ? 255 : 0;
 }
 
-// Scroll txt right to left at cps columns/s, the text drawn in the rainbow
-// colors of the keys it passes over (a stencil), easing to a stop as the
-// rainbow block docks. Sub-column positions blend neighboring columns.
-static void boot_text_scroll(uint16_t t, const char *txt, uint16_t cps) {
+// Scroll txt right to left at cps columns/s, easing to a stop as the rainbow
+// block docks. Sub-column positions blend neighboring columns. The text is
+// either a stencil -- drawn in the rainbow colors of the keys it passes over,
+// so a letter changes color as it moves -- or each letter keeps its own color.
+static void boot_text_scroll(uint16_t t, const char *txt, uint16_t cps, bool per_letter) {
     boot_text_build(txt);
     const int32_t D  = (int32_t)boot_text_ncols * 256; // from -4 to ncols-4 columns
     const int32_t L  = 2 * 256;                         // decelerate over the last 2
@@ -1542,10 +1559,16 @@ static void boot_text_scroll(uint16_t t, const char *txt, uint16_t cps) {
     uint8_t fr   = (uint8_t)(p & 0xFF);
     for (uint8_t r = 0; r < 6; r++) {
         for (uint8_t c = 0; c < 4; c++) {
-            uint8_t v0 = boot_text_px(base + c, r), v1 = boot_text_px(base + c + 1, r);
-            uint8_t v8 = (uint8_t)(((uint16_t)v0 * (256 - fr) + (uint16_t)v1 * fr) >> 8);
-            uint8_t i  = BOOT_KEY(r, c);
-            RGB     o  = boot_rgb_scale(boot_own[i], v8);
+            int32_t a = base + c, b = a + 1;
+            uint8_t i = BOOT_KEY(r, c);
+            RGB     ca = boot_own[i], cb = boot_own[i];
+            if (per_letter) {
+                // Letter columns carry their own color; the closing block and
+                // empty space keep the key's rainbow color.
+                if (a >= 0 && a < boot_text_ncols && !(boot_text_cols[a] & BOOT_TEXT_BLOCK)) ca = boot_hsv(boot_text_hue[a], 255, 255);
+                if (b >= 0 && b < boot_text_ncols && !(boot_text_cols[b] & BOOT_TEXT_BLOCK)) cb = boot_hsv(boot_text_hue[b], 255, 255);
+            }
+            RGB o = boot_rgb_lerp(boot_rgb_scale(ca, boot_text_px(a, r)), boot_rgb_scale(cb, boot_text_px(b, r)), fr);
             rgb_matrix_set_color(i, o.r, o.g, o.b);
         }
     }
@@ -1555,13 +1578,25 @@ static void boot_text_scroll(uint16_t t, const char *txt, uint16_t cps) {
 // slides in behind it.
 #define BOOT_TEXT_FW16_MS 3050
 static void boot_anim_text_fw16(uint16_t t) {
-    boot_text_scroll(t, "FW16", 9);
+    boot_text_scroll(t, "FW16", 9, false);
 }
 
-// 19 FRAMEWORK scroll: the same with the full name, a little faster.
-#define BOOT_TEXT_FWK_MS 3700
+// 19 FRAMEWORK scroll: the same with the full name, at an easy reading pace.
+#define BOOT_TEXT_FWK_MS 7750
 static void boot_anim_text_framework(uint16_t t) {
-    boot_text_scroll(t, "FRAMEWORK", 15);
+    boot_text_scroll(t, "FRAMEWORK", 7, false);
+}
+
+// 21 FRAMEWORK scroll, letter colors: each letter keeps its own color as it
+// moves, F red through K violet.
+static void boot_anim_text_framework_letters(uint16_t t) {
+    boot_text_scroll(t, "FRAMEWORK", 7, true);
+}
+
+// 22 FRAMEWORK 16 scroll, letter colors.
+#define BOOT_TEXT_FWK16_MS 9450
+static void boot_anim_text_framework16(uint16_t t) {
+    boot_text_scroll(t, "FRAMEWORK 16", 7, true);
 }
 
 // 17 FW16 pop: F, W, 1, 6 pop up one at a time as big letters -- a white flash
@@ -1639,6 +1674,8 @@ static const boot_anim_t boot_anims[] = {
     {boot_anim_text_fw16, BOOT_TEXT_FW16_MS},       // 18
     {boot_anim_text_framework, BOOT_TEXT_FWK_MS},   // 19
     {boot_anim_text_flash, BOOT_TEXT_FLASH_MS},     // 20
+    {boot_anim_text_framework_letters, BOOT_TEXT_FWK_MS}, // 21
+    {boot_anim_text_framework16, BOOT_TEXT_FWK16_MS},     // 22
 };
 #define BOOT_ANIM_COUNT ((uint8_t)(sizeof(boot_anims) / sizeof(boot_anims[0])))
 
@@ -1700,6 +1737,12 @@ static void boot_start(uint8_t first, uint8_t span, uint8_t rounds, bool numbere
 // variant (0 = just the first), args[2] = rounds (0 = 1).
 static void boot_replay(const uint8_t *args) {
     if (args[0] == 0xFD) return; // status query only
+    if (args[0] == 0xFC) {       // preview warning styles args[1]..args[2]
+        warn_prev_first   = args[1] ? MIN(args[1], SYSMON_WARN_STYLES) : 1;
+        warn_prev_last    = args[2] ? MIN(args[2], SYSMON_WARN_STYLES) : (args[1] ? warn_prev_first : SYSMON_WARN_STYLES);
+        warn_prev_started = false;
+        return;
+    }
     boot_armed = false; // a replay before the first frame replaces the boot play
     if (args[0] == 0xFE) {
         boot_start(boot_next_pick(), 1, 1, false);
@@ -1713,7 +1756,8 @@ static void boot_replay(const uint8_t *args) {
     }
     if (last > BOOT_ANIM_COUNT) last = BOOT_ANIM_COUNT;
     if (first > BOOT_ANIM_COUNT || last < first) {
-        boot_playing = false;
+        boot_playing    = false;
+        warn_prev_first = 0;
         return;
     }
     boot_start(first - 1, last - first + 1, args[2], true);
@@ -1811,24 +1855,93 @@ void suspend_power_down_user(void) {
 // --- disconnect warning ----------------------------------------------------
 
 // Shown when the host stops sending without saying goodbye (a crash, a hung
-// process): an amber triangle, narrow at the top, with a white "!" -- stroke
-// on rows 1-2, dot on row 4. 0 = off, 1 = triangle, 2 = "!".
+// process): black-and-yellow caution stripes, diagonal bands two keys thick.
+// Candidates (preview them with BOOT REPLAY 0xFC):
+//   1 static, bands rising to the right "/"   2 static, falling "\"
+//   3 static, slowly breathing                4 blinking slowly as a whole
+//   5 stepping one band-width at a time, like the chaser lights on a barrier
 #define SYSMON_WARN_MS 10000
-#define SYSMON_WARN_HUE 32
-static const uint8_t sysmon_warn_map[6][4] = {
-    {0, 1, 1, 0}, {0, 2, 2, 0}, {1, 2, 2, 1}, {1, 1, 1, 1}, {1, 2, 2, 1}, {1, 1, 1, 1},
-};
-static uint32_t sysmon_warn_el; // how far into the warning the last frame was
+#define SYSMON_WARN_STYLE 1 // the one shown for real
+#define SYSMON_WARN_HUE 40  // yellow
+static uint32_t sysmon_warn_el;                         // how far into the warning the last frame was
+static uint8_t  sysmon_warn_shown = SYSMON_WARN_STYLE; // style of that frame
 
-// Warning color of key i, el ms into the warning: fades in, the triangle
-// breathes (the "!" holds steady), and the whole sign fades out at the end.
-static RGB sysmon_warn_rgb(uint8_t i, uint32_t el) {
-    uint8_t kind = sysmon_warn_map[boot_row[i]][boot_col[i]];
-    if (!kind) return (RGB){0, 0, 0};
-    uint8_t v = boot_mul(boot_prog(el, 0, 300), 255 - boot_prog(el, SYSMON_WARN_MS - 800, 800));
-    if (kind == 2) return boot_rgb_scale(boot_hsv(0, 0, 255), v);
-    uint8_t breathe = 115 + boot_mul(sin8((uint8_t)((el % 1200) * 256 / 1200)), 140);
-    return boot_rgb_scale(boot_hsv(SYSMON_WARN_HUE, 255, 255), boot_mul(v, breathe));
+// Is key (r, c) on a yellow band? Bands follow the key grid's diagonals
+// (r + c = const runs "/"), two diagonals yellow, two black; shift moves them.
+static bool sysmon_warn_stripe(uint8_t r, uint8_t c, bool falling, uint8_t shift) {
+    uint8_t d = r + (falling ? 3 - c : c) + shift;
+    return ((d / 2) & 1) == 0;
+}
+
+// Warning color of key i, el ms into the warning. Every style fades in and,
+// over the last 800 ms, out.
+static RGB sysmon_warn_rgb(uint8_t style, uint8_t i, uint32_t el) {
+    uint8_t r = boot_row[i], c = boot_col[i];
+    uint8_t env = boot_mul(boot_prog(el, 0, 300), 255 - boot_prog(el, SYSMON_WARN_MS - 800, 800));
+    uint8_t v   = 255;
+    bool    on  = false;
+    switch (style) {
+        default:
+        case 1:
+            on = sysmon_warn_stripe(r, c, false, 0);
+            break;
+        case 2:
+            on = sysmon_warn_stripe(r, c, true, 0);
+            break;
+        case 3: // breathing 55%..100% over 2.4 s
+            on = sysmon_warn_stripe(r, c, false, 0);
+            v  = 140 + boot_mul(sin8((uint8_t)((el % 2400) * 256 / 2400)), 115);
+            break;
+        case 4: { // on 800 ms of every 1300, with soft 150 ms edges
+            uint32_t ph = el % 1300;
+            on          = sysmon_warn_stripe(r, c, false, 0);
+            v           = ph >= 800 ? 0 : (uint8_t)MIN(MIN(ph, 800 - ph) * 255 / 150, 255);
+            break;
+        }
+        case 5: // the bands step down-right one diagonal every 350 ms
+            on = sysmon_warn_stripe(r, c, false, (uint8_t)(4 - (el / 350) % 4));
+            break;
+    }
+    if (!on) return (RGB){0, 0, 0};
+    return boot_hsv(SYSMON_WARN_HUE, 255, boot_mul(env, v));
+}
+
+// BOOT REPLAY 0xFC: show warning styles first..last, each named by amber dots
+// first, at the warning's real length. Starts when it first renders, so it can
+// be queued behind a boot replay.
+static bool     warn_prev_started = false;
+static uint32_t warn_prev_t0;
+#define WARN_PREV_SLOT (BOOT_DOTS_MS + BOOT_GAP_MS + SYSMON_WARN_MS)
+
+static bool warn_preview_render(void) {
+    if (!warn_prev_first) return false;
+    if (!warn_prev_started) {
+        warn_prev_started = true;
+        warn_prev_t0      = timer_read32();
+    }
+    uint32_t t     = timer_elapsed32(warn_prev_t0);
+    uint32_t k     = t / WARN_PREV_SLOT;
+    uint32_t el    = t % WARN_PREV_SLOT;
+    if (warn_prev_first + k > warn_prev_last) {
+        warn_prev_first = 0;
+        return false;
+    }
+    uint8_t style = (uint8_t)(warn_prev_first + k);
+    for (uint8_t i = 0; i < BOOT_N; i++) {
+        RGB col = {0, 0, 0};
+        if (el < BOOT_DOTS_MS) {
+            uint8_t n = 0;
+            for (uint8_t q = 0; q < style; q++)
+                if (BOOT_KEY(q / 4, q % 4) == i) n = 1;
+            if (n) col = boot_hsv(30, 255, 255);
+        } else if (el >= BOOT_DOTS_MS + BOOT_GAP_MS) {
+            sysmon_warn_el    = el - BOOT_DOTS_MS - BOOT_GAP_MS;
+            sysmon_warn_shown = style;
+            col               = sysmon_warn_rgb(style, i, sysmon_warn_el);
+        }
+        rgb_matrix_set_color(i, col.r, col.g, col.b);
+    }
+    return true;
 }
 
 // --- blending into the bars ------------------------------------------------
@@ -1865,7 +1978,7 @@ static void sysmon_flush(uint8_t gcc_bars) {
     uint8_t gmax = MAX(MAX(gf, gcc_bars), 1);
     uint8_t f    = ease8InOutQuad((uint8_t)(timer_elapsed32(sysmon_xf_t0) * 255 / SYSMON_XFADE_MS));
     for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
-        RGB a = sysmon_xf_from == DISP_BOOT ? boot_own[i] : sysmon_warn_rgb(i, sysmon_warn_el);
+        RGB a = sysmon_xf_from == DISP_BOOT ? boot_own[i] : sysmon_warn_rgb(sysmon_warn_shown, i, sysmon_warn_el);
         RGB o = boot_rgb_lerp(sysmon_gcc_scale(a, gf, gmax), sysmon_gcc_scale(sysmon_fb[i], gcc_bars, gmax), f);
         rgb_matrix_set_color(i, o.r, o.g, o.b);
     }
@@ -1900,6 +2013,11 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
         sysmon_disp = DISP_BOOT;
         return false;
     }
+    if (warn_preview_render()) {
+        sysmon_set_gcc(sysmon_last_update ? sysmon_slewed_val() : BOOT_BRIGHTNESS);
+        sysmon_disp = DISP_WARN;
+        return false;
+    }
     if (boot_counter_dirty) {
         // Deferred until the animation is over, clear of USB enumeration
         // (a flash write stalls the MCU).
@@ -1918,9 +2036,10 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
         }
         if (sysmon_last_update != 0 && !sysmon_goodbye && !sysmon_quiet && since - timeout_ms < SYSMON_WARN_MS) {
             sysmon_set_gcc(sysmon_slewed_val());
-            sysmon_warn_el = since - timeout_ms;
+            sysmon_warn_el    = since - timeout_ms;
+            sysmon_warn_shown = SYSMON_WARN_STYLE;
             for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
-                RGB c = sysmon_warn_rgb(i, sysmon_warn_el);
+                RGB c = sysmon_warn_rgb(SYSMON_WARN_STYLE, i, sysmon_warn_el);
                 rgb_matrix_set_color(i, c.r, c.g, c.b);
             }
             sysmon_disp = DISP_WARN;
