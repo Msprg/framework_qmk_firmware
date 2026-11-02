@@ -6,7 +6,7 @@ normally — the stats ride on a private custom-value channel, `0x42`):
 
 | Row | Indicator | Colors |
 |-----|-----------|--------|
-| 1 (top, small keys) | Battery | charging: level bar (red→green by level), segments from the filling one upward pulse in sync; discharging: level bar (red unplugged, amber when the battery is assisting an overloaded charger on AC), segments from the boundary downward flare and fade in sync, blinks below 15%; the charge/discharge power decides how many segments animate (1 segment for a trickle up to all 4 at ≥75 W); idle on AC: whole row steady dim green — a sub-10 W cap-drift drain counts as idle, with the boundary segment breathing faintly as a tell; the bar is rescaled against the max-charge cap, so charged-to-cap shows completely full |
+| 1 (top, small keys) | Battery | charging: level bar (red→green by level), segments from the filling one upward pulse in sync; discharging: level bar (red unplugged, amber when the battery is assisting an overloaded charger on AC), segments from the boundary downward flare and fade in sync, blinks below 15%; the charge/discharge power decides how many segments animate (1 segment for a trickle up to all 4 at ≥75 W); idle on AC: whole row steady dim green — a sub-10 W drain counts as idle, and if the EC is measurably drifting off the cap the boundary segment breathes faintly as a tell (a 0 W "discharging" report, which is what the EC says while it floats a pack it is done charging, is plain idle: no tell); the bar is rescaled against the max-charge cap, so charged-to-cap shows completely full |
 | 2 | CPU usage | red bar; breathes when the APU is power-limited (see below) |
 | 3 | Memory usage | gold bar; whole row blinks at ~1 Hz when usage is critically high (≥90%) |
 | 4 | iGPU usage | red bar |
@@ -331,7 +331,7 @@ Running from source, the same file is written next to the script; create it with
 either works during development. What is available:
 
 - **thresholds**: `BATT_CRITICAL_PCT`, `MEM_CRITICAL_PCT`, `TEMP_CRITICAL_C`,
-  `TEMP_MIN_C` / `TEMP_MAX_C`, `ASSIST_MIN_W`
+  `TEMP_MIN_C` / `TEMP_MAX_C`, `ASSIST_MIN_W`, `DRIFT_MIN_W`
 - **APU power limit**: `APU_LIMIT_NEAR` (how close to a limit counts as
   binding) and `APU_LIMIT_SIGNALS` (which SMU limits — `stapm`/`slow`/`fast` —
   trigger the breathe)

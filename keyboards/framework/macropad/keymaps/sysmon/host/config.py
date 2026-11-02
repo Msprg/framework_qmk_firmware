@@ -117,6 +117,13 @@ SCHEMA = [
             comment="Battery-assist drain (watts, on AC) that counts as a real\n"
                     "power deficit. Below this, a trickle out of the battery on\n"
                     "AC is just EC charge-cap housekeeping and is shown as idle."),
+    Setting("DRIFT_MIN_W", "thresholds", FLOAT, lo=0, hi=255,
+            comment="Smallest drain (watts, on AC) that counts as real cap\n"
+                    "drift and earns the faint boundary-segment tell. The EC\n"
+                    "leaves the ACPI discharging bit asserted at a flat 0 W\n"
+                    "while it floats a pack it is done charging (what you get\n"
+                    "with the charge cap at 100%), so a bit with no measured\n"
+                    "flow behind it is idle, not drift."),
     Setting("MEM_CRITICAL_PCT", "thresholds", INT, lo=0, hi=100,
             comment="Memory usage % at or above which the whole row blinks."),
     Setting("TEMP_CRITICAL_C", "thresholds", FLOAT, lo=0, hi=150,
