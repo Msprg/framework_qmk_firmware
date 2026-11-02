@@ -137,6 +137,12 @@ void enable_factory_mode(bool enable) {
 // so an older host that never sends it can't leave a stale ghost on screen.
 // Older firmware ignores value_id 0x03 and just draws the main bars.
 //
+// GOODBYE (value_id 0x04, no payload): the host is stopping on purpose (service
+// stop, shutdown, Ctrl+C). The firmware hands over to the regular RGB effect at
+// once. Without it, frames simply stop: after the timeout the macropad shows a
+// disconnect warning (an amber triangle with a "!") for SYSMON_WARN_MS, then
+// falls back to the regular effect. The next FRAME A/B cancels either state.
+//
 // BOOT REPLAY (value_id 0x10) replays boot animations, for previewing and
 // tuning them. Numbered playback shows N white dots before variant N.
 //   data[3] = first variant, 1-based (0 = all of them; 0xFE = play the next
@@ -149,6 +155,8 @@ void enable_factory_mode(bool enable) {
 // RAM holds it: already advanced past this boot's pick), the variant this
 // power-up picked (1-based, 0 = none yet), and the counter as stored in
 // EEPROM (u32 LE; lags by one until this boot's animation has finished).
+// data[20] is what the display shows: 0 = regular RGB effect, 1 = boot
+// rainbow, 2 = sysmon bars, 3 = disconnect warning.
 // It never counts as host data, so it doesn't end the pre-connect rainbow.
 //
 // VIA echoes the buffer back, which serves as the ACK.
@@ -158,6 +166,7 @@ void enable_factory_mode(bool enable) {
 #define SYSMON_FRAME_A 0x01 // rows 0,1,2
 #define SYSMON_FRAME_B 0x02 // rows 3,4,5 + globals
 #define SYSMON_FRAME_C 0x03 // ghost bars, rows 0..5
+#define SYSMON_GOODBYE 0x04 // host stopping on purpose: no disconnect warning
 #define SYSMON_BOOT_REPLAY 0x10 // replay the boot animation (preview/tuning)
 
 #define SYSMON_ROW_BYTES 8   // per-row descriptor size in the payload
@@ -216,6 +225,15 @@ static uint8_t        sysmon_glide_units    = SYSMON_DEFAULT_GLIDE_UNITS;
 static uint8_t        sysmon_timeout_units  = SYSMON_DEFAULT_TIMEOUT_UNITS;
 static uint32_t       sysmon_last_update    = 0;
 static uint32_t       sysmon_ghost_update   = 0; // last FRAME C; 0 = never
+static bool           sysmon_goodbye        = false; // host said it is stopping
+static bool           sysmon_quiet          = false; // suspended since the last frame
+
+// What the display showed last, so one can blend into the next.
+#define DISP_EFFECT 0 // the regular RGB effect
+#define DISP_BOOT 1   // boot animation / static rainbow
+#define DISP_SYSMON 2 // the bars
+#define DISP_WARN 3   // the disconnect warning
+static uint8_t sysmon_disp = DISP_EFFECT;
 
 // Defined with the boot rainbow below.
 static void boot_replay(const uint8_t *args);
@@ -245,6 +263,8 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
             sysmon_decode_row(1, payload + 1 * SYSMON_ROW_BYTES);
             sysmon_decode_row(2, payload + 2 * SYSMON_ROW_BYTES);
             sysmon_last_update = timer_read32();
+            sysmon_goodbye     = false;
+            sysmon_quiet       = false;
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_FRAME_B) {
             sysmon_decode_row(3, payload + 0 * SYSMON_ROW_BYTES);
             sysmon_decode_row(4, payload + 1 * SYSMON_ROW_BYTES);
@@ -254,6 +274,8 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
             sysmon_glide_units   = payload[3 * SYSMON_ROW_BYTES + 1];
             sysmon_timeout_units = payload[3 * SYSMON_ROW_BYTES + 2];
             sysmon_last_update   = timer_read32();
+            sysmon_goodbye       = false;
+            sysmon_quiet         = false;
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_FRAME_C) {
             for (uint8_t row = 0; row < 6; row++) {
                 const uint8_t *src = payload + row * SYSMON_GHOST_BYTES;
@@ -266,6 +288,8 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
             // VIA echoes this buffer back: mark it so the host can detect
             // ghost support (payload[24] = data[27], past the descriptors).
             payload[6 * SYSMON_GHOST_BYTES] = SYSMON_GHOST_ACK;
+        } else if (*command_id == id_custom_set_value && *value_id == SYSMON_GOODBYE) {
+            sysmon_goodbye = true;
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_BOOT_REPLAY) {
             // Deliberately leaves sysmon_last_update alone: a preview is not
             // the host connecting.
@@ -302,14 +326,26 @@ static const uint8_t sysmon_row_leds[6][4] = {
 // efficiently, so a linear map runs visibly too bright at the dim end.
 static uint8_t sysmon_gcc = ISSI_GLOBALCURRENT; // last value written to the chip
 
-static void sysmon_set_gcc(uint8_t val) {
+static uint8_t sysmon_gcc_for(uint8_t val) {
     uint8_t gcc = (uint8_t)((uint32_t)val * val * ISSI_GLOBALCURRENT / (255UL * 255));
     if (gcc == 0 && val > 0) gcc = 1; // host wants light; GCC 0 is fully off
+    return gcc;
+}
+
+static void sysmon_write_gcc(uint8_t gcc) {
     if (gcc == sysmon_gcc) return;
     sysmon_gcc = gcc;
     IS31FL_unlock_register(DRIVER_ADDR_1, ISSI_PAGE_FUNCTION);
     IS31FL_write_single_register(DRIVER_ADDR_1, ISSI_REG_GLOBALCURRENT, gcc);
 }
+
+static void sysmon_set_gcc(uint8_t val) {
+    sysmon_write_gcc(sysmon_gcc_for(val));
+}
+
+// The bars render into this frame first, so the frame can be blended with
+// whatever the display showed before (see sysmon_flush) instead of cutting.
+static RGB sysmon_fb[RGB_MATRIX_LED_COUNT];
 
 // Lift a sub-full PWM brightness onto a GCC-dependent visibility floor.
 // Emitted light goes as PWM x GCC, and at global current 1-2 any PWM below
@@ -399,7 +435,7 @@ static void sysmon_render_bar(uint8_t row, uint8_t level, sysmon_color_mode_t mo
                 rgb.b = qadd8(rgb.b, g.b);
             }
         }
-        rgb_matrix_set_color(sysmon_row_leds[row][i], rgb.r, rgb.g, rgb.b);
+        sysmon_fb[sysmon_row_leds[row][i]] = rgb;
     }
 }
 
@@ -581,7 +617,7 @@ static void sysmon_render_row(uint8_t row, sysmon_glide_t *g, sysmon_glide_t *gg
         for (uint8_t k = 0; k < r->overlay_count; k++) {
             int8_t idx = down ? (int8_t)seg - (int8_t)k : (int8_t)seg + (int8_t)k;
             if (idx < 0 || idx > 3) continue;
-            rgb_matrix_set_color(sysmon_row_leds[row][idx], rgb.r, rgb.g, rgb.b);
+            sysmon_fb[sysmon_row_leds[row][idx]] = rgb;
         }
     }
 }
@@ -605,7 +641,7 @@ static void sysmon_render_row(uint8_t row, sysmon_glide_t *g, sysmon_glide_t *gg
 // state may advance per call. Each one ends on the exact static frame.
 //
 // The pick is a shuffle bag over a boot counter kept in the EEPROM user word:
-// every BOOT_ANIM_COUNT boots play each animation once, in a fresh order, and
+// every BOOT_POOL_COUNT boots play each pooled animation once, in a fresh order, and
 // never the same one twice in a row. (Nothing here seeds random8(), so it
 // would replay the same "random" sequence on every boot.) The counter is
 // written back only after the animation, clear of USB enumeration.
@@ -628,10 +664,19 @@ static void sysmon_render_row(uint8_t row, sysmon_glide_t *g, sysmon_glide_t *gg
 static uint8_t boot_nx[BOOT_N];     // left -> right
 static uint8_t boot_ny[BOOT_N];     // top -> bottom
 static uint8_t boot_pos[BOOT_N];    // diagonal, top-left -> bottom-right
-static uint8_t boot_center[BOOT_N]; // pad center -> outward
 static uint8_t boot_rise[BOOT_N];   // bottom -> top
 static uint8_t boot_ends[BOOT_N];   // both diagonal corners -> the middle
 static uint8_t boot_hue[BOOT_N];    // finished rainbow hue
+static RGB     boot_own[BOOT_N];    // ...and as RGB
+
+// Grid and true-proportion position of each key: column 0..3, row 0..5 (top
+// = 0), and x/y in hundredths of a key pitch (x 0..300, y 0..474; the top row
+// is half-height, so it sits closer to row 1).
+static uint8_t  boot_row[BOOT_N];
+static uint8_t  boot_col[BOOT_N];
+static uint16_t boot_px[BOOT_N];
+static uint16_t boot_py[BOOT_N];
+#define BOOT_KEY(r, c) (sysmon_row_leds[(r)][(c)])
 
 // Per-playback randomness, reseeded every time an animation starts.
 static uint32_t boot_seed;
@@ -713,21 +758,29 @@ static void boot_geometry_init(void) {
         if (g_led_config.point[i].x > max_x) max_x = g_led_config.point[i].x;
         if (g_led_config.point[i].y > max_y) max_y = g_led_config.point[i].y;
     }
-    uint16_t center[BOOT_N], ends[BOOT_N];
+    uint16_t ends[BOOT_N];
     for (uint8_t i = 0; i < BOOT_N; i++) {
         boot_nx[i]   = (uint8_t)((uint16_t)g_led_config.point[i].x * 255 / max_x);
         boot_ny[i]   = (uint8_t)((uint16_t)g_led_config.point[i].y * 255 / max_y);
         boot_pos[i]  = (uint8_t)(((uint16_t)boot_nx[i] + boot_ny[i]) / 2);
         boot_rise[i] = 255 - boot_ny[i];
         boot_hue[i]  = boot_hue_at(boot_pos[i]);
-
-        int32_t dx = ((int32_t)boot_nx[i] * 300 / 255 - 150) / 2; // half key-pitch/100 units
-        int32_t dy = ((int32_t)boot_ny[i] * 474 / 255 - 237) / 2;
-        center[i]  = sqrt16((uint16_t)(dx * dx + dy * dy));
-        ends[i]    = boot_pos[i] < 128 ? boot_pos[i] : 255 - boot_pos[i];
+        ends[i]      = boot_pos[i] < 128 ? boot_pos[i] : 255 - boot_pos[i];
     }
-    boot_normalize(boot_center, center);
     boot_normalize(boot_ends, ends);
+
+    for (uint8_t r = 0; r < 6; r++) {
+        for (uint8_t c = 0; c < 4; c++) {
+            uint8_t i   = BOOT_KEY(r, c);
+            boot_row[i] = r;
+            boot_col[i] = c;
+        }
+    }
+    for (uint8_t i = 0; i < BOOT_N; i++) {
+        boot_px[i]  = (uint16_t)((uint32_t)boot_nx[i] * 300 / 255);
+        boot_py[i]  = (uint16_t)((uint32_t)boot_ny[i] * 474 / 255);
+        boot_own[i] = hsv_to_rgb((HSV){boot_hue[i], 255, 255});
+    }
 }
 
 static void boot_set(uint8_t i, uint8_t hue, uint8_t sat, uint8_t val) {
@@ -887,17 +940,12 @@ static void boot_anim_rotate(uint16_t t) {
     }
 }
 
-// 7 Twinkle, center: the sparks start in the middle of the pad and spread out.
-static void boot_anim_twinkle_center(uint16_t t) {
-    boot_twinkle(t, boot_center, 1300);
-}
-
-// 8 Twinkle, scatter: sparks land anywhere, in a fresh random order each time.
+// 7 Twinkle, scatter: sparks land anywhere, in a fresh random order each time.
 static void boot_anim_twinkle_scatter(uint16_t t) {
     boot_twinkle(t, boot_rank, 1300);
 }
 
-// 9 Fire: classic red/orange/yellow flames climb from the bottom row to the
+// 8 Fire: classic red/orange/yellow flames climb from the bottom row to the
 // top, their tips flickering at uneven heights, while red embers break off the
 // flames and shoot up well ahead of them, drifting sideways and burning out on
 // the way. The flames are a band: behind it each key cools from flame yellow
@@ -1003,21 +1051,14 @@ static void boot_anim_fire(uint16_t t) {
     for (uint8_t i = 0; i < BOOT_N; i++) rgb_matrix_set_color(i, px[i].r, px[i].g, px[i].b);
 }
 
-// 10 Ripple: a white, slightly ragged ring grows from the center outward and
-// cools into the colors behind it.
-#define BOOT_RIPPLE_MS 1800
-static void boot_anim_ripple(uint16_t t) {
-    boot_sweep(t, BOOT_RIPPLE_MS, boot_center, 110, 40, true);
-}
-
-// 11 Converge: two white, slightly ragged edges start at opposite corners and
+// 9 Converge: two white, slightly ragged edges start at opposite corners and
 // meet across the middle.
 #define BOOT_CONVERGE_MS 1600
 static void boot_anim_converge(uint16_t t) {
     boot_sweep(t, BOOT_CONVERGE_MS, boot_ends, 110, 30, true);
 }
 
-// 12 Flicker: each key sputters on like a warming neon tube, at its own random
+// 10 Flicker: each key sputters on like a warming neon tube, at its own random
 // moment (drifting loosely along the diagonal), then holds.
 #define BOOT_FLICKER_MS 2200
 static void boot_anim_flicker(uint16_t t) {
@@ -1041,7 +1082,7 @@ static void boot_anim_flicker(uint16_t t) {
     }
 }
 
-// 13 Lock-in: the whole pad sweeps once through the spectrum as one color, and
+// 11 Lock-in: the whole pad sweeps once through the spectrum as one color, and
 // each key freezes on its own color as the sweep reaches it, until the last
 // one (violet) locks. The sweep starts a little before red, from pink, so even
 // the red corner visibly arrives rather than being locked from the start.
@@ -1062,6 +1103,515 @@ static void boot_anim_lockin(uint16_t t) {
     }
 }
 
+// --- palette 2 -------------------------------------------------------------
+//
+// Deliberately unlike palette 1's sweeping fronts: discrete events, particles
+// with momentum or gravity, per-column motion, light-source metaphors, things
+// that scramble and settle. Same rules: pure functions of t (random layouts
+// are rebuilt from boot_seed when it changes, never advanced per call), dark
+// is exactly 0, and each one ends on the exact static frame.
+
+static RGB boot_fb[BOOT_N]; // additive frame buffer for particle effects
+
+static void boot_fb_clear(void) {
+    for (uint8_t i = 0; i < BOOT_N; i++) boot_fb[i] = (RGB){0, 0, 0};
+}
+
+static void boot_fb_add(uint8_t i, RGB c, uint8_t w) {
+    boot_fb[i].r = qadd8(boot_fb[i].r, boot_mul(c.r, w));
+    boot_fb[i].g = qadd8(boot_fb[i].g, boot_mul(c.g, w));
+    boot_fb[i].b = qadd8(boot_fb[i].b, boot_mul(c.b, w));
+}
+
+static void boot_fb_flush(void) {
+    for (uint8_t i = 0; i < BOOT_N; i++) rgb_matrix_set_color(i, boot_fb[i].r, boot_fb[i].g, boot_fb[i].b);
+}
+
+static RGB boot_rgb_scale(RGB c, uint8_t v) {
+    return (RGB){boot_mul(c.r, v), boot_mul(c.g, v), boot_mul(c.b, v)};
+}
+
+static RGB boot_hsv(uint8_t h, uint8_t s, uint8_t v) {
+    return hsv_to_rgb((HSV){h, s, v});
+}
+
+// A per-playback random number, stable for a given key.
+static uint32_t boot_rnd(uint32_t key) {
+    return boot_hash32(boot_seed ^ (key * 0x9E3779B9U + 0x7F4A7C15U));
+}
+
+// True when an animation's precomputed layout must be rebuilt: another
+// animation used the cache last, or the seed changed (new boot / new round).
+static bool boot_cache_stale(uint8_t id) {
+    static uint32_t seed  = 0;
+    static uint8_t  owner = 0xFF;
+    if (owner == id && seed == boot_seed) return false;
+    owner = id;
+    seed  = boot_seed;
+    return true;
+}
+
+// Distance between two points in key-pitch/100 units (sqrt16 needs halving:
+// the squared diagonal of the pad overflows 16 bits).
+static uint16_t boot_dist(int32_t dx, int32_t dy) {
+    dx /= 2;
+    dy /= 2;
+    return (uint16_t)(sqrt16((uint16_t)MIN(dx * dx + dy * dy, 65535)) * 2);
+}
+
+// 12 Fireworks: rockets rise from the bottom and burst; each burst lights the
+// keys around it (a white pop settling into their colors) and throws sparks
+// that arc under gravity. A big finale lights the rest.
+#define BOOT_FW_MS 2800
+#define BOOT_FW_SHELLS 4
+#define BOOT_FW_SPARKS 8
+#define BOOT_FW_RISE 380
+static uint16_t boot_fw_launch[BOOT_FW_SHELLS];
+static uint8_t  boot_fw_col[BOOT_FW_SHELLS];
+static uint16_t boot_fw_y[BOOT_FW_SHELLS];
+static uint16_t boot_fw_radius[BOOT_FW_SHELLS];
+static uint8_t  boot_fw_hue[BOOT_FW_SHELLS];
+static uint16_t boot_fw_reveal[BOOT_N];
+
+static void boot_anim_fireworks(uint16_t t) {
+    static const uint16_t row_y[6] = {0, 72, 176, 273, 369, 474};
+    if (boot_cache_stale(16)) {
+        uint8_t prev = 0xFF;
+        for (uint8_t s = 0; s < BOOT_FW_SHELLS; s++) {
+            uint32_t h        = boot_rnd(0xF14Eu + s);
+            bool     finale   = s == BOOT_FW_SHELLS - 1;
+            uint8_t  col      = finale ? 1 + (h & 1) : (uint8_t)((h >> 4) % 4);
+            if (!finale && col == prev) col = (col + 1 + (h >> 8) % 3) % 4;
+            prev              = col;
+            boot_fw_col[s]    = col;
+            boot_fw_launch[s] = (uint16_t)(100 + s * 490 + (h >> 12) % 80);
+            static const uint8_t rows[BOOT_FW_SHELLS][2] = {{1, 2}, {3, 4}, {1, 2}, {2, 3}};
+            boot_fw_y[s]      = row_y[rows[s][(h >> 20) & 1]];
+            boot_fw_radius[s] = finale ? 700 : 165;
+            boot_fw_hue[s]    = (uint8_t)(h >> 24);
+        }
+        for (uint8_t i = 0; i < BOOT_N; i++) {
+            boot_fw_reveal[i] = 0xFFFF;
+            for (uint8_t s = 0; s < BOOT_FW_SHELLS; s++) {
+                uint16_t d = boot_dist((int32_t)boot_px[i] - boot_fw_col[s] * 100, (int32_t)boot_py[i] - boot_fw_y[s]);
+                if (d > boot_fw_radius[s]) continue;
+                uint16_t at = boot_fw_launch[s] + BOOT_FW_RISE + d / 4;
+                if (at < boot_fw_reveal[i]) boot_fw_reveal[i] = at;
+            }
+        }
+    }
+    boot_fb_clear();
+    // Lit keys: a pale pop at burst, saturating into their own color.
+    for (uint8_t i = 0; i < BOOT_N; i++) {
+        if (t < boot_fw_reveal[i]) continue;
+        uint8_t s = 120 + boot_mul(135, boot_ease_out(boot_prog(t - boot_fw_reveal[i], 0, 450)));
+        boot_fb_add(i, boot_hsv(boot_hue[i], s, 255), 255);
+    }
+    for (uint8_t s = 0; s < BOOT_FW_SHELLS; s++) {
+        int32_t dt = (int32_t)t - boot_fw_launch[s];
+        if (dt < 0) continue;
+        int32_t cx = boot_fw_col[s] * 100;
+        if (dt < BOOT_FW_RISE) {
+            // The rocket: a warm-white head with a short tail, slowing to apex.
+            int32_t y = 534 - (int32_t)(534 - boot_fw_y[s]) * boot_ease_out((uint8_t)(dt * 255 / BOOT_FW_RISE)) / 255;
+            RGB     rc = boot_hsv(28, 90, 255);
+            for (uint8_t r = 0; r < 6; r++) {
+                uint8_t i  = BOOT_KEY(r, boot_fw_col[s]);
+                int32_t dy = (int32_t)boot_py[i] - y; // > 0: below the head
+                if (dy > -50 && dy <= 0) boot_fb_add(i, rc, (uint8_t)((50 + dy) * 255 / 50));
+                if (dy > 0 && dy < 110) boot_fb_add(i, rc, (uint8_t)((110 - dy) * 255 / 110));
+            }
+            continue;
+        }
+        // Sparks: fly out from the burst, arc down under gravity, burn out.
+        int32_t bt  = dt - BOOT_FW_RISE;
+        RGB     sc  = boot_hsv(boot_fw_hue[s], 200, 255);
+        for (uint8_t j = 0; j < BOOT_FW_SPARKS; j++) {
+            uint32_t h    = boot_rnd(0x5A4Cu + s * 16u + j);
+            int32_t  life = 450 + (int32_t)(h % 250);
+            if (bt >= life) continue;
+            uint8_t a     = (uint8_t)(j * 32 + (h >> 8) % 24);
+            int32_t speed = 450 + (int32_t)((h >> 16) % 350); // units / s
+            int32_t x     = cx + ((int32_t)cos8(a) - 128) * speed / 128 * bt / 1000;
+            int32_t y     = boot_fw_y[s] + ((int32_t)sin8(a) - 128) * speed / 128 * bt / 1000 + 450 * bt * bt / 1000000;
+            uint8_t heat  = (uint8_t)(255 - bt * 255 / life);
+            for (uint8_t i = 0; i < BOOT_N; i++) {
+                int32_t dx = (int32_t)boot_px[i] - x, dy = (int32_t)boot_py[i] - y;
+                int32_t d2 = dx * dx + dy * dy;
+                if (d2 >= 4900) continue;
+                boot_fb_add(i, sc, boot_mul((uint8_t)(255 - d2 * 255 / 4900), heat));
+            }
+        }
+    }
+    boot_fb_flush();
+}
+
+// 13 Lightning: dark, then bolts strike top to bottom along a jagged path,
+// flickering the way lightning does and lighting the sky. Each bolt leaves the
+// keys it struck lit in their colors; the last one lights everything.
+#define BOOT_BOLT_MS 2400
+#define BOOT_BOLTS 3
+static uint16_t boot_bolt_t[BOOT_BOLTS];
+static uint8_t  boot_bolt_path[BOOT_BOLTS][6]; // column per row
+static uint8_t  boot_bolt_fork[BOOT_BOLTS];    // a one-key side branch (LED index)
+
+static uint8_t boot_bolt_env(int32_t dt) {
+    if (dt < 0) return 0;
+    if (dt < 60) return 255;
+    if (dt < 110) return 40;
+    if (dt < 170) return 255;
+    if (dt < 220) return 70;
+    if (dt < 270) return 210;
+    if (dt < 600) {
+        uint8_t r = (uint8_t)(255 - (dt - 270) * 255 / 330);
+        return boot_mul(210, boot_mul(r, r));
+    }
+    return 0;
+}
+
+static void boot_anim_lightning(uint16_t t) {
+    if (boot_cache_stale(17)) {
+        static const uint16_t base[BOOT_BOLTS] = {200, 850, 1500};
+        for (uint8_t k = 0; k < BOOT_BOLTS; k++) {
+            uint32_t h     = boot_rnd(0xB017u + k);
+            boot_bolt_t[k] = base[k] + (uint16_t)(h % 140);
+            int8_t col     = (int8_t)((h >> 8) % 4);
+            for (uint8_t r = 0; r < 6; r++) {
+                if (r) col += (int8_t)((h >> (10 + 2 * r)) % 3) - 1; // -1, 0, +1
+                if (col < 0) col = 1;
+                if (col > 3) col = 2;
+                boot_bolt_path[k][r] = (uint8_t)col;
+            }
+            uint8_t fr        = 1 + (h >> 26) % 4;
+            int8_t  fc        = (int8_t)boot_bolt_path[k][fr] + ((h >> 30) & 1 ? 1 : -1);
+            if (fc < 0 || fc > 3) fc = (int8_t)boot_bolt_path[k][fr] - (fc < 0 ? -1 : 1);
+            boot_bolt_fork[k] = BOOT_KEY(fr + 1 > 5 ? 5 : fr + 1, fc);
+        }
+    }
+    const RGB bolt = boot_hsv(165, 50, 255);
+    const RGB sky  = boot_hsv(160, 90, 255);
+    boot_fb_clear();
+    // Keys earlier strikes revealed (and, after the last strike, all of them).
+    int32_t last = (int32_t)t - boot_bolt_t[BOOT_BOLTS - 1];
+    uint8_t all  = last < 110 ? 0 : boot_fade(boot_prog(last, 110, 590));
+    for (uint8_t i = 0; i < BOOT_N; i++) {
+        uint8_t v = all;
+        for (uint8_t k = 0; k < BOOT_BOLTS && v < 255; k++) {
+            if ((int32_t)t - boot_bolt_t[k] >= 110 && boot_bolt_path[k][boot_row[i]] == boot_col[i]) v = 255;
+        }
+        if (v) boot_fb_add(i, boot_own[i], v);
+    }
+    for (uint8_t k = 0; k < BOOT_BOLTS; k++) {
+        int32_t dt  = (int32_t)t - boot_bolt_t[k];
+        uint8_t env = boot_bolt_env(dt);
+        if (!env) continue;
+        for (uint8_t i = 0; i < BOOT_N; i++) boot_fb_add(i, sky, boot_mul(env, 46));
+        for (uint8_t r = 0; r < 6; r++) {
+            if (dt < r * 12) break; // the leader races down the path
+            boot_fb_add(BOOT_KEY(r, boot_bolt_path[k][r]), bolt, env);
+        }
+        if (dt >= 40) boot_fb_add(boot_bolt_fork[k], bolt, boot_mul(env, 150));
+    }
+    boot_fb_flush();
+}
+
+// 14 Stack: the colors drop in from above like falling blocks, bottom row
+// first, each landing in its slot with a little flash, until the pad is full.
+#define BOOT_STACK_MS 2650
+static uint16_t boot_stack_t[BOOT_N];
+
+static void boot_anim_stack(uint16_t t) {
+    // Fall time to row r from one row above the pad at 40 rows/s^2.
+    static const uint16_t land_ms[6] = {224, 316, 387, 447, 500, 548};
+    if (boot_cache_stale(19)) {
+        for (uint8_t g = 0; g < 6; g++) { // g = 0 is the bottom row
+            uint8_t order[4];
+            boot_shuffle(order, 4, boot_rnd(0x57ACu + g));
+            for (uint8_t j = 0; j < 4; j++) {
+                uint8_t k                                = g * 4 + j;
+                boot_stack_t[BOOT_KEY(5 - g, order[j])] = (uint16_t)(80 + k * 80 + g * 50 + boot_rnd(0x57A0u + k) % 25);
+            }
+        }
+    }
+    boot_fb_clear();
+    for (uint8_t i = 0; i < BOOT_N; i++) {
+        int32_t dt = (int32_t)t - boot_stack_t[i];
+        if (dt < 0) continue;
+        uint8_t r = boot_row[i];
+        if (dt >= land_ms[r]) {
+            uint8_t s = 150 + boot_mul(105, boot_prog(dt - land_ms[r], 0, 180)); // landing flash
+            boot_fb_add(i, boot_hsv(boot_hue[i], s, 255), 255);
+            continue;
+        }
+        int32_t y = -256 + dt * dt * 512 / 100000; // 1/256 rows
+        int32_t r0 = y >> 8;                       // the two rows the block straddles
+        for (int32_t rr = r0; rr <= r0 + 1; rr++) {
+            if (rr < 0 || rr > 5) continue;
+            int32_t d = y - rr * 256;
+            if (d < 0) d = -d;
+            if (d >= 256) continue;
+            boot_fb_add(BOOT_KEY(rr, boot_col[i]), boot_own[i], (uint8_t)((256 - d) * 255 / 256));
+        }
+    }
+    boot_fb_flush();
+}
+
+// 15 Spotlight: a soft spotlight wanders around the dark pad, showing the
+// rainbow only where it shines (a little paler at its hot center), then
+// widens until the whole pad is lit.
+#define BOOT_SPOT_MS 2600
+static void boot_anim_spotlight(uint16_t t) {
+    uint8_t phx  = (uint8_t)(boot_rnd(0x5B07u) + (uint32_t)t * 2304 / 10000); // 0.9 Hz
+    uint8_t phy  = (uint8_t)(boot_rnd(0x5B08u) + (uint32_t)t * 1408 / 10000); // 0.55 Hz
+    int32_t sx   = 150 + 135 * ((int32_t)sin8(phx) - 128) / 128;
+    int32_t sy   = 237 + 215 * ((int32_t)sin8(phy) - 128) / 128;
+    uint8_t grow = boot_prog(t, 1500, 1000);
+    int32_t r0   = 105 + 560 * (int32_t)boot_mul(grow, grow) / 255;
+    uint8_t pale = boot_mul(110, 255 - grow);
+    uint8_t v0   = boot_fade(boot_prog(t, 0, 250));
+    for (uint8_t i = 0; i < BOOT_N; i++) {
+        int32_t d = boot_dist((int32_t)boot_px[i] - sx, (int32_t)boot_py[i] - sy);
+        uint8_t v = d <= r0 ? 255 : d >= r0 + 75 ? 0 : (uint8_t)((r0 + 75 - d) * 255 / 75);
+        uint8_t s = d < r0 ? 255 - boot_mul(pale, (uint8_t)(255 - d * 255 / r0)) : 255;
+        boot_set(i, boot_hue[i], s, boot_mul(v, v0));
+    }
+}
+
+// 16 Glitch: the picture boots like a corrupted video signal -- rows tear
+// sideways, blocks of wrong color flash, channels drop out, frames black out
+// -- and the corruption thins out until the image holds clean.
+#define BOOT_GLITCH_MS 2300
+#define BOOT_GLITCH_SLOT 45
+static void boot_anim_glitch(uint16_t t) {
+    uint32_t slot  = t / BOOT_GLITCH_SLOT;
+    uint32_t h     = boot_rnd(0x6117C800u + slot);
+    uint32_t h2    = boot_hash32(h);
+    uint8_t  chaos = 255 - boot_prog(t, 400, 1600);
+    bool     image = t >= 300 || (h & 0x300) == 0; // the picture stutters in at first
+    RGB      g[6][4];
+    for (uint8_t r = 0; r < 6; r++)
+        for (uint8_t c = 0; c < 4; c++) g[r][c] = image ? boot_own[BOOT_KEY(r, c)] : (RGB){0, 0, 0};
+
+    if ((uint8_t)(h >> 24) < boot_mul(chaos, 230)) {
+        switch ((h >> 4) % 6) {
+            case 0: // rows tear sideways
+                for (uint8_t r = 0; r < 6; r++) {
+                    if (!((h2 >> r) & 1)) continue;
+                    uint8_t sh = 1 + (h2 >> (8 + 2 * r)) % 3;
+                    RGB     row[4];
+                    for (uint8_t c = 0; c < 4; c++) row[c] = g[r][(c + sh) % 4];
+                    for (uint8_t c = 0; c < 4; c++) g[r][c] = row[c];
+                }
+                break;
+            case 1: { // a block of wrong color (sometimes white)
+                uint8_t r0 = h2 % 6, c0 = (h2 >> 4) % 4, rh = 1 + (h2 >> 8) % 3, cw = 1 + (h2 >> 12) % 3;
+                RGB     col = boot_hsv((uint8_t)(h2 >> 16), (h2 >> 28) ? 255 : 0, 255);
+                for (uint8_t r = r0; r < r0 + rh && r < 6; r++)
+                    for (uint8_t c = c0; c < c0 + cw && c < 4; c++) g[r][c] = col;
+                break;
+            }
+            case 2: // a color channel drops out
+                for (uint8_t r = 0; r < 6; r++)
+                    for (uint8_t c = 0; c < 4; c++) {
+                        if (h2 % 3 == 0) g[r][c].r = 0;
+                        if (h2 % 3 == 1) g[r][c].g = 0;
+                        if (h2 % 3 == 2) g[r][c].b = 0;
+                    }
+                break;
+            case 3: // blackout from some row down
+                for (uint8_t r = h2 % 6; r < 6; r++)
+                    for (uint8_t c = 0; c < 4; c++) g[r][c] = (RGB){0, 0, 0};
+                break;
+            case 4: { // vertical tear: the lower part slips down a row
+                uint8_t rt = 1 + h2 % 5;
+                for (uint8_t r = 5; r > rt; r--)
+                    for (uint8_t c = 0; c < 4; c++) g[r][c] = g[r - 1][c];
+                break;
+            }
+            default: { // a band with inverted hues
+                uint8_t r0 = h2 % 5;
+                for (uint8_t r = r0; r < r0 + 2; r++)
+                    for (uint8_t c = 0; c < 4; c++) g[r][c] = boot_hsv(boot_hue[BOOT_KEY(r, c)] + 128, 255, 255);
+                break;
+            }
+        }
+    }
+    for (uint8_t r = 0; r < 6; r++)
+        for (uint8_t c = 0; c < 4; c++) rgb_matrix_set_color(BOOT_KEY(r, c), g[r][c].r, g[r][c].g, g[r][c].b);
+}
+
+// --- text prototypes (preview only) ----------------------------------------
+//
+// A 5-row font drawn on pad rows 1-5, the evenly spaced ones; the
+// half-height top row stays dark until the ending. Glyph rows are bitmaps,
+// bit (w-1-x) = column x. M and W need five columns to read; the lowercase
+// entries are four-column forms for styles that show one letter at a time.
+
+typedef struct {
+    char    ch;
+    uint8_t w;
+    uint8_t rows[5];
+} boot_glyph_t;
+
+static const boot_glyph_t boot_font[] = {
+    {'F', 4, {0x0F, 0x08, 0x0E, 0x08, 0x08}}, // ####  #...  ###.  #...  #...
+    {'R', 4, {0x0E, 0x09, 0x0E, 0x0A, 0x09}}, // ###.  #..#  ###.  #.#.  #..#
+    {'A', 4, {0x06, 0x09, 0x0F, 0x09, 0x09}}, // .##.  #..#  ####  #..#  #..#
+    {'M', 5, {0x11, 0x1B, 0x15, 0x11, 0x11}}, // #...#  ##.##  #.#.#  #...#  #...#
+    {'E', 4, {0x0F, 0x08, 0x0E, 0x08, 0x0F}}, // ####  #...  ###.  #...  ####
+    {'W', 5, {0x11, 0x11, 0x15, 0x1B, 0x11}}, // #...#  #...#  #.#.#  ##.##  #...#
+    {'O', 4, {0x06, 0x09, 0x09, 0x09, 0x06}}, // .##.  #..#  #..#  #..#  .##.
+    {'K', 4, {0x09, 0x0A, 0x0C, 0x0A, 0x09}}, // #..#  #.#.  ##..  #.#.  #..#
+    {'1', 3, {0x02, 0x06, 0x02, 0x02, 0x07}}, // .#.  ##.  .#.  .#.  ###
+    {'6', 4, {0x06, 0x08, 0x0E, 0x09, 0x06}}, // .##.  #...  ###.  #..#  .##.
+    {'m', 4, {0x09, 0x0F, 0x0F, 0x09, 0x09}}, // #..#  ####  ####  #..#  #..#
+    {'w', 4, {0x09, 0x09, 0x0F, 0x0F, 0x09}}, // #..#  #..#  ####  ####  #..#
+};
+
+static const boot_glyph_t *boot_glyph(char c) {
+    for (uint8_t i = 0; i < sizeof(boot_font) / sizeof(boot_font[0]); i++) {
+        if (boot_font[i].ch == c) return &boot_font[i];
+    }
+    return &boot_font[0];
+}
+
+// Is key (r, c) part of glyph g drawn on rows 1-5, centered in the 4 columns?
+static bool boot_glyph_lit(const boot_glyph_t *g, uint8_t r, uint8_t c) {
+    uint8_t x0 = (uint8_t)((4 - g->w + 1) / 2);
+    if (r == 0 || c < x0 || c >= x0 + g->w) return false;
+    return (g->rows[r - 1] >> (g->w - 1 - (c - x0))) & 1;
+}
+
+// --- marquee ---
+
+#define BOOT_TEXT_MAXCOLS 64
+#define BOOT_TEXT_BLOCK 0x80 // a column of the closing rainbow block (all rows)
+static uint8_t     boot_text_cols[BOOT_TEXT_MAXCOLS]; // bits 0-4 = rows 1-5
+static uint8_t     boot_text_ncols;
+static const char *boot_text_built = NULL;
+
+// Lay the text out as columns: each glyph, a blank column, and at the end a
+// 4-column block of the rainbow itself that scrolls in and docks.
+static void boot_text_build(const char *txt) {
+    if (boot_text_built == txt) return;
+    uint8_t n = 0;
+    for (const char *p = txt; *p; p++) {
+        const boot_glyph_t *g = boot_glyph(*p);
+        for (uint8_t x = 0; x < g->w && n < BOOT_TEXT_MAXCOLS - 5; x++) {
+            uint8_t m = 0;
+            for (uint8_t r = 0; r < 5; r++) {
+                if ((g->rows[r] >> (g->w - 1 - x)) & 1) m |= 1 << r;
+            }
+            boot_text_cols[n++] = m;
+        }
+        boot_text_cols[n++] = 0;
+    }
+    for (uint8_t k = 0; k < 4; k++) boot_text_cols[n++] = BOOT_TEXT_BLOCK;
+    boot_text_ncols = n;
+    boot_text_built = txt;
+}
+
+static uint8_t boot_text_px(int32_t col, uint8_t r) {
+    if (col < 0 || col >= boot_text_ncols) return 0;
+    uint8_t m = boot_text_cols[col];
+    if (m & BOOT_TEXT_BLOCK) return 255;
+    return (r > 0 && ((m >> (r - 1)) & 1)) ? 255 : 0;
+}
+
+// Scroll txt right to left at cps columns/s, the text drawn in the rainbow
+// colors of the keys it passes over (a stencil), easing to a stop as the
+// rainbow block docks. Sub-column positions blend neighboring columns.
+static void boot_text_scroll(uint16_t t, const char *txt, uint16_t cps) {
+    boot_text_build(txt);
+    const int32_t D  = (int32_t)boot_text_ncols * 256; // from -4 to ncols-4 columns
+    const int32_t L  = 2 * 256;                         // decelerate over the last 2
+    const int32_t v  = (int32_t)cps * 256;              // 1/256 columns per second
+    const int32_t t1 = (D - L) * 1000 / v;              // ms at full speed
+    const int32_t td = 2 * L * 1000 / v;                // ms decelerating
+    int32_t       p;
+    if (t < t1) {
+        p = v * t / 1000;
+    } else if (t < t1 + td) {
+        int32_t dt = t - t1;
+        p          = D - L + v * dt / 1000 - (int32_t)((int64_t)v * dt * dt / (2000LL * td));
+    } else {
+        p = D;
+    }
+    p -= 4 * 256;
+    int32_t base = p >> 8; // arithmetic shift: floors
+    uint8_t fr   = (uint8_t)(p & 0xFF);
+    for (uint8_t r = 0; r < 6; r++) {
+        for (uint8_t c = 0; c < 4; c++) {
+            uint8_t v0 = boot_text_px(base + c, r), v1 = boot_text_px(base + c + 1, r);
+            uint8_t v8 = (uint8_t)(((uint16_t)v0 * (256 - fr) + (uint16_t)v1 * fr) >> 8);
+            uint8_t i  = BOOT_KEY(r, c);
+            RGB     o  = boot_rgb_scale(boot_own[i], v8);
+            rgb_matrix_set_color(i, o.r, o.g, o.b);
+        }
+    }
+}
+
+// 18 FW16 scroll: "FW16" scrolls through like an LED ticker, then the rainbow
+// slides in behind it.
+#define BOOT_TEXT_FW16_MS 3050
+static void boot_anim_text_fw16(uint16_t t) {
+    boot_text_scroll(t, "FW16", 9);
+}
+
+// 19 FRAMEWORK scroll: the same with the full name, a little faster.
+#define BOOT_TEXT_FWK_MS 3700
+static void boot_anim_text_framework(uint16_t t) {
+    boot_text_scroll(t, "FRAMEWORK", 15);
+}
+
+// 17 FW16 pop: F, W, 1, 6 pop up one at a time as big letters -- a white flash
+// cooling into the rainbow colors under them. The 6 stays, and the rest of
+// the pad sparkles in around it.
+#define BOOT_TEXT_POP_MS 2800
+#define BOOT_POP_SLOT 420
+static void boot_anim_text_pop(uint16_t t) {
+    static const char text[4] = {'F', 'w', '1', '6'};
+    int32_t           k       = ((int32_t)t - 100) / BOOT_POP_SLOT;
+    if (t < 100) k = -1;
+    if (k > 3) k = 3;
+    int32_t  dt   = (int32_t)t - 100 - k * BOOT_POP_SLOT;
+    int32_t  fill = (int32_t)t - (100 + 3 * BOOT_POP_SLOT + 500); // the sparkle finish
+    for (uint8_t i = 0; i < BOOT_N; i++) {
+        bool on = k >= 0 && boot_glyph_lit(boot_glyph(text[k]), boot_row[i], boot_col[i]);
+        if (on) {
+            uint8_t v = boot_prog(dt, 0, 70);
+            if (k < 3) v = boot_mul(v, 255 - boot_prog(dt, 340, 70)); // the last letter stays
+            boot_set(i, boot_hue[i], boot_prog(dt, 70, 150), v);
+        } else if (fill >= 0) {
+            boot_spark(i, (int16_t)(fill - (int32_t)boot_rank[i] * 300 / 255));
+        } else {
+            boot_set(i, 0, 0, 0);
+        }
+    }
+}
+
+// 20 FRAMEWORK flash: the letters flash one at a time in white, like a sign
+// spelling itself out, then the whole rainbow sputters on like neon.
+#define BOOT_TEXT_FLASH_MS 2650
+static void boot_anim_text_flash(uint16_t t) {
+    static const char text[] = "FRAmEwORK";
+    int32_t           end    = 100 + 9 * 220; // after the last letter
+    if ((int32_t)t >= end) {
+        // Neon switch-on: on, off, on, off, then steady.
+        int32_t dt = (int32_t)t - end;
+        bool    on = dt < 50 || (dt >= 90 && dt < 120) || dt >= 180;
+        for (uint8_t i = 0; i < BOOT_N; i++) boot_set(i, boot_hue[i], 255, on ? 255 : 0);
+        return;
+    }
+    int32_t k  = ((int32_t)t - 100) / 220;
+    int32_t dt = (int32_t)t - 100 - k * 220;
+    bool    lit_phase = t >= 100 && dt < 160;
+    for (uint8_t i = 0; i < BOOT_N; i++) {
+        bool on = lit_phase && boot_glyph_lit(boot_glyph(text[k]), boot_row[i], boot_col[i]);
+        boot_set(i, 0, 0, on ? 255 : 0);
+    }
+}
+
 typedef struct {
     void (*render)(uint16_t t);
     uint16_t duration_ms;
@@ -1074,34 +1624,47 @@ static const boot_anim_t boot_anims[] = {
     {boot_anim_bloom, BOOT_BLOOM_MS},               // 4
     {boot_anim_twinkle, BOOT_TWINKLE_MS},           // 5
     {boot_anim_rotate, BOOT_ROTATE_MS},             // 6
-    {boot_anim_twinkle_center, BOOT_TWINKLE_MS},    // 7
-    {boot_anim_twinkle_scatter, BOOT_TWINKLE_MS},   // 8
-    {boot_anim_fire, BOOT_FIRE_MS},                 // 9
-    {boot_anim_ripple, BOOT_RIPPLE_MS},             // 10
-    {boot_anim_converge, BOOT_CONVERGE_MS},         // 11
-    {boot_anim_flicker, BOOT_FLICKER_MS},           // 12
-    {boot_anim_lockin, BOOT_LOCKIN_MS},             // 13
+    {boot_anim_twinkle_scatter, BOOT_TWINKLE_MS},   // 7
+    {boot_anim_fire, BOOT_FIRE_MS},                 // 8
+    {boot_anim_converge, BOOT_CONVERGE_MS},         // 9
+    {boot_anim_flicker, BOOT_FLICKER_MS},           // 10
+    {boot_anim_lockin, BOOT_LOCKIN_MS},             // 11
+    {boot_anim_fireworks, BOOT_FW_MS},              // 12
+    {boot_anim_lightning, BOOT_BOLT_MS},            // 13
+    {boot_anim_stack, BOOT_STACK_MS},               // 14
+    {boot_anim_spotlight, BOOT_SPOT_MS},            // 15
+    {boot_anim_glitch, BOOT_GLITCH_MS},             // 16
+    // preview-only text prototypes (not in the pool)
+    {boot_anim_text_pop, BOOT_TEXT_POP_MS},         // 17
+    {boot_anim_text_fw16, BOOT_TEXT_FW16_MS},       // 18
+    {boot_anim_text_framework, BOOT_TEXT_FWK_MS},   // 19
+    {boot_anim_text_flash, BOOT_TEXT_FLASH_MS},     // 20
 };
 #define BOOT_ANIM_COUNT ((uint8_t)(sizeof(boot_anims) / sizeof(boot_anims[0])))
 
+// The power-up pool: which animations (0-based table indices) a boot may
+// pick. Every animation can be replayed by number; only these play at boot.
+static const uint8_t boot_pool[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+#define BOOT_POOL_COUNT ((uint8_t)(sizeof(boot_pool) / sizeof(boot_pool[0])))
+
 // --- picking ---------------------------------------------------------------
 
-// Which variant the n-th power-up plays: position n % COUNT of the shuffle
-// for cycle n / COUNT. A cycle whose first pick repeats the previous cycle's
+// Which variant the n-th power-up plays: position n % POOL of the shuffle
+// for cycle n / POOL. A cycle whose first pick repeats the previous cycle's
 // last swaps its first two, so no variant ever plays twice in a row.
 static uint8_t boot_bag_pick(uint32_t n) {
-    uint8_t  cur[BOOT_ANIM_COUNT];
-    uint32_t cycle = n / BOOT_ANIM_COUNT;
-    boot_shuffle(cur, BOOT_ANIM_COUNT, boot_hash32(cycle));
+    uint8_t  cur[BOOT_POOL_COUNT];
+    uint32_t cycle = n / BOOT_POOL_COUNT;
+    boot_shuffle(cur, BOOT_POOL_COUNT, boot_hash32(cycle));
     if (cycle > 0) {
-        uint8_t prev[BOOT_ANIM_COUNT];
-        boot_shuffle(prev, BOOT_ANIM_COUNT, boot_hash32(cycle - 1));
-        if (cur[0] == prev[BOOT_ANIM_COUNT - 1]) {
+        uint8_t prev[BOOT_POOL_COUNT];
+        boot_shuffle(prev, BOOT_POOL_COUNT, boot_hash32(cycle - 1));
+        if (cur[0] == prev[BOOT_POOL_COUNT - 1]) {
             cur[0] = cur[1];
-            cur[1] = prev[BOOT_ANIM_COUNT - 1];
+            cur[1] = prev[BOOT_POOL_COUNT - 1];
         }
     }
-    return cur[n % BOOT_ANIM_COUNT];
+    return boot_pool[cur[n % BOOT_POOL_COUNT]];
 }
 
 // Draw the next power-up pick and advance the counter (saved after playback).
@@ -1165,12 +1728,20 @@ static void boot_status(uint8_t *out) {
     boot_put32(out, boot_counter);
     out[4] = boot_powerup_pick;
     boot_put32(out + 5, eeconfig_read_user());
+    out[9] = sysmon_disp;
 }
 
-// Variant n's name tag: n white dots in reading order from the top-left key.
+// Variant n's name tag. Up to 9: n white dots in reading order from the
+// top-left key. From 10: the tens as cyan dots on the top row, then the units
+// as white dots in reading order from the second row.
 static void boot_render_dots(uint8_t n) {
     for (uint8_t i = 0; i < BOOT_N; i++) boot_set(i, 0, 0, 0);
-    for (uint8_t k = 0; k < n && k < 24; k++) boot_set(sysmon_row_leds[k / 4][k % 4], 0, 0, 255);
+    if (n < 10) {
+        for (uint8_t k = 0; k < n; k++) boot_set(BOOT_KEY(k / 4, k % 4), 0, 0, 255);
+        return;
+    }
+    for (uint8_t k = 0; k < n / 10 && k < 4; k++) boot_set(BOOT_KEY(0, k), 128, 255, 255);
+    for (uint8_t k = 0; k < n % 10; k++) boot_set(BOOT_KEY(1 + k / 4, k % 4), 0, 0, 255);
 }
 
 // Length of one playlist slot showing variant v.
@@ -1231,12 +1802,84 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     return true;
 }
 
+// A USB suspend (sleep) silences the host for an expected reason: don't greet
+// the wake-up with a disconnect warning. The next frame clears this.
+void suspend_power_down_user(void) {
+    sysmon_quiet = true;
+}
+
+// --- disconnect warning ----------------------------------------------------
+
+// Shown when the host stops sending without saying goodbye (a crash, a hung
+// process): an amber triangle, narrow at the top, with a white "!" -- stroke
+// on rows 1-2, dot on row 4. 0 = off, 1 = triangle, 2 = "!".
+#define SYSMON_WARN_MS 10000
+#define SYSMON_WARN_HUE 32
+static const uint8_t sysmon_warn_map[6][4] = {
+    {0, 1, 1, 0}, {0, 2, 2, 0}, {1, 2, 2, 1}, {1, 1, 1, 1}, {1, 2, 2, 1}, {1, 1, 1, 1},
+};
+static uint32_t sysmon_warn_el; // how far into the warning the last frame was
+
+// Warning color of key i, el ms into the warning: fades in, the triangle
+// breathes (the "!" holds steady), and the whole sign fades out at the end.
+static RGB sysmon_warn_rgb(uint8_t i, uint32_t el) {
+    uint8_t kind = sysmon_warn_map[boot_row[i]][boot_col[i]];
+    if (!kind) return (RGB){0, 0, 0};
+    uint8_t v = boot_mul(boot_prog(el, 0, 300), 255 - boot_prog(el, SYSMON_WARN_MS - 800, 800));
+    if (kind == 2) return boot_rgb_scale(boot_hsv(0, 0, 255), v);
+    uint8_t breathe = 115 + boot_mul(sin8((uint8_t)((el % 1200) * 256 / 1200)), 140);
+    return boot_rgb_scale(boot_hsv(SYSMON_WARN_HUE, 255, 255), boot_mul(v, breathe));
+}
+
+// --- blending into the bars ------------------------------------------------
+
+// Coming from the boot rainbow or the warning, the bars cross-fade in over
+// SYSMON_XFADE_MS instead of cutting (the cut used to read as a dark gap,
+// with the bars gliding up from empty). The two frames ran at different
+// global currents, so the blend runs at the higher one with the dimmer
+// frame's PWM scaled down to match. From the regular effect it still cuts.
+#define SYSMON_XFADE_MS 700
+static uint8_t  sysmon_xf_from = DISP_EFFECT;
+static uint32_t sysmon_xf_t0;
+
+static bool sysmon_xfading(void) {
+    return sysmon_xf_from != DISP_EFFECT && timer_elapsed32(sysmon_xf_t0) < SYSMON_XFADE_MS;
+}
+
+static uint8_t sysmon_xf_from_gcc(void) {
+    return sysmon_gcc_for(sysmon_xf_from == DISP_BOOT ? BOOT_BRIGHTNESS : sysmon_brightness);
+}
+
+static RGB sysmon_gcc_scale(RGB c, uint8_t gcc, uint8_t gmax) {
+    return (RGB){(uint8_t)((uint16_t)c.r * gcc / gmax), (uint8_t)((uint16_t)c.g * gcc / gmax), (uint8_t)((uint16_t)c.b * gcc / gmax)};
+}
+
+// Write the bars' frame, blended with the previous display while a
+// cross-fade runs. The chip is already at max(from, bars) GCC by then.
+static void sysmon_flush(uint8_t gcc_bars) {
+    if (!sysmon_xfading()) {
+        for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) rgb_matrix_set_color(i, sysmon_fb[i].r, sysmon_fb[i].g, sysmon_fb[i].b);
+        return;
+    }
+    uint8_t gf   = sysmon_xf_from_gcc();
+    uint8_t gmax = MAX(MAX(gf, gcc_bars), 1);
+    uint8_t f    = ease8InOutQuad((uint8_t)(timer_elapsed32(sysmon_xf_t0) * 255 / SYSMON_XFADE_MS));
+    for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
+        RGB a = sysmon_xf_from == DISP_BOOT ? boot_own[i] : sysmon_warn_rgb(i, sysmon_warn_el);
+        RGB o = boot_rgb_lerp(sysmon_gcc_scale(a, gf, gmax), sysmon_gcc_scale(sysmon_fb[i], gcc_bars, gmax), f);
+        rgb_matrix_set_color(i, o.r, o.g, o.b);
+    }
+}
+
 // Display priority, highest first:
 //   1. a playing boot animation (it is short; finish it even if the host
 //      connects meanwhile, and a replay preview must show over live data)
-//   2. fresh host data: the sysmon bars
+//   2. fresh host data: the sysmon bars (cross-fading in from 1, 3 or 4)
 //   3. the host has never connected: the static boot rainbow
-//   4. otherwise (host gone, or rainbow dismissed): the regular RGB effect
+//   4. the host went silent without a goodbye: the disconnect warning, for
+//      SYSMON_WARN_MS after the no-data timeout
+//   5. otherwise (goodbye, warning over, or rainbow dismissed): the regular
+//      RGB effect
 bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
     (void)led_min;
     (void)led_max;
@@ -1254,6 +1897,7 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
 
     if (boot_render()) {
         sysmon_set_gcc(BOOT_BRIGHTNESS);
+        sysmon_disp = DISP_BOOT;
         return false;
     }
     if (boot_counter_dirty) {
@@ -1264,19 +1908,38 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
     }
 
     uint32_t timeout_ms = (uint32_t)sysmon_timeout_units * 100;
-    if (sysmon_last_update == 0 || timer_elapsed32(sysmon_last_update) > timeout_ms) {
+    uint32_t since      = sysmon_last_update ? timer_elapsed32(sysmon_last_update) : 0;
+    if (sysmon_last_update == 0 || since > timeout_ms || sysmon_goodbye) {
         if (sysmon_last_update == 0 && !boot_dismissed) {
             sysmon_set_gcc(BOOT_BRIGHTNESS);
             boot_render_static();
+            sysmon_disp = DISP_BOOT;
+            return false;
+        }
+        if (sysmon_last_update != 0 && !sysmon_goodbye && !sysmon_quiet && since - timeout_ms < SYSMON_WARN_MS) {
+            sysmon_set_gcc(sysmon_slewed_val());
+            sysmon_warn_el = since - timeout_ms;
+            for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
+                RGB c = sysmon_warn_rgb(i, sysmon_warn_el);
+                rgb_matrix_set_color(i, c.r, c.g, c.b);
+            }
+            sysmon_disp = DISP_WARN;
             return false;
         }
         // No fresh data from the host; restore the stock global current and
         // let the normal RGB effect run at its own brightness
         sysmon_set_gcc(255);
+        sysmon_disp = DISP_EFFECT;
         return true;
     }
 
-    sysmon_set_gcc(sysmon_slewed_val());
+    if (sysmon_disp != DISP_SYSMON) {
+        sysmon_xf_from = sysmon_disp; // blend in from whatever was showing
+        sysmon_xf_t0   = timer_read32();
+        sysmon_disp    = DISP_SYSMON;
+    }
+    uint8_t gcc_bars = sysmon_gcc_for(sysmon_slewed_val());
+    sysmon_write_gcc(sysmon_xfading() ? MAX(gcc_bars, sysmon_xf_from_gcc()) : gcc_bars);
 
     uint32_t glide_ms = (uint32_t)sysmon_glide_units * 4;
 
@@ -1285,6 +1948,7 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
     for (uint8_t row = 0; row < 6; row++) {
         sysmon_render_row(row, &glides[row], &ghost_glides[row], glide_ms, timeout_ms);
     }
+    sysmon_flush(gcc_bars);
 
     return false;
 }

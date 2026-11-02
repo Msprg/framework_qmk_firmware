@@ -17,7 +17,8 @@ normally — the stats ride on a private custom-value channel, `0x42`):
 
 From power-up until the host first connects, the macropad shows a dim, static
 rainbow running diagonally from red at the top-left key to violet at the
-bottom-right one. It's introduced by a short animation, one of thirteen:
+bottom-right one. It's introduced by a short animation picked from the
+power-up pool (`boot_pool[]` in `keymap.c`), currently 1–16:
 
 | # | Animation | |
 |---|-----------|---|
@@ -27,24 +28,49 @@ bottom-right one. It's introduced by a short animation, one of thirteen:
 | 4 | Bloom | the pad fades in white, then the rainbow colours fade in |
 | 5 | Twinkle | keys ignite as white sparks roughly along the diagonal |
 | 6 | Rotate | the gradient spins around the centre and settles on the diagonal |
-| 7 | Twinkle, centre | the sparks start in the middle and spread out |
-| 8 | Twinkle, scatter | sparks land anywhere, in random order |
-| 9 | Fire | red/orange/yellow flames climb from the bottom row, red embers shoot up ahead of them, and the burned keys cool into the still rainbow behind |
-| 10 | Ripple | a ragged white ring grows from the centre |
-| 11 | Converge | ragged white edges from opposite corners meet in the middle |
-| 12 | Flicker | each key sputters on like a warming neon tube |
-| 13 | Lock-in | the whole pad sweeps through the spectrum as one colour; each key freezes as it reaches its own |
+| 7 | Twinkle, scatter | sparks land anywhere, in random order |
+| 8 | Fire | red/orange/yellow flames climb from the bottom row, red embers shoot up ahead of them, and the burned keys cool into the still rainbow behind |
+| 9 | Converge | ragged white edges from opposite corners meet in the middle |
+| 10 | Flicker | each key sputters on like a warming neon tube |
+| 11 | Lock-in | the whole pad sweeps through the spectrum as one colour; each key freezes as it reaches its own |
+| 12 | Fireworks | rockets rise and burst, lighting the keys around them and throwing sparks that arc down; a finale lights the rest |
+| 13 | Lightning | jagged bolts strike top to bottom with a flickering sky flash, leaving struck keys lit; the last lights everything |
+| 14 | Stack | colours drop in from above like falling blocks, bottom row first, each landing with a flash |
+| 15 | Spotlight | a spotlight wanders the dark pad showing the rainbow where it shines, then widens to light it all |
+| 16 | Glitch | the picture boots like a corrupted video signal until it holds clean |
 
-Each power-up picks one from a shuffle bag: every 13 power-ups play each
-animation once, in a fresh order, never the same one twice in a row. The
-position is a counter in the EEPROM user word (written after the animation, so
-clear of USB enumeration). The twinkle, fire, flicker and ragged-edge timing
-is re-randomized on every boot (and on every round of a replay) too.
+Text prototypes, built in for previewing but not in the pool:
 
-Once the host connects, the bars take over and the rainbow is done until the
-next power-up: if the host later goes away, the macropad falls back to the
-regular RGB effect, as it always has. Pressing any RGB key (Fn layer) also
+| # | Animation | |
+|---|-----------|---|
+| 17 | FW16 pop | F, W, 1, 6 pop up one at a time as big letters in the rainbow colours; the rest sparkles in around the 6 |
+| 18 | FW16 scroll | "FW16" scrolls through like an LED ticker, then the rainbow slides in behind it |
+| 19 | FRAMEWORK scroll | the same with "FRAMEWORK", faster |
+| 20 | FRAMEWORK flash | white letters flash one at a time like a sign spelling itself out, then the rainbow sputters on like neon |
+
+Each power-up picks one from a shuffle bag: every cycle of power-ups (one per
+pooled animation) plays each pooled animation once, in a fresh order, never
+the same one twice in a row. The position is a counter in the EEPROM user word
+(written after the animation, so clear of USB enumeration). The random parts
+(twinkles, fire, flicker, fireworks, lightning, glitches...) are re-randomized on
+every boot, and on every round of a replay.
+
+Once the host connects, the bars cross-fade in over the rainbow and the
+rainbow is done until the next power-up. Pressing any RGB key (Fn layer) also
 dismisses it, so the regular effect stays reachable without a host.
+
+If the host later goes away:
+
+- **It stopped on purpose** (service stop, shutdown, Ctrl+C): the host sends a
+  goodbye, and the macropad switches to the regular RGB effect at once.
+- **It vanished** (a crash, a hung process): after the no-data timeout the
+  macropad shows a disconnect warning, a breathing amber triangle with a white
+  "!", for 10 seconds, then falls back to the regular RGB effect. If the host
+  comes back meanwhile, the bars cross-fade back in.
+- **The laptop slept**: no warning. Silence across a USB suspend is expected.
+
+The goodbye needs the host from this version; an older installed service just
+goes quiet when stopped, which the macropad reads as a vanished host.
 
 Brightness (`BOOT_BRIGHTNESS`, same scale as the host's brightness byte) and the
 hue span (`BOOT_HUE_START`/`BOOT_HUE_END`) are defines in `keymap.c`. To preview
@@ -54,12 +80,16 @@ prompt, since that interpreter is requireAdministrator-manifested. It is safe
 alongside the running service. From `host\`:
 
 ```powershell
-.venv\Scripts\python.exe -I bootanim_preview.py          # all 13, numbered (N white dots = #N)
+.venv\Scripts\python.exe -I bootanim_preview.py          # every animation, numbered
 .venv\Scripts\python.exe -I bootanim_preview.py 7-12 x2  # a range, twice
 .venv\Scripts\python.exe -I bootanim_preview.py 5        # just one
 .venv\Scripts\python.exe -I bootanim_preview.py boot     # the next power-up pick, as a boot plays it
 .venv\Scripts\python.exe -I bootanim_preview.py status   # boot counter + this power-up's pick
 ```
+
+Numbered playback names each animation with dots before it plays: up to 9,
+N white dots in reading order from the top-left key; from 10, the tens as
+cyan dots on the top row and the units as white dots from the second row.
 
 ## NPU on the iGPU row
 
@@ -434,6 +464,7 @@ Three 32-byte VIA "custom set value" reports are sent per interval on channel
 [2]   value_id: 0x01 = FRAME A (rows 0,1,2)
                0x02 = FRAME B (rows 3,4,5 + globals)
                0x03 = FRAME C (ghost bars, rows 0..5; optional)
+               0x04 = GOODBYE (no payload; sent once on a clean exit)
 [3..] payload: FRAME A/B: three back-to-back 8-byte row descriptors
                FRAME C:   six back-to-back 4-byte ghost descriptors
 
@@ -466,9 +497,15 @@ The firmware glides each row's `level`, fills the bar (solid or gradient),
 applies the envelope to the whole-row brightness, then paints any overlay
 segments from the fill boundary — all timed off its own clock, so the bars stay
 smooth between the host's updates. A ghost bar glides the same way and adds,
-per segment, whatever part the ghost covers beyond the main fill. After
-`timeout` with no frame it restores the stock global current and lets the
-regular RGB effect run. VIA's echo is the ACK.
+per segment, whatever part the ghost covers beyond the main fill. VIA's echo
+is the ACK.
+
+When frames stop, what happens depends on how. After a GOODBYE the firmware
+restores the stock global current and hands over to the regular RGB effect at
+once. If frames just stop, it waits `timeout`, shows the disconnect warning for
+10 s, and then hands over. After a USB suspend it skips the warning. The next
+FRAME A/B cancels all of this; the bars cross-fade back in over 0.7 s from the
+boot rainbow or the warning, and cut in from the regular effect.
 
 FRAME C is optional in both directions. Firmware that predates it ignores value
 `0x03` and draws the plain bars. Firmware that has it fades the ghosts out on
@@ -488,4 +525,5 @@ it doesn't end the pre-connect rainbow:
 [5] rounds (0 = 1)
 echo [11..14] boot counter in RAM (u32 LE)   [15] this power-up's pick (1-based)
      [16..19] boot counter in EEPROM (u32 LE; lags by one until the boot animation ends)
+     [20]     display: 0 = regular RGB effect, 1 = boot rainbow, 2 = bars, 3 = warning
 ```

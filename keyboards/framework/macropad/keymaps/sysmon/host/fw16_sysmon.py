@@ -144,6 +144,7 @@ SYSMON_CHANNEL = 0x42
 SYSMON_VALUE_FRAME_A = 0x01  # rows 0,1,2
 SYSMON_VALUE_FRAME_B = 0x02  # rows 3,4,5 + globals
 SYSMON_VALUE_FRAME_C = 0x03  # ghost bars, rows 0..5
+SYSMON_VALUE_GOODBYE = 0x04  # host stopping on purpose: no disconnect warning
 
 ROW_DESC_LEN = 8
 GHOST_DESC_LEN = 4
@@ -2115,6 +2116,22 @@ def build_parser():
     return parser
 
 
+def send_goodbye(dev):
+    """Tell the firmware this host is stopping on purpose.
+
+    Without it the firmware can't tell a clean stop from a crash: both just
+    stop sending. A crash should be noticed -- the module shows a warning
+    triangle for a while before falling back to the regular RGB effect -- but a
+    service stop, a shutdown or Ctrl+C should hand over to the RGB effect
+    quietly and at once. Best effort: a write error here changes nothing.
+    """
+    rep = bytes([VIA_CMD_CUSTOM_SET_VALUE, SYSMON_CHANNEL, SYSMON_VALUE_GOODBYE])
+    try:
+        dev.write(b"\x00" + rep + bytes(REPORT_LEN - len(rep)))
+    except (OSError, ValueError):
+        pass
+
+
 def bootloader_jump(dev):
     """Reboot the macropad into its UF2 bootloader over the open raw-HID handle.
 
@@ -2382,16 +2399,21 @@ def run(args, stop_event=None, resume_check=None):
             dev = None
             stop_event.wait(2)
             continue
-        stop_event.wait(args.interval)
+        try:
+            stop_event.wait(args.interval)
+        except KeyboardInterrupt:  # Ctrl+C usually lands here, mid-sleep
+            break
 
     if dev is not None:
+        send_goodbye(dev)
         dev.close()
     lhmlib.close()
     ryzen.close()
-    # Nothing is sent on the way out on purpose: the firmware's own no-data
-    # timeout (TIMEOUT_MS_DEFAULT) restores the stock RGB effect a few seconds
-    # later, which is also what happens on a crash or an abrupt power loss, so
-    # there is only one fallback path to reason about.
+    # A clean exit says goodbye (above), so the firmware hands over to the
+    # regular RGB effect at once. A crash or an abrupt power loss sends
+    # nothing: the firmware's no-data timeout (TIMEOUT_MS_DEFAULT) then shows a
+    # disconnect warning for a while before falling back -- deliberately, as
+    # that case is worth noticing.
 
 
 if __name__ == "__main__":
