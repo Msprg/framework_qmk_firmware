@@ -191,6 +191,11 @@ ROW_VAL_BATT_IDLE = 80   # AC-idle dim green; firmware lifts via visible_pwm
 BATT_CRITICAL_PCT = 15   # raw % below which a discharging battery blinks red
 ASSIST_MIN_W = 10        # battery-assist drain meaning a real power deficit;
                          # below this on AC is just EC cap-drift housekeeping
+DRIFT_MIN_W = 0.1        # smallest AC drain that counts as *any* flow out of
+                         # the pack. The EC leaves the ACPI discharging bit
+                         # asserted at a flat 0 W while it floats a full pack
+                         # (visible with the charge cap at 100%), and that is
+                         # idle, not drift -- no tell.
 
 # Battery drift breathe tell (the faint AC cap-drift sine). The firmware's old
 # tell breathed 68..92 around the dim-80 fill; encode that as a sine overlay
@@ -1394,9 +1399,13 @@ def build_battery_row(m):
 
     # Drift fold: on AC, a sub-ASSIST_MIN_W drain is the EC holding the cap,
     # not a real discharge. Treat it as idle; remember it for the faint tell.
-    drift = ac and discharging and rate_w < ASSIST_MIN_W
-    if drift:
+    # The tell needs a *measured* drain: the discharging bit alone means little
+    # on AC, since the EC keeps it asserted at a flat 0 W while it floats a
+    # pack it is done charging, and that is plain idle with nothing to tell.
+    drift = False
+    if ac and discharging and rate_w < ASSIST_MIN_W:
         discharging = False
+        drift = rate_w >= DRIFT_MIN_W
 
     # Critical (gated on RAW %, not rescaled): full red row blinking ~1Hz.
     if discharging and raw_pct < BATT_CRITICAL_PCT:
