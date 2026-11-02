@@ -7,6 +7,8 @@
   bootanim_preview.py boot         the next power-up pick, exactly as a boot plays it
   bootanim_preview.py stop         stop a running replay
   bootanim_preview.py status       boot counter, this power-up's pick, display mode
+  bootanim_preview.py warn [N[-M]] preview disconnect-warning styles (all, N, or N..M),
+                                   each named by amber dots; queues behind a replay
   bootanim_preview.py goodbye      send the host's clean-stop notice (0x04), as a
                                    stopping host would -- for testing the warning
 
@@ -24,13 +26,17 @@ MODES = {0: "rgb-effect", 1: "boot-rainbow", 2: "sysmon", 3: "warning"}
 
 def parse(argv):
     arg = argv[0] if argv else "0"
-    rounds = int(argv[1].lstrip("x")) if len(argv) > 1 else 1
     if arg == "status":
         return 0xFD, 0, 0
     if arg == "stop":
         return 0xFF, 0, 0
     if arg == "boot":
         return 0xFE, 0, 0
+    if arg == "warn":
+        rng = argv[1] if len(argv) > 1 else "0"
+        lo, _, hi = rng.partition("-")
+        return 0xFC, int(lo), int(hi or lo)
+    rounds = int(argv[1].lstrip("x")) if len(argv) > 1 else 1
     if "-" in arg:
         first, last = (int(p) for p in arg.split("-", 1))
         return first, last, rounds
