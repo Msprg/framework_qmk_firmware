@@ -69,7 +69,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "startservice";  Description: "Start the service now (it starts automatically at boot from then on)"; GroupDescription: "After installing:"
 Name: "flashfirmware"; Description: "Flash the bundled firmware onto the macropad now"; GroupDescription: "After installing:"; Flags: unchecked
-Name: "frameworktool"; Description: "Install framework_tool via winget (battery charge-cap scaling and a temperature fallback)"; GroupDescription: "Optional dependencies:"; Check: NeedsFrameworkTool
+Name: "frameworktool"; Description: "Install framework_tool via winget (battery charge-cap scaling and a temperature fallback)"; GroupDescription: "Optional dependencies:"; Check: CanInstallFrameworkTool
 
 [Files]
 ; One entry, on purpose. build.ps1 assembles dist\fw16-sysmon into exactly the
@@ -110,7 +110,12 @@ Name: "{group}\Uninstall {#AppName}";                   Filename: "{uninstallexe
 Filename: "{app}\{#ExeName}"; Parameters: "--write-default-config"; StatusMsg: "Writing the default configuration..."; Flags: runhidden waituntilterminated
 Filename: "{app}\{#ExeName}"; Parameters: "--install-service";      StatusMsg: "Registering the boot-start service...";  Flags: runhidden waituntilterminated
 
-Filename: "winget.exe"; Parameters: "install --id FrameworkComputer.framework_tool --silent --accept-source-agreements --accept-package-agreements"; StatusMsg: "Installing framework_tool via winget..."; Flags: runhidden waituntilterminated skipifdoesntexist; Tasks: frameworktool
+; Full resolved path, not a bare "winget.exe": the App Execution Alias is not
+; on a path Inno can resolve, and with skipifdoesntexist that failed silently.
+; Run through cmd with output captured, because a hidden [Run] discards
+; winget's own diagnostics -- and when this step fails, that message is the
+; only thing that explains why.
+Filename: "{cmd}"; Parameters: "/c """"{code:WingetPath}"" install --id FrameworkComputer.framework_tool --silent --accept-source-agreements --accept-package-agreements > ""{tmp}\winget.log"" 2>&1"""; StatusMsg: "Installing framework_tool via winget..."; Flags: runhidden waituntilterminated; Tasks: frameworktool
 
 ; Flashing is interactive by nature (it waits for the module to re-enumerate),
 ; so it gets a visible console rather than running hidden, and pauses itself at
@@ -187,10 +192,49 @@ begin
   Result := (Pos('AMD', Uppercase(CpuName)) > 0) or (Pos('RYZEN', Uppercase(CpuName)) > 0);
 end;
 
+// winget installs a portable package into MACHINE scope only when it is run
+// elevated; from a normal terminal it lands in the user's own WinGet\Links.
+// Checking only the machine paths reported "not installed" for a tool that was
+// installed and working, which then fired a bogus "could not be installed"
+// dialog. Search PATH first -- that is what actually decides whether the host
+// can run it -- then the known install roots.
+// Mirrors fw16_sysmon.find_framework_tool(): PATH, then Program Files, then
+// EVERY user profile's per-user winget install. Checking only {localappdata} is
+// not enough -- for the LocalSystem service that resolves to the systemprofile,
+// which has no WinGet directory at all, so a per-user install is invisible to
+// the service even though it is on the installing user's PATH.
 function FrameworkToolPresent: Boolean;
+var
+  Found: TFindRec;
+  UsersDir, Candidate: String;
 begin
+  Result := FileSearch('framework_tool.exe', GetEnv('PATH')) <> '';
+  if Result then Exit;
   Result := FileExists(ExpandConstant('{commonpf}\WinGet\Links\framework_tool.exe'))
          or FileExists(ExpandConstant('{commonpf}\Framework Computer\framework_tool.exe'));
+  if Result then Exit;
+
+  UsersDir := ExpandConstant('{sd}\Users');
+  if FindFirst(UsersDir + '\*', Found) then
+  begin
+    try
+      repeat
+        if (Found.Attributes and FILE_ATTRIBUTE_DIRECTORY <> 0)
+           and (Found.Name <> '.') and (Found.Name <> '..') then
+        begin
+          Candidate := UsersDir + '\' + Found.Name +
+                       '\AppData\Local\Microsoft\WinGet\Links\framework_tool.exe';
+          if FileExists(Candidate) then
+          begin
+            Result := True;
+            Exit;
+          end;
+        end;
+      until not FindNext(Found);
+    finally
+      FindClose(Found);
+    end;
+  end;
 end;
 
 function NeedsFrameworkTool: Boolean;
@@ -198,14 +242,51 @@ begin
   Result := not FrameworkToolPresent;
 end;
 
-function WingetPresent: Boolean;
+// winget is normally an App Execution Alias under the user's WindowsApps
+// directory -- NOT in Program Files and NOT registered under App Paths. Looking
+// only in those two places reports "winget not found" on essentially every
+// machine, and a bare "winget.exe" in [Run] cannot be resolved either, so the
+// entry silently skipped and framework_tool was never installed.
+// Returns a full path, or '' when winget genuinely is not available.
+function FindWinget: String;
 var
-  Dummy: String;
+  Candidates: array[0..2] of String;
+  I: Integer;
+  FromAppPaths: String;
 begin
-  Result := RegQueryStringValue(HKEY_LOCAL_MACHINE,
-    'SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\winget.exe', '', Dummy);
-  if not Result then
-    Result := FileExists(ExpandConstant('{commonpf}\WinGet\Links\winget.exe'));
+  Result := '';
+  Candidates[0] := ExpandConstant('{localappdata}\Microsoft\WindowsApps\winget.exe');
+  Candidates[1] := ExpandConstant('{commonpf}\WinGet\Links\winget.exe');
+  if RegQueryStringValue(HKEY_LOCAL_MACHINE,
+      'SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\winget.exe', '',
+      FromAppPaths) then
+    Candidates[2] := FromAppPaths
+  else
+    Candidates[2] := '';
+  for I := 0 to 2 do
+    if (Candidates[I] <> '') and FileExists(Candidates[I]) then
+    begin
+      Result := Candidates[I];
+      Exit;
+    end;
+end;
+
+// {code:WingetPath} in [Run] requires this exact signature (Inno passes the
+// text after a '|', empty here).
+function WingetPath(Param: String): String;
+begin
+  Result := FindWinget;
+end;
+
+function WingetPresent: Boolean;
+begin
+  Result := FindWinget <> '';
+end;
+
+// Offer the framework_tool task only when it is both needed and possible.
+function CanInstallFrameworkTool: Boolean;
+begin
+  Result := NeedsFrameworkTool and WingetPresent;
 end;
 
 function ServiceInstalled: Boolean;
@@ -307,6 +388,49 @@ begin
   // An upgrade over a running service cannot replace the exe in place.
   if ServiceInstalled then
     CmdOk(ExpandConstant('{sys}\net.exe'), 'stop {#ServiceName}');
+end;
+
+// Last few lines of winget's captured output, for the failure dialog.
+function WingetLogTail: String;
+var
+  Lines: TArrayOfString;
+  I, First: Integer;
+begin
+  Result := '';
+  if not LoadStringsFromFile(ExpandConstant('{tmp}\winget.log'), Lines) then
+    Exit;
+  First := GetArrayLength(Lines) - 8;
+  if First < 0 then First := 0;
+  for I := First to GetArrayLength(Lines) - 1 do
+    if Trim(Lines[I]) <> '' then
+      Result := Result + Trim(Lines[I]) + #13#10;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Tail: String;
+begin
+  // Verify the winget step actually did something. It runs hidden and its exit
+  // code is not surfaced, so a failure (winget declining to run under Setup's
+  // elevated token, no network, the package id having moved) would otherwise be
+  // invisible until the user noticed a wrong temperature row much later.
+  if (CurStep = ssPostInstall) and WizardIsTaskSelected('frameworktool') then
+  begin
+    if not FrameworkToolPresent then
+    begin
+      Tail := WingetLogTail;
+      if Tail <> '' then
+        Tail := #13#10 + 'winget said:' + #13#10 + #13#10 + Tail;
+      MsgBox('framework_tool could not be installed automatically.' + #13#10 +
+             Tail + #13#10 +
+             'It is optional -- it adds battery charge-cap scaling and a' + #13#10 +
+             'temperature fallback. To install it yourself, open a normal' + #13#10 +
+             '(non-elevated) terminal and run:' + #13#10 + #13#10 +
+             '    winget install FrameworkComputer.framework_tool' + #13#10 + #13#10 +
+             'then restart the service from the Start menu.',
+             mbInformation, MB_OK);
+    end;
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

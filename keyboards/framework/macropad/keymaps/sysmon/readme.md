@@ -275,18 +275,22 @@ confirm which source is driving the CPU row.
   ring0 driver to read the CPU, so the script must run **elevated**; if Windows
   *Core Isolation → Memory Integrity* is enabled it may block that driver (the
   same limitation the LHM app hits). Disable with `--no-lhm-lib`.
+- [framework_tool](https://github.com/FrameworkComputer/framework-system)
+  on PATH (`winget install FrameworkComputer.framework_tool`) — the EC's own APU
+  sensor, throttled to one subprocess every few seconds. This is deliberately
+  ranked **above** ryzenadj Tctl: Tctl is decoded from the AMD SMU power table,
+  whose layout depends on the CPU model, and a wrong decode does not fail — it
+  returns a plausible-looking number. On a clean Windows install on the same
+  FW16, Tctl sat at exactly 100 °C (an unpopulated field) while the EC read
+  41 °C, pinning the temperature row full and blinking. Needs elevation.
 - **ryzenadj Tctl** — when `ryzenadj` is installed for the power-limit breathe,
-  its die temperature (Tctl) is read from the same in-process SMU handle for
-  free, so the APU power-limit feature alone is enough to light the temperature
-  row even without LibreHardwareMonitor. Also elevated-only.
+  its die temperature is read from the same in-process SMU handle for free, so
+  ryzenadj alone is enough to light the temperature row on a machine with
+  neither LibreHardwareMonitor nor framework_tool. Also elevated-only. Run
+  `--selftest` to see what every source reports and which one is being used.
 - the [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)
   **app** running with its WMI provider enabled — fallback when the in-process
   lib isn't set up; same CPU package-power sensor.
-- [framework_tool](https://github.com/FrameworkComputer/framework-system)
-  on PATH (`winget install FrameworkComputer.framework_tool`) — throttled
-  fallback for temperature only (APU die temperature from the EC; needs the
-  script elevated). Also used (every 60 s) to read the battery max-charge cap so
-  the battery bar scales to the cap.
 - a working ACPI thermal zone — last resort; the FW16 exposes zones that
   *look* valid but report frozen values (a constant ~63 °C), and reading them
   needs admin rights anyway. Temperature stays dark if no source provides data.

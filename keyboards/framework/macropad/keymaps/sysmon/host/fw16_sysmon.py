@@ -660,17 +660,94 @@ class ApuLimits:
         return power, False
 
 
+FRAMEWORK_TOOL_EXE = "framework_tool.exe"
+_framework_tool_path = None    # None = not resolved yet, False = not found
+
+
+def find_framework_tool(explicit=None):
+    """Locate framework_tool.exe, without relying on PATH.
+
+    PATH is the wrong thing to trust here, and this cost a real bug: winget
+    installs a portable package into the *user's* WinGet\\Links unless it was
+    run elevated, and that directory is only ever on the user's PATH. The
+    LocalSystem service gets the machine PATH, which has no WinGet entry at all,
+    so it silently lost the EC temperature source and the battery charge cap --
+    while an interactive --selftest, inheriting the user's PATH, found the tool
+    and reported everything healthy.
+
+    %LOCALAPPDATA% is no help either: for LocalSystem it resolves to
+    C:\\Windows\\System32\\config\\systemprofile\\AppData\\Local, which has no
+    WinGet directory. So the user profiles are searched explicitly -- the
+    service runs as SYSTEM and can read them.
+
+    Resolved once and cached; pass an explicit path (--framework-tool) to skip
+    the search entirely.
+    """
+    import glob
+    import shutil
+
+    cands = []
+    if explicit:
+        # An explicit setting that does not exist must not fail silently: it is
+        # almost always a typo or a moved install, and quietly searching on
+        # would leave the user editing a path that is never consulted.
+        if os.path.isfile(explicit):
+            return explicit
+        log(f"framework-tool is set to {explicit}, which does not exist; "
+            f"searching the usual locations instead")
+    found = shutil.which("framework_tool")
+    if found:
+        cands.append(found)
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    cands.append(os.path.join(program_files, "WinGet", "Links", FRAMEWORK_TOOL_EXE))
+    cands.append(os.path.join(program_files, "Framework Computer", FRAMEWORK_TOOL_EXE))
+    # Every user profile's per-user winget install.
+    users = os.environ.get("PUBLIC")
+    users = os.path.dirname(users) if users else r"C:\Users"
+    for sub in (r"AppData\Local\Microsoft\WinGet\Links",
+                r"AppData\Local\Microsoft\WindowsApps"):
+        cands.extend(sorted(glob.glob(os.path.join(users, "*", sub,
+                                                   FRAMEWORK_TOOL_EXE))))
+    for path in cands:
+        try:
+            if path and os.path.isfile(path):
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def set_framework_tool(explicit=None):
+    """Resolve framework_tool once at start-up; log where it was found."""
+    global _framework_tool_path
+    path = find_framework_tool(explicit)
+    _framework_tool_path = path or False
+    if path:
+        log(f"framework_tool: {path}")
+    else:
+        log("framework_tool not found (EC temperature and battery charge cap "
+            "unavailable); install it with "
+            "`winget install FrameworkComputer.framework_tool`, or set "
+            "framework-tool in sysmon.ini")
+    return path
+
+
 def run_framework_tool(*tool_args):
     """Run framework_tool and return its stdout, or None on transient failure.
 
     Raises FileNotFoundError if the tool is not installed, so callers can
     disable themselves permanently.
     """
+    global _framework_tool_path
+    if _framework_tool_path is None:
+        set_framework_tool()
+    if not _framework_tool_path:
+        raise FileNotFoundError(FRAMEWORK_TOOL_EXE)
     try:
         # stdin must be DEVNULL: under CREATE_NO_WINDOW framework_tool
         # sees a fresh console and waits for ENTER before exiting
         return subprocess.run(
-            ["framework_tool", *tool_args],
+            [_framework_tool_path, *tool_args],
             capture_output=True, text=True, timeout=2,
             stdin=subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NO_WINDOW).stdout
@@ -1151,6 +1228,9 @@ class RyzenAdjSource:
         self.available = False
         self._lib = None
         self._ry = None
+        self._tctl_last = None
+        self._tctl_repeats = 0
+        self._tctl_dead = False
         if not enabled:
             return
         d = find_ryzenadj_dir(dll_dir)
@@ -1262,7 +1342,8 @@ class RyzenAdjSource:
             # limit means "not reported" and must not count as binding.
             if lim == lim and val == val and lim > 0:
                 out[key] = (float(val), float(lim))
-        out["tctl"] = float(tctl) if (tctl == tctl and tctl > 0) else None
+        out["tctl"] = self._check_stuck(
+            float(tctl) if (tctl == tctl and tctl > 0) else None)
         return out
 
     @staticmethod
@@ -1280,10 +1361,45 @@ class RyzenAdjSource:
                 return True
         return False
 
+    # A Tctl slot that never changes is not a temperature. On a Ryzen AI 9
+    # HX 370 this reads a flat 100.0 while the die genuinely swings 42->59 C
+    # (confirmed against the EC and the fans spinning up), because libryzenadj
+    # has no valid offset for the THM value on that SMU table version and
+    # returns the Tjmax constant instead. Every other field in the same table
+    # is live and correct, so the table itself is fine -- only this slot is dead.
+    #
+    # Left undetected this is the worst possible failure: 100.0 is above
+    # TEMP_CRITICAL_C, so a dead field renders as a permanent maximum-severity
+    # thermal alarm. A live sensor jitters (Tctl has 0.125 C granularity and a
+    # control loop behind it), so bit-identical readings this many times running
+    # mean the slot is not being written at all.
+    STUCK_READS = 5
+
     @staticmethod
     def temperature(snap):
         """Tctl die temperature from a snapshot, or None."""
         return snap.get("tctl") if snap else None
+
+    def _check_stuck(self, tctl):
+        """Return tctl, or None once it has proven to be a dead constant."""
+        if tctl is None:
+            self._tctl_repeats = 0
+            self._tctl_last = None
+            return None
+        if tctl == self._tctl_last:
+            self._tctl_repeats += 1
+        else:
+            self._tctl_repeats = 0
+            self._tctl_last = tctl
+            self._tctl_dead = False
+        if self._tctl_repeats < self.STUCK_READS:
+            return tctl
+        if not self._tctl_dead:
+            self._tctl_dead = True
+            log(f"ryzenadj Tctl is stuck at {tctl:.1f} C across "
+                f"{self.STUCK_READS + 1} reads; treating it as an unpopulated "
+                f"field and ignoring it for temperature")
+        return None
 
     def close(self):
         try:
@@ -1593,16 +1709,33 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
     # verdict and an in-process Tctl temperature fallback.
     rj = cache["ryzenadj"]() if ryzen.available else None
 
-    # Temperature: prefer LHM (validated), then ryzenadj Tctl (in-process,
-    # authoritative), then the throttled EC framework_tool, then static ACPI.
+    # Temperature: prefer LHM (validated), then the EC via framework_tool, then
+    # ryzenadj Tctl, then static ACPI.
+    #
+    # The EC outranks Tctl on purpose. Tctl is decoded from the AMD SMU power
+    # table, whose layout depends on the CPU model, and a wrong decode does not
+    # fail -- it returns a plausible-looking number. Observed on a clean Windows
+    # install on this very machine: Tctl pinned at exactly 100.0 C (an
+    # unpopulated field) while the EC read 41 C, which drove the temperature row
+    # to full and blinking. The same table reported implausible power limits on
+    # that install too, so when the decode is wrong it is wrong across the
+    # board. The EC sensor is the Framework firmware's own, and is the source
+    # this hardware is actually specified around.
+    #
+    # The cost is a throttled subprocess (TTL_EC_THERMAL) instead of a free
+    # in-process read, and it is only paid when LHM is unavailable -- which is
+    # exactly the case where Tctl proved untrustworthy.
     temp_c = lhm_temp
+    temp_src = "lhm"
     if temp_c is None:
-        temp_c = RyzenAdjSource.temperature(rj)
+        temp_c, temp_src = cache["ec_temp"](), "ec"
     if temp_c is None:
-        temp_c = cache["ec_temp"]()
+        temp_c, temp_src = RyzenAdjSource.temperature(rj), "ryzenadj"
     if temp_c is None:
-        temp_c = sources.acpi_temperature()
+        temp_c, temp_src = sources.acpi_temperature(), "acpi"
     has_temp = temp_c is not None
+    if not has_temp:
+        temp_src = None
     raw_temp = temp_c if has_temp else 0
 
     # Brightness -> LED global current value (host-side gamma).
@@ -1662,6 +1795,7 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
         "has_temp": has_temp,
         "temp_c": clamp(raw_temp, 0, 254) if has_temp else 0,
         "raw_temp": raw_temp,
+        "temp_src": temp_src,
 
         "brightness": led_val,
     }
@@ -1708,6 +1842,10 @@ def build_parser():
     parser.add_argument("--no-lhm-lib", action="store_true",
                         help="disable the in-process LibreHardwareMonitorLib APU "
                              "source (fall back to the LHM WMI provider / EC)")
+    parser.add_argument("--framework-tool", default=None, metavar="PATH",
+                        help="full path to framework_tool.exe (searched on PATH, "
+                             "in Program Files and in every user's winget "
+                             "install if unset; the service cannot rely on PATH)")
     parser.add_argument("--fetch-lhm", action="store_true",
                         help="download LibreHardwareMonitorLib + HidSharp DLLs "
                              "into lib/ and exit (needs pythonnet at runtime); "
@@ -1840,6 +1978,36 @@ def main(argv=None, stop_event=None, resume_check=None):
     return run(args, stop_event, resume_check)
 
 
+def _publish_service_state(m, lhmlib, ryzen):
+    """Write the service's own view of its sensors for --selftest to read.
+
+    Deliberately records the *resolved* framework_tool path and the temperature
+    source that actually won, because those are precisely the things that differ
+    between a LocalSystem service and the interactive session someone runs a
+    diagnostic in.
+    """
+    import json
+    try:
+        paths.ensure_data_dir()
+        state = {
+            "version": __version__,
+            "written": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "framework_tool": _framework_tool_path or None,
+            "temp_src": m["temp_src"],
+            "temp_c": m["raw_temp"] if m["has_temp"] else None,
+            "lhm_available": bool(lhmlib.available),
+            "ryzenadj_available": bool(ryzen.available),
+            "dgpu_present": bool(m["dgpu_present"]),
+            "brightness": m["brightness"],
+        }
+        tmp = paths.service_state_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+        os.replace(tmp, paths.service_state_path())
+    except Exception as err:
+        log(f"Could not publish service state: {err}")
+
+
 def run(args, stop_event=None, resume_check=None):
     """The poll loop: gather, build six rows, send two frames, repeat.
 
@@ -1855,6 +2023,32 @@ def run(args, stop_event=None, resume_check=None):
     """
     if stop_event is None:
         stop_event = threading.Event()
+
+    # The macropad has a single raw-HID endpoint. A console run while the
+    # service is also running means two processes interleaving frames at
+    # slightly different rates, which looks like the display "behaving oddly"
+    # rather than like a conflict -- so say so plainly instead of letting it be
+    # diagnosed as a bug in the readings.
+    import applog
+    if not applog.is_service_mode():
+        try:
+            import service
+            if service.is_running():
+                print(f"WARNING: the {service.SERVICE_NAME} service is also "
+                      f"running and writing to the macropad.", file=sys.stderr)
+                print(f"         Both will fight over the single raw-HID "
+                      f"endpoint and the display will look erratic.",
+                      file=sys.stderr)
+                print(f"         Stop it first:  sc stop {service.SERVICE_NAME}"
+                      f"   (or use host\\dev.ps1, which does this for you)",
+                      file=sys.stderr)
+        except Exception:
+            pass
+
+    # Resolve framework_tool up front and log the result: it is the difference
+    # between a working EC temperature source and a silent fallback, and the
+    # service's environment is not the one anybody tests interactively.
+    set_framework_tool(args.framework_tool)
 
     sources = WmiSources()
     ec = EcThermal()
@@ -1893,6 +2087,7 @@ def run(args, stop_event=None, resume_check=None):
     psutil.cpu_percent(interval=None)  # prime; first call always returns 0
 
     dev = None
+    published_state = False
     while not stop_event.is_set():
         try:
             if resume_check is not None and resume_check():
@@ -1918,6 +2113,14 @@ def run(args, stop_event=None, resume_check=None):
 
             m = gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache)
             rows = [ROW_BUILDERS[i](m) for i in range(6)]
+            if not published_state:
+                # First complete tick: record what this process can actually
+                # see. Only the service's view is worth publishing -- a console
+                # run would overwrite it with the user's environment, which is
+                # exactly the confusion this file exists to prevent.
+                published_state = True
+                if applog.is_service_mode():
+                    _publish_service_state(m, lhmlib, ryzen)
             if args.verbose:
                 names = ["batt", "cpu", "mem", "igpu", "dgpu", "temp"]
                 print(f"bright={m['brightness']}")

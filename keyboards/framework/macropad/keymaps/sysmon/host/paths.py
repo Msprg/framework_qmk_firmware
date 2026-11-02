@@ -93,6 +93,18 @@ def log_path():
     return os.path.join(data_dir(), "sysmon.log")
 
 
+def service_state_path():
+    """Where the service publishes what IT can actually see.
+
+    A self-test run by a human inherits that human's environment; the service
+    runs as LocalSystem with a different PATH and a different profile. Those
+    diverge in ways that silently degrade the service while an interactive
+    check reports everything healthy -- so the service writes its own view here
+    and --selftest reads it back rather than assuming the two match.
+    """
+    return os.path.join(data_dir(), "service-state.json")
+
+
 def vendor_dir():
     """Directory holding libryzenadj.dll + WinRing0x64.dll/.sys + inpoutx64.dll.
 
