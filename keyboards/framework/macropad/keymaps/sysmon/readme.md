@@ -90,7 +90,18 @@ alongside the running service. From `host\`:
 .venv\Scripts\python.exe -I bootanim_preview.py 5        # just one
 .venv\Scripts\python.exe -I bootanim_preview.py boot     # the next power-up pick, as a boot plays it
 .venv\Scripts\python.exe -I bootanim_preview.py status   # boot counter + this power-up's pick
+.venv\Scripts\python.exe -I bootanim_preview.py text FRAMEWORK FRAmEWORK -r 3   # A/B, three times
+.venv\Scripts\python.exe -I bootanim_preview.py text "FRAMEWORK 16" -s ticker -c letters
 ```
+
+`text` shows any text (up to 23 characters: A-Z, 0-9, space, `-`, `!`, `.`)
+as a `flash` (letters one at a time, the default), `ticker` or `pop`, in
+`white` (default), `rainbow` or per-`letters` colours, at `--speed` ms per
+letter (flash/pop) or columns per second (ticker). Several texts play one
+after another, each when the previous has finished. Letter case picks the
+form: uppercase W and M are tall (they reach into the small top row, which
+keeps them from reading as an H), lowercase w and m short; every other
+letter has a single form.
 
 Numbered playback names each animation with dots before it plays: up to 9,
 N white dots in reading order from the top-left key; from 10, the tens as
@@ -525,11 +536,16 @@ it doesn't end the pre-connect rainbow:
 
 ```text
 [3] first variant, 1-based (0 = all; 0xFC = preview warning styles [4]..[5];
-    0xFD = status query only; 0xFE = the next power-up pick, unnumbered;
-    past the end = stop)
+    0xFB = custom text, see below; 0xFD = status query only;
+    0xFE = the next power-up pick, unnumbered; past the end = stop)
 [4] last variant (0 = only the first)
 [5] rounds (0 = 1)
 echo [11..14] boot counter in RAM (u32 LE)   [15] this power-up's pick (1-based)
      [16..19] boot counter in EEPROM (u32 LE; lags by one until the boot animation ends)
      [20]     display: 0 = regular RGB effect, 1 = boot rainbow, 2 = bars, 3 = warning
+     [21]     1 while a replay is playing
+
+custom text (0xFB): [4] style 0 flash / 1 ticker / 2 pop, [5] colour 0 rainbow /
+1 per letter / 2 white, [6..7] speed (u16 LE; 0 = default), [8..] text, NUL-terminated
+or 23 characters
 ```
