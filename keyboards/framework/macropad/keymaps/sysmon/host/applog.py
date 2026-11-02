@@ -183,6 +183,11 @@ def pause_if_own_console():
         pass
 
 
+def is_service_mode():
+    """True when running under the SCM rather than in a console."""
+    return _service_mode
+
+
 def log(msg):
     """Emit one diagnostic line to wherever this run's output belongs."""
     if _service_mode:

@@ -25,6 +25,13 @@ and the summary only counts `missing` as something the user has to act on.
 
 Probes must be cheap, must never hang, and must never raise: this runs inside an
 installer wizard page.
+
+Scope note: the probes deliberately ignore the runtime switches in sysmon.ini
+(no-ryzenadj and friends). This is a *capability* report -- "could this machine
+do X" -- not a description of the current configuration. Hiding a source because
+it is switched off would make a broken sensor indistinguishable from a disabled
+one, which is the opposite of what a diagnostic is for. What the service is
+actually doing is reported separately, by probe_service_view().
 """
 
 import ctypes
@@ -441,16 +448,25 @@ def probe_lhm():
 
 def probe_framework_tool():
     """EC access: temperature fallback and the battery max-charge cap."""
+    exe = None
+    try:
+        exe = paths.engine_module().find_framework_tool()
+    except Exception:
+        pass
+    if exe is None:
+        return Result(
+            "framework_tool", "framework_tool (EC)", MISSING, "not found",
+            "winget install FrameworkComputer.framework_tool -- gives the "
+            "battery charge-cap scaling and a temperature fallback. Optional.")
     try:
         out = subprocess.run(
-            ["framework_tool", "--charge-limit"], capture_output=True,
+            [exe, "--charge-limit"], capture_output=True,
             text=True, timeout=5, stdin=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
     except FileNotFoundError:
         return Result(
-            "framework_tool", "framework_tool (EC)", MISSING, "not on PATH",
-            "winget install FrameworkComputer.framework_tool -- gives the "
-            "battery charge-cap scaling and a temperature fallback. Optional.")
+            "framework_tool", "framework_tool (EC)", MISSING, f"{exe} vanished",
+            "winget install FrameworkComputer.framework_tool")
     except OSError as err:
         if getattr(err, "winerror", None) == 740:  # ERROR_ELEVATION_REQUIRED
             return Result(
@@ -470,10 +486,95 @@ def probe_framework_tool():
         # (it does, under CREATE_NO_WINDOW), so the last line is the wrong one.
         line = next((l.strip() for l in out.splitlines() if "Maximum" in l),
                     "charge limit readable")
-        return Result("framework_tool", "framework_tool (EC)", OK, line)
+        # Report the path: a per-user winget install is reachable from here but
+        # not from the LocalSystem service, and that difference is the whole
+        # bug this line exists to make visible.
+        return Result("framework_tool", "framework_tool (EC)", OK,
+                      f"{line}  [{exe}]")
     return Result("framework_tool", "framework_tool (EC)", DEGRADED,
                   "installed but returned no charge-limit data",
                   "Usually means the process is not elevated.")
+
+
+def probe_temperature():
+    """Walk the temperature fallback chain and report what each source says.
+
+    Temperature is the only reading with a four-deep fallback, and the sources
+    disagree in ways that matter: LibreHardwareMonitor needs a chipset driver
+    that a fresh Windows install does not have, ryzenadj's Tctl comes from an
+    SMU table whose layout depends on the CPU model, and the FW16's ACPI
+    thermal zones report a *frozen* value that looks plausible but never moves.
+
+    The capability probes above would all say "ok" while the row shows a wrong
+    number, because each source works in isolation -- what goes wrong is which
+    one wins. So this reproduces gather()'s exact ordering and prints every
+    candidate next to the winner, which turns "the temperature row is wrong"
+    into a one-line diagnosis.
+    """
+    try:
+        eng = paths.engine_module()
+    except Exception as err:
+        return Result("temperature", "Temperature source", MISSING, str(err))
+
+    readings = []      # (label, value_or_None)
+    lhm = ryzen = None
+    try:
+        with _quiet():
+            lhm = eng.LhmLibSource(enabled=True)
+            lhm_temp = lhm.snapshot()[0] if lhm.available else None
+        readings.append(("LibreHardwareMonitor", lhm_temp))
+
+        # Same order gather() uses: EC before Tctl (see the note there).
+        with _quiet():
+            ec = eng.EcThermal().temperature()
+        readings.append(("framework_tool EC", ec))
+
+        with _quiet():
+            ryzen = eng.RyzenAdjSource(enabled=True)
+            snap = ryzen.snapshot() if ryzen.available else None
+        readings.append(("ryzenadj Tctl", eng.RyzenAdjSource.temperature(snap)))
+
+        with _quiet():
+            acpi = eng.WmiSources().acpi_temperature()
+        readings.append(("ACPI zone", acpi))
+    finally:
+        for src in (lhm, ryzen):
+            try:
+                if src is not None:
+                    src.close()
+            except Exception:
+                pass
+
+    detail = ", ".join(
+        f"{name}={'--' if val is None else format(val, '.1f')}"
+        for name, val in readings)
+
+    winner = next(((n, v) for n, v in readings if v is not None), None)
+    if winner is None:
+        return Result("temperature", "Temperature source", MISSING, detail,
+                      "No source provides a temperature, so row 6 stays dark. "
+                      "Install framework_tool, or the AMD chipset driver so "
+                      "LibreHardwareMonitor can read the CPU.")
+
+    name, value = winner
+    used = f"using {name} = {value:.1f} C  ({detail})"
+
+    # The bar spans TEMP_MIN_C..TEMP_MAX_C and the row blinks above
+    # TEMP_CRITICAL_C, so a source stuck high pins the row full and blinking.
+    if value >= eng.TEMP_CRITICAL_C:
+        return Result(
+            "temperature", "Temperature source", DEGRADED, used,
+            f"That is at or above TEMP_CRITICAL_C ({eng.TEMP_CRITICAL_C} C), so "
+            f"row 6 shows full and blinks. If the machine is not actually hot, "
+            f"this source is lying -- compare the values above and disable the "
+            f"bad one (--no-ryzenadj / --no-lhm-lib), or raise TEMP_CRITICAL_C.")
+    if name == "ACPI zone":
+        return Result(
+            "temperature", "Temperature source", DEGRADED, used,
+            "The FW16's ACPI thermal zones report a constant value that never "
+            "changes, so row 6 will look plausible but be frozen. Install "
+            "framework_tool for a real EC reading.")
+    return Result("temperature", "Temperature source", OK, used)
 
 
 def probe_brightness():
@@ -603,6 +704,63 @@ def probe_config():
     return Result("config", "Settings file", OK, f"{applied} setting(s), all valid")
 
 
+def probe_service_view():
+    """Compare what the SERVICE sees with what this session sees.
+
+    Every other probe here runs in the caller's session and inherits the
+    caller's environment. The service does not: it runs as LocalSystem, with the
+    machine PATH and the systemprofile, and those differ in ways that silently
+    degrade it. That gap produced a real bug -- a per-user winget install of
+    framework_tool was on the user's PATH but not the machine's, so the service
+    lost its EC temperature source and fell through to a dead sensor pinned at
+    100 C, rendering a permanent false thermal alarm, while this self-test
+    cheerfully printed "Everything needed is in place".
+
+    So the service publishes what it resolved at start-up and this reads it back
+    instead of assuming the two environments agree.
+    """
+    path = paths.service_state_path()
+    if not os.path.isfile(path):
+        return Result(
+            "service_view", "Service's own view", NA,
+            "not published yet",
+            "Start the service and re-run to compare what it sees with what "
+            "this session sees.")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+    except Exception as err:
+        return Result("service_view", "Service's own view", DEGRADED, str(err))
+
+    detail = (f"at {state.get('written')}: temp from "
+              f"{state.get('temp_src') or 'nothing'}"
+              + (f" = {state['temp_c']:.1f} C" if state.get("temp_c") else "")
+              + f", framework_tool={state.get('framework_tool') or 'NOT FOUND'}")
+
+    # The divergence that matters: a tool this session can run but the service
+    # cannot. That is invisible from here without asking the service directly.
+    mine = None
+    try:
+        eng = paths.engine_module()
+        mine = eng.find_framework_tool()
+    except Exception:
+        pass
+    if mine and not state.get("framework_tool"):
+        return Result(
+            "service_view", "Service's own view", MISSING, detail,
+            f"This session can run framework_tool ({mine}) but the service "
+            f"could not find it. The service loses the EC temperature source "
+            f"and the battery charge cap. Set framework-tool in sysmon.ini to "
+            f"that path and restart the service.")
+    if state.get("temp_src") in ("ryzenadj", "acpi"):
+        return Result(
+            "service_view", "Service's own view", DEGRADED, detail,
+            "The service is on a last-resort temperature source. Compare with "
+            "the 'Temperature source' line above -- if they disagree, the "
+            "service's environment is missing something this session has.")
+    return Result("service_view", "Service's own view", OK, detail)
+
+
 def probe_service():
     try:
         import service
@@ -624,11 +782,13 @@ PROBES = [
     probe_nvml,
     probe_lhm,
     probe_framework_tool,
+    probe_temperature,
     probe_brightness,
     probe_battery,
     probe_gpu_counters,
     probe_config,
     probe_service,
+    probe_service_view,
 ]
 
 
