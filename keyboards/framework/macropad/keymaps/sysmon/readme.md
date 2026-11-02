@@ -13,6 +13,54 @@ normally — the stats ride on a private custom-value channel, `0x42`):
 | 5 | dGPU usage | green bar (dark if no dGPU); breathes when the dGPU is power-limited (see below) |
 | 6 | System temperature | fixed green→deep-red gradient across the row; bar length scales 30–90 °C; whole row blinks at ~1 Hz above 90 °C |
 
+## Boot rainbow
+
+From power-up until the host first connects, the macropad shows a dim, static
+rainbow running diagonally from red at the top-left key to violet at the
+bottom-right one. It's introduced by a short animation, one of thirteen:
+
+| # | Animation | |
+|---|-----------|---|
+| 1 | Wipe | a soft diagonal edge sweeps from the top-left corner, revealing it |
+| 2 | Shine | the same sweep with a white edge that cools into the colours |
+| 3 | Spin | the rainbow flows along the diagonal, slows down and freezes |
+| 4 | Bloom | the pad fades in white, then the rainbow colours fade in |
+| 5 | Twinkle | keys ignite as white sparks roughly along the diagonal |
+| 6 | Rotate | the gradient spins around the centre and settles on the diagonal |
+| 7 | Twinkle, centre | the sparks start in the middle and spread out |
+| 8 | Twinkle, scatter | sparks land anywhere, in random order |
+| 9 | Fire | red/orange/yellow flames climb from the bottom row, red embers shoot up ahead of them, and the burned keys cool into the still rainbow behind |
+| 10 | Ripple | a ragged white ring grows from the centre |
+| 11 | Converge | ragged white edges from opposite corners meet in the middle |
+| 12 | Flicker | each key sputters on like a warming neon tube |
+| 13 | Lock-in | the whole pad sweeps through the spectrum as one colour; each key freezes as it reaches its own |
+
+Each power-up picks one from a shuffle bag: every 13 power-ups play each
+animation once, in a fresh order, never the same one twice in a row. The
+position is a counter in the EEPROM user word (written after the animation, so
+clear of USB enumeration). The twinkle, fire, flicker and ragged-edge timing
+is re-randomized on every boot (and on every round of a replay) too.
+
+Once the host connects, the bars take over and the rainbow is done until the
+next power-up: if the host later goes away, the macropad falls back to the
+regular RGB effect, as it always has. Pressing any RGB key (Fn layer) also
+dismisses it, so the regular effect stays reachable without a host.
+
+Brightness (`BOOT_BRIGHTNESS`, same scale as the host's brightness byte) and the
+hue span (`BOOT_HUE_START`/`BOOT_HUE_END`) are defines in `keymap.c`. To preview
+animations without power-cycling, use `host/bootanim_preview.py`. It needs
+`hidapi`, so run it with the host venv's interpreter — from an **elevated**
+prompt, since that interpreter is requireAdministrator-manifested. It is safe
+alongside the running service. From `host\`:
+
+```powershell
+.venv\Scripts\python.exe -I bootanim_preview.py          # all 13, numbered (N white dots = #N)
+.venv\Scripts\python.exe -I bootanim_preview.py 7-12 x2  # a range, twice
+.venv\Scripts\python.exe -I bootanim_preview.py 5        # just one
+.venv\Scripts\python.exe -I bootanim_preview.py boot     # the next power-up pick, as a boot plays it
+.venv\Scripts\python.exe -I bootanim_preview.py status   # boot counter + this power-up's pick
+```
+
 ## NPU on the iGPU row
 
 The NPU (the XDNA "Ryzen AI" engine on the HX 370) shares the iGPU row rather
@@ -428,3 +476,16 @@ their own when FRAME C stops arriving within `timeout`, so an older host can
 never leave a stale ghost behind. Ghost-capable firmware also sets byte `[27]`
 of its FRAME C echo to `0x01` (older firmware echoes the frame unchanged), which
 is how `--selftest` reports that the module needs a reflash to draw the NPU.
+
+Value `0x10` (BOOT REPLAY) isn't sent by the host; it replays boot animations
+for previewing (`host/bootanim_preview.py`) and never counts as host data, so
+it doesn't end the pre-connect rainbow:
+
+```text
+[3] first variant, 1-based (0 = all; 0xFD = status query only;
+    0xFE = the next power-up pick, unnumbered; past the end = stop)
+[4] last variant (0 = only the first)
+[5] rounds (0 = 1)
+echo [11..14] boot counter in RAM (u32 LE)   [15] this power-up's pick (1-based)
+     [16..19] boot counter in EEPROM (u32 LE; lags by one until the boot animation ends)
+```
