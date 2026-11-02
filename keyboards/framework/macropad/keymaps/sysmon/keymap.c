@@ -10,7 +10,7 @@
 //   row 0 (top, small keys): battery level + charge/discharge effects
 //   row 1: CPU usage
 //   row 2: memory usage
-//   row 3: iGPU usage
+//   row 3: iGPU usage (NPU usage as a dim ghost bar behind it)
 //   row 4: dGPU usage
 //   row 5: system temperature
 //
@@ -114,14 +114,37 @@ void enable_factory_mode(bool enable) {
 //     data[28] = glide       units of 4ms   (per-row level glide; default 75)
 //     data[29] = timeout     units of 100ms (no-data fallback; default 50)
 //
+// An optional third report, FRAME C (value_id 0x03), adds a second, dimmer
+// "ghost" bar to any row: drawn in its own hue behind the main bar, so it only
+// shows where it reaches past the main bar's fill. Six 4-byte ghost
+// descriptors, one per row, back-to-back:
+//
+//   ghost descriptor (4 bytes):
+//     +0 level   0..255  fraction of the 4-segment bar (0 = no ghost)
+//     +1 hue     0..255  ghost color
+//     +2 val     0..255  ghost brightness (the row envelope scales it too)
+//     +3 flags   reserved (0)
+//
+//   FRAME C payload (data[3..26]) = ghost0[4] ++ ... ++ ghost5[4]
+//   FRAME C echo: data[27] is set to SYSMON_GHOST_ACK, so the host can tell
+//   ghost-capable firmware from older firmware (which echoes it unchanged).
+//
+// FRAME C is independent of A/B: it doesn't keep the display alive, and its
+// ghosts fade out on their own if FRAME C stops arriving within the timeout,
+// so an older host that never sends it can't leave a stale ghost on screen.
+// Older firmware ignores value_id 0x03 and just draws the main bars.
+//
 // VIA echoes the buffer back, which serves as the ACK.
 // ---------------------------------------------------------------------------
 
 #define SYSMON_CHANNEL 0x42
 #define SYSMON_FRAME_A 0x01 // rows 0,1,2
 #define SYSMON_FRAME_B 0x02 // rows 3,4,5 + globals
+#define SYSMON_FRAME_C 0x03 // ghost bars, rows 0..5
 
-#define SYSMON_ROW_BYTES 8 // per-row descriptor size in the payload
+#define SYSMON_ROW_BYTES 8   // per-row descriptor size in the payload
+#define SYSMON_GHOST_BYTES 4 // per-row ghost descriptor size in FRAME C
+#define SYSMON_GHOST_ACK 0x01 // written into the FRAME C echo at data[27]
 
 // flags field bit layout
 #define SYSMON_FLAG_GRADIENT (1 << 0)      // bit0: solid hue0 vs hue0->hue1
@@ -160,11 +183,21 @@ typedef struct {
     uint8_t floor;         // breathe trough / sine floor
 } sysmon_row_t;
 
-static sysmon_row_t sysmon_rows[6];
-static uint8_t      sysmon_brightness     = 255;
-static uint8_t      sysmon_glide_units    = SYSMON_DEFAULT_GLIDE_UNITS;
-static uint8_t      sysmon_timeout_units  = SYSMON_DEFAULT_TIMEOUT_UNITS;
-static uint32_t     sysmon_last_update    = 0;
+// Optional per-row ghost bar (FRAME C): the 4 wire bytes, no semantics attached.
+typedef struct {
+    uint8_t level; // 0..255 ghost bar fraction (0 = none)
+    uint8_t hue;   // ghost color
+    uint8_t val;   // ghost brightness
+    uint8_t flags; // reserved
+} sysmon_ghost_t;
+
+static sysmon_row_t   sysmon_rows[6];
+static sysmon_ghost_t sysmon_ghosts[6];
+static uint8_t        sysmon_brightness     = 255;
+static uint8_t        sysmon_glide_units    = SYSMON_DEFAULT_GLIDE_UNITS;
+static uint8_t        sysmon_timeout_units  = SYSMON_DEFAULT_TIMEOUT_UNITS;
+static uint32_t       sysmon_last_update    = 0;
+static uint32_t       sysmon_ghost_update   = 0; // last FRAME C; 0 = never
 
 // Decode one 8-byte descriptor at src into sysmon_rows[row].
 static void sysmon_decode_row(uint8_t row, const uint8_t *src) {
@@ -199,6 +232,18 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
             sysmon_glide_units   = payload[3 * SYSMON_ROW_BYTES + 1];
             sysmon_timeout_units = payload[3 * SYSMON_ROW_BYTES + 2];
             sysmon_last_update   = timer_read32();
+        } else if (*command_id == id_custom_set_value && *value_id == SYSMON_FRAME_C) {
+            for (uint8_t row = 0; row < 6; row++) {
+                const uint8_t *src = payload + row * SYSMON_GHOST_BYTES;
+                sysmon_ghosts[row].level = src[0];
+                sysmon_ghosts[row].hue   = src[1];
+                sysmon_ghosts[row].val   = src[2];
+                sysmon_ghosts[row].flags = src[3];
+            }
+            sysmon_ghost_update = timer_read32();
+            // VIA echoes this buffer back: mark it so the host can detect
+            // ghost support (payload[24] = data[27], past the descriptors).
+            payload[6 * SYSMON_GHOST_BYTES] = SYSMON_GHOST_ACK;
         }
         return;
     }
@@ -269,22 +314,31 @@ static uint8_t sysmon_seg_hue(sysmon_color_mode_t mode, uint8_t hue0, uint8_t hu
     return (uint8_t)((int16_t)hue0 + ((int16_t)hue1 - (int16_t)hue0) * (int16_t)i / 3);
 }
 
+// How much of segment i (0..3) a bar of length lvl (0..1020) covers, 0..255.
+static uint16_t sysmon_seg_fill(uint16_t lvl, uint8_t i) {
+    if (lvl >= (uint16_t)(i + 1) * 255) return 255;
+    if (lvl > (uint16_t)i * 255) return lvl - (uint16_t)i * 255;
+    return 0;
+}
+
 // Paint one row as a 4-segment bar from a 0..255 level (0=empty, 255=full).
 // level*4 spans 0..1020 across the four segments; full segments read 255,
 // the fractional boundary segment fades in through sysmon_visible_pwm so a
 // dim row_val (e.g. an AC-idle dim fill) stays visible and distinguishable.
 // Colored solid hue0 or as a hue0->hue1 gradient, at brightness row_val.
+//
+// A ghost bar (ghost_level > 0) is drawn behind the main bar in ghost_hue at
+// ghost_val: each segment adds whatever part of it the ghost covers *beyond*
+// the main fill, so the ghost only shows past the main bar's end, and a
+// segment the two share mixes both colors in proportion to their coverage.
 static void sysmon_render_bar(uint8_t row, uint8_t level, sysmon_color_mode_t mode,
-                              uint8_t hue0, uint8_t hue1, uint8_t row_val) {
-    uint16_t lvl = (uint16_t)level * 4; // 0..1020
+                              uint8_t hue0, uint8_t hue1, uint8_t row_val,
+                              uint8_t ghost_level, uint8_t ghost_hue, uint8_t ghost_val) {
+    uint16_t lvl  = (uint16_t)level * 4;       // 0..1020
+    uint16_t glvl = (uint16_t)ghost_level * 4; // 0..1020
 
     for (uint8_t i = 0; i < 4; i++) {
-        uint16_t fill = 0; // 0..255: how much of this segment is lit
-        if (lvl >= (uint16_t)(i + 1) * 255) {
-            fill = 255;
-        } else if (lvl > (uint16_t)i * 255) {
-            fill = lvl - (uint16_t)i * 255;
-        }
+        uint16_t fill = sysmon_seg_fill(lvl, i); // 0..255: how much is lit
         // Scale the lit fraction by the row brightness, then lift any nonzero
         // result onto the GCC visibility floor so dim fills stay visible at low
         // global current — both the fractional boundary segment and a low
@@ -295,6 +349,29 @@ static void sysmon_render_bar(uint8_t row, uint8_t level, sysmon_color_mode_t mo
         if (bright) bright = (uint8_t)sysmon_visible_pwm(bright);
         uint8_t hue = sysmon_seg_hue(mode, hue0, hue1, i);
         RGB rgb = hsv_to_rgb((HSV){hue, 255, bright});
+
+        uint16_t gfill = sysmon_seg_fill(glvl, i);
+        if (gfill > fill) {
+            uint16_t gpart = gfill - fill; // 1..255: ghost coverage past the main fill
+            uint8_t  gb    = scale8(ghost_val, (uint8_t)gpart);
+            // Visibility lift, weighted by the ghost's share of the segment's
+            // coverage (gpart / gfill). An otherwise-dark segment (fill = 0)
+            // gets the full lift, like any dim fill. A ghost sliver past a
+            // nearly-full main segment gets almost none, so it can't tint that
+            // segment heavily at low global current. A tiny main sliver under a
+            // mostly-ghost segment lifts the ghost nearly fully; unlifted, that
+            // segment would read darker than the ghost-only ones beside it.
+            if (gb) {
+                uint16_t lift = sysmon_visible_pwm(gb) - gb;
+                gb = (uint8_t)(gb + (uint32_t)lift * gpart / gfill);
+            }
+            if (gb) {
+                RGB g = hsv_to_rgb((HSV){ghost_hue, 255, gb});
+                rgb.r = qadd8(rgb.r, g.r);
+                rgb.g = qadd8(rgb.g, g.g);
+                rgb.b = qadd8(rgb.b, g.b);
+            }
+        }
         rgb_matrix_set_color(sysmon_row_leds[row][i], rgb.r, rgb.g, rgb.b);
     }
 }
@@ -404,10 +481,17 @@ static uint8_t sysmon_slewed_val(void) {
 // envelope to the whole row's effective brightness, then paint any overlay
 // segments from the boundary. No metric-specific logic lives here — every
 // behavior is described by the row descriptor the host sent.
-static void sysmon_render_row(uint8_t row, sysmon_glide_t *g, uint32_t glide_ms) {
-    const sysmon_row_t *r = &sysmon_rows[row];
+static void sysmon_render_row(uint8_t row, sysmon_glide_t *g, sysmon_glide_t *gg,
+                              uint32_t glide_ms, uint32_t timeout_ms) {
+    const sysmon_row_t   *r  = &sysmon_rows[row];
+    const sysmon_ghost_t *gh = &sysmon_ghosts[row];
 
     uint8_t level = sysmon_glide(g, r->level, glide_ms);
+
+    // A ghost glides like the main bar, and glides out to empty once FRAME C
+    // goes stale (or never arrived), keeping its last color on the way out.
+    bool    ghost_fresh = sysmon_ghost_update != 0 && timer_elapsed32(sysmon_ghost_update) <= timeout_ms;
+    uint8_t ghost_level = sysmon_glide(gg, ghost_fresh ? gh->level : 0, glide_ms);
 
     sysmon_color_mode_t mode = (r->flags & SYSMON_FLAG_GRADIENT) ? SYSMON_COLOR_GRADIENT
                                                                  : SYSMON_COLOR_SOLID;
@@ -426,7 +510,14 @@ static void sysmon_render_row(uint8_t row, sysmon_glide_t *g, uint32_t glide_ms)
             break; // SYSMON_ENV_NONE
     }
 
-    sysmon_render_bar(row, level, mode, r->hue0, r->hue1, row_val);
+    // The envelope belongs to the whole row, ghost included: scale the ghost
+    // by the same fraction it took off the main bar (a blinking row must not
+    // leave a steady ghost behind).
+    uint8_t ghost_val = gh->val;
+    if (r->row_val) ghost_val = (uint8_t)((uint16_t)ghost_val * row_val / r->row_val);
+
+    sysmon_render_bar(row, level, mode, r->hue0, r->hue1, row_val,
+                      ghost_level, gh->hue, ghost_val);
 
     // Overlay paints overlay_count segments from the boundary, overriding the
     // base fill there. Colored with the row hue (hue0).
@@ -485,8 +576,9 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
     uint32_t glide_ms = (uint32_t)sysmon_glide_units * 4;
 
     static sysmon_glide_t glides[6];
+    static sysmon_glide_t ghost_glides[6];
     for (uint8_t row = 0; row < 6; row++) {
-        sysmon_render_row(row, &glides[row], glide_ms);
+        sysmon_render_row(row, &glides[row], &ghost_glides[row], glide_ms, timeout_ms);
     }
 
     return false;

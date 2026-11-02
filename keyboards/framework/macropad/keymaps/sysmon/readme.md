@@ -9,9 +9,32 @@ normally — the stats ride on a private custom-value channel, `0x42`):
 | 1 (top, small keys) | Battery | charging: level bar (red→green by level), segments from the filling one upward pulse in sync; discharging: level bar (red unplugged, amber when the battery is assisting an overloaded charger on AC), segments from the boundary downward flare and fade in sync, blinks below 15%; the charge/discharge power decides how many segments animate (1 segment for a trickle up to all 4 at ≥75 W); idle on AC: whole row steady dim green — a sub-10 W drain counts as idle, and if the EC is measurably drifting off the cap the boundary segment breathes faintly as a tell (a 0 W "discharging" report, which is what the EC says while it floats a pack it is done charging, is plain idle: no tell); the bar is rescaled against the max-charge cap, so charged-to-cap shows completely full |
 | 2 | CPU usage | red bar; breathes when the APU is power-limited (see below) |
 | 3 | Memory usage | gold bar; whole row blinks at ~1 Hz when usage is critically high (≥90%) |
-| 4 | iGPU usage | red bar |
+| 4 | iGPU + NPU usage | red bar for the iGPU; NPU usage as a dim cyan *ghost* bar behind it, visible where the NPU is busier than the iGPU (see below) |
 | 5 | dGPU usage | green bar (dark if no dGPU); breathes when the dGPU is power-limited (see below) |
 | 6 | System temperature | fixed green→deep-red gradient across the row; bar length scales 30–90 °C; whole row blinks at ~1 Hz above 90 °C |
+
+## NPU on the iGPU row
+
+The NPU (the XDNA "Ryzen AI" engine on the HX 370) shares the iGPU row rather
+than taking a row of its own: it sits on the same die and is idle most of the
+time. The iGPU keeps its bright red bar; the NPU is a dim cyan bar drawn
+*behind* it, so:
+
+- NPU idle → the row is exactly the iGPU bar it always was;
+- NPU busier than the iGPU → cyan segments extend past the end of the red
+  bar, up to the NPU's level;
+- iGPU busier than the NPU → the ghost is hidden under the red bar.
+
+A segment the two bars share mixes both colours in proportion to how much of
+it each one covers.
+
+The NPU is found by what the kernel says it is — a *compute-only* adapter
+(`D3DKMT_ADAPTERTYPE.ComputeOnly`, the same flag Task Manager keys its NPU graph
+on), so no name matching is involved — and its utilization is read from the
+same PDH `GPU Engine` counters as the GPUs, scoped to the NPU's LUID. On a
+machine without an NPU the row is just the iGPU bar. Drawing the ghost needs the
+firmware from this version (protocol FRAME C, below); older firmware ignores it
+and shows the plain iGPU bar.
 
 ## Power-limit indication
 
@@ -339,9 +362,10 @@ either works during development. What is available:
 - **APU power limit**: `APU_LIMIT_NEAR` (how close to a limit counts as
   binding) and `APU_LIMIT_SIGNALS` (which SMU limits — `stapm`/`slow`/`fast` —
   trigger the breathe)
-- **colours**: the `HUE_*` constants and the temperature gradient endpoints
+- **colours**: the `HUE_*` constants (including `HUE_NPU`, the ghost bar) and
+  the temperature gradient endpoints
 - **mappings**: `RATE_SEG_W1/2/3` (watts → animated segments),
-  `ROW_VAL_BATT_IDLE`, `BATT_DRIFT_FLOOR`, `LIMIT_FLOOR`
+  `ROW_VAL_BATT_IDLE`, `ROW_VAL_NPU_GHOST`, `BATT_DRIFT_FLOOR`, `LIMIT_FLOOR`
 - **cadences**: the `PERIOD_*` constants (blink / breathe / pulse, in 32 ms units)
 - **globals**: `GLIDE_MS_DEFAULT`, `TIMEOUT_MS_DEFAULT`
 - **polling**: the `TTL_*` source-cache lifetimes (how often each slow sensor is read)
@@ -353,7 +377,7 @@ on the host.
 
 ## Protocol (v2)
 
-Two 32-byte VIA "custom set value" reports are sent per interval on channel
+Three 32-byte VIA "custom set value" reports are sent per interval on channel
 `0x42`. The host describes each row fully; the firmware just draws it.
 
 ```text
@@ -361,7 +385,9 @@ Two 32-byte VIA "custom set value" reports are sent per interval on channel
 [1]   0x42  sysmon channel
 [2]   value_id: 0x01 = FRAME A (rows 0,1,2)
                0x02 = FRAME B (rows 3,4,5 + globals)
-[3..] payload: three back-to-back 8-byte row descriptors
+               0x03 = FRAME C (ghost bars, rows 0..5; optional)
+[3..] payload: FRAME A/B: three back-to-back 8-byte row descriptors
+               FRAME C:   six back-to-back 4-byte ghost descriptors
 
 row descriptor (8 bytes):
   +0 level         0-255  fraction of the 4-segment bar (0=empty, 255=full)
@@ -380,10 +406,25 @@ FRAME B appends three globals after its three row descriptors:
   [27] brightness  0-255           overall brightness (drives the LED global current)
   [28] glide       units of 4 ms   per-row level glide   (default 300 ms => 75)
   [29] timeout     units of 100 ms no-data fallback       (default 5000 ms => 50)
+
+ghost descriptor (4 bytes, FRAME C):
+  +0 level   0-255  fraction of the 4-segment bar (0 = no ghost)
+  +1 hue     0-255  ghost colour
+  +2 val     0-255  ghost brightness (the row's envelope scales it too)
+  +3 flags   reserved (0)
 ```
 
 The firmware glides each row's `level`, fills the bar (solid or gradient),
 applies the envelope to the whole-row brightness, then paints any overlay
 segments from the fill boundary — all timed off its own clock, so the bars stay
-smooth between the host's updates. After `timeout` with no frame it restores the
-stock global current and lets the regular RGB effect run. VIA's echo is the ACK.
+smooth between the host's updates. A ghost bar glides the same way and adds,
+per segment, whatever part the ghost covers beyond the main fill. After
+`timeout` with no frame it restores the stock global current and lets the
+regular RGB effect run. VIA's echo is the ACK.
+
+FRAME C is optional in both directions. Firmware that predates it ignores value
+`0x03` and draws the plain bars. Firmware that has it fades the ghosts out on
+their own when FRAME C stops arriving within `timeout`, so an older host can
+never leave a stale ghost behind. Ghost-capable firmware also sets byte `[27]`
+of its FRAME C echo to `0x01` (older firmware echoes the frame unchanged), which
+is how `--selftest` reports that the module needs a reflash to draw the NPU.

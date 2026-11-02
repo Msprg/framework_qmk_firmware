@@ -252,8 +252,7 @@ def probe_firmware():
             reply = dev.read(eng.REPORT_LEN)
             if reply:
                 if len(reply) > 1 and reply[1] == eng.SYSMON_CHANNEL:
-                    return Result("firmware", "sysmon firmware", OK,
-                                  "device acknowledged channel 0x42")
+                    return _probe_ghost_support(dev, eng)
                 return Result(
                     "firmware", "sysmon firmware", DEGRADED,
                     "device answered VIA but not on the sysmon channel",
@@ -273,6 +272,53 @@ def probe_firmware():
                 dev.close()
         except Exception:
             pass
+
+
+def _probe_ghost_support(dev, eng):
+    """The module runs sysmon firmware; does it also draw ghost bars?
+
+    Sends an all-zero FRAME C (legal: no ghosts) and reads the echo back.
+    Ghost-capable firmware marks byte GHOST_ACK_OFFSET of the echo; older
+    firmware echoes FRAME C unchanged. Without that check, firmware that
+    predates the ghost bars fails silently: the iGPU row just never shows the
+    NPU. Other echoes can arrive first (a running service gets them too), so
+    only a FRAME C echo counts.
+    """
+    import time
+    ok = Result("firmware", "sysmon firmware", OK,
+                "device acknowledged channel 0x42; draws ghost bars")
+    probe = bytearray(eng.REPORT_LEN)
+    probe[0] = eng.VIA_CMD_CUSTOM_SET_VALUE
+    probe[1] = eng.SYSMON_CHANNEL
+    probe[2] = eng.SYSMON_VALUE_FRAME_C
+    try:
+        dev.write(b"\x00" + bytes(probe))
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            reply = dev.read(eng.REPORT_LEN)
+            if (reply and len(reply) > eng.GHOST_ACK_OFFSET
+                    and reply[1] == eng.SYSMON_CHANNEL
+                    and reply[2] == eng.SYSMON_VALUE_FRAME_C):
+                if reply[eng.GHOST_ACK_OFFSET] == eng.GHOST_ACK:
+                    return ok
+                break
+            if not reply:
+                time.sleep(0.02)
+    except Exception:
+        pass
+    # Old firmware. Only worth flagging where a ghost would actually be drawn.
+    detail = "device acknowledged channel 0x42; firmware predates ghost bars"
+    try:
+        has_npu = bool(eng.compute_only_adapter_luids())
+    except Exception:
+        has_npu = False
+    if not has_npu:
+        return Result("firmware", "sysmon firmware", OK,
+                      detail + " (only needed with an NPU; none here)")
+    return Result("firmware", "sysmon firmware", DEGRADED, detail,
+                  "This machine has an NPU, which the iGPU row shows as a "
+                  "ghost bar that this firmware cannot draw. Flash the bundled "
+                  "firmware (--flash).")
 
 
 def probe_ryzenadj():
@@ -616,7 +662,7 @@ def probe_battery():
 
 
 def probe_gpu_counters():
-    """PDH GPU Engine counters: the iGPU row, and the dGPU fallback."""
+    """PDH GPU Engine counters: the iGPU row, its NPU ghost, and the dGPU fallback."""
     try:
         import win32pdh
     except ImportError:
@@ -651,7 +697,20 @@ def probe_gpu_counters():
         detail = f"{len(items)} engine instance(s), " \
                  f"{len(names)} adapter(s): {', '.join(sorted(set(names.values())))}"
     except Exception:
+        eng = None
         detail = f"{len(items)} engine instance(s)"
+    # The NPU is the iGPU row's ghost bar. Absent is normal on a CPU without
+    # one, so it only adds to the detail line and never degrades the result.
+    try:
+        npus = eng.compute_only_adapter_luids() if eng is not None else None
+        if npus is None:
+            detail += "; NPU: cannot enumerate (Windows too old)"
+        elif npus:
+            detail += "; NPU: " + ", ".join(f"luid 0x{l:X}" for l in sorted(npus))
+        else:
+            detail += "; NPU: none"
+    except Exception as err:
+        detail += f"; NPU: probe failed ({err})"
     return Result("gpu", "GPU counters (PDH)", OK, detail)
 
 
