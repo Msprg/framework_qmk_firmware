@@ -1444,43 +1444,98 @@ static void boot_anim_glitch(uint16_t t) {
         for (uint8_t c = 0; c < 4; c++) rgb_matrix_set_color(BOOT_KEY(r, c), g[r][c].r, g[r][c].g, g[r][c].b);
 }
 
-// --- text prototypes (preview only) ----------------------------------------
+// --- text ------------------------------------------------------------------
 //
 // Letters are 5 rows tall on pad rows 1-5, the evenly spaced ones; the
-// half-height top row (row 0) stays dark -- except for W, whose outer strokes
-// reach up into it. A W squeezed into the same rows as everything else reads
-// as an H; the tall outer strokes with the joins low down read as a W. Glyph
-// rows are bitmaps, rows[0] = pad row 0, bit (w-1-x) = column x. M and W need
-// five columns to read; the lowercase entries are four-column forms for the
-// styles that show one letter at a time.
+// half-height top row (row 0) stays dark -- except for the tall forms of W
+// and M, which use all six rows. Squeezed into the same rows as everything
+// else, both read as an H: the tall W's outer strokes reach up into row 0 with
+// the joins low down, and the tall M is its mirror image, starting in row 0
+// with the joins high and long legs.
+//
+// Letter case picks the form: uppercase W/M are tall, lowercase w/m short.
+// Every other letter has one form, so its case doesn't matter. W and M also
+// come in five columns (tickers, where width is free) and four (styles that
+// show one letter at a time). Glyph rows are bitmaps, rows[0] = pad row 0,
+// bit (w-1-x) = column x.
+
+#define BOOT_GLYPH_NARROW 0x01 // the four-column form of a five-column letter
+#define BOOT_GLYPH_TALL 0x02   // uses row 0
 
 typedef struct {
-    char    ch;
+    char    ch; // uppercase
+    uint8_t flags;
     uint8_t w;
     uint8_t rows[6];
 } boot_glyph_t;
 
+#define BOOT_TALL BOOT_GLYPH_TALL
+#define BOOT_NARROW BOOT_GLYPH_NARROW
 static const boot_glyph_t boot_font[] = {
-    {'F', 4, {0x00, 0x0F, 0x08, 0x0E, 0x08, 0x08}}, // ####  #...  ###.  #...  #...
-    {'R', 4, {0x00, 0x0E, 0x09, 0x0E, 0x0A, 0x09}}, // ###.  #..#  ###.  #.#.  #..#
-    {'A', 4, {0x00, 0x06, 0x09, 0x0F, 0x09, 0x09}}, // .##.  #..#  ####  #..#  #..#
-    {'M', 5, {0x00, 0x11, 0x1B, 0x15, 0x11, 0x11}}, // #...#  ##.##  #.#.#  #...#  #...#
-    {'E', 4, {0x00, 0x0F, 0x08, 0x0E, 0x08, 0x0F}}, // ####  #...  ###.  #...  ####
-    {'W', 5, {0x11, 0x11, 0x11, 0x15, 0x1B, 0x11}}, // #...#  #...#  #...#  #.#.#  ##.##  #...# (tall)
-    {'O', 4, {0x00, 0x06, 0x09, 0x09, 0x09, 0x06}}, // .##.  #..#  #..#  #..#  .##.
-    {'K', 4, {0x00, 0x09, 0x0A, 0x0C, 0x0A, 0x09}}, // #..#  #.#.  ##..  #.#.  #..#
-    {'1', 3, {0x00, 0x02, 0x06, 0x02, 0x02, 0x07}}, // .#.  ##.  .#.  .#.  ###
-    {'6', 4, {0x00, 0x06, 0x08, 0x0E, 0x09, 0x06}}, // .##.  #...  ###.  #..#  .##.
-    {'m', 4, {0x00, 0x09, 0x0F, 0x0F, 0x09, 0x09}}, // #..#  ####  ####  #..#  #..#
-    {'w', 4, {0x09, 0x09, 0x09, 0x0F, 0x0F, 0x09}}, // #..#  #..#  #..#  ####  ####  #..# (tall)
-    {' ', 2, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+    {'A', 0, 4, {0, 0x6, 0x9, 0xF, 0x9, 0x9}},
+    {'B', 0, 4, {0, 0xE, 0x9, 0xE, 0x9, 0xE}},
+    {'C', 0, 4, {0, 0x7, 0x8, 0x8, 0x8, 0x7}},
+    {'D', 0, 4, {0, 0xE, 0x9, 0x9, 0x9, 0xE}},
+    {'E', 0, 4, {0, 0xF, 0x8, 0xE, 0x8, 0xF}},
+    {'F', 0, 4, {0, 0xF, 0x8, 0xE, 0x8, 0x8}},
+    {'G', 0, 4, {0, 0x7, 0x8, 0xB, 0x9, 0x7}},
+    {'H', 0, 4, {0, 0x9, 0x9, 0xF, 0x9, 0x9}},
+    {'I', 0, 3, {0, 0x7, 0x2, 0x2, 0x2, 0x7}},
+    {'J', 0, 4, {0, 0x3, 0x1, 0x1, 0x9, 0x6}},
+    {'K', 0, 4, {0, 0x9, 0xA, 0xC, 0xA, 0x9}},
+    {'L', 0, 4, {0, 0x8, 0x8, 0x8, 0x8, 0xF}},
+    // M: #...#  ##.##  #.#.#  #...#  #...#  (tall: from row 0, one more leg row)
+    {'M', 0, 5, {0, 0x11, 0x1B, 0x15, 0x11, 0x11}},
+    {'M', BOOT_TALL, 5, {0x11, 0x1B, 0x15, 0x11, 0x11, 0x11}},
+    {'M', BOOT_NARROW, 4, {0, 0x9, 0xF, 0xF, 0x9, 0x9}},
+    {'M', BOOT_NARROW | BOOT_TALL, 4, {0x9, 0xF, 0xF, 0x9, 0x9, 0x9}},
+    {'N', 0, 4, {0, 0x9, 0xD, 0xB, 0x9, 0x9}},
+    {'O', 0, 4, {0, 0x6, 0x9, 0x9, 0x9, 0x6}},
+    {'P', 0, 4, {0, 0xE, 0x9, 0xE, 0x8, 0x8}},
+    {'Q', 0, 4, {0, 0x6, 0x9, 0x9, 0xA, 0x5}},
+    {'R', 0, 4, {0, 0xE, 0x9, 0xE, 0xA, 0x9}},
+    {'S', 0, 4, {0, 0x7, 0x8, 0x6, 0x1, 0xE}},
+    {'T', 0, 3, {0, 0x7, 0x2, 0x2, 0x2, 0x2}},
+    {'U', 0, 4, {0, 0x9, 0x9, 0x9, 0x9, 0x6}},
+    {'V', 0, 3, {0, 0x5, 0x5, 0x5, 0x5, 0x2}},
+    // W: #...#  #...#  #.#.#  ##.##  #...#  (tall: outer strokes up into row 0)
+    {'W', 0, 5, {0, 0x11, 0x11, 0x15, 0x1B, 0x11}},
+    {'W', BOOT_TALL, 5, {0x11, 0x11, 0x11, 0x15, 0x1B, 0x11}},
+    {'W', BOOT_NARROW, 4, {0, 0x9, 0x9, 0xF, 0xF, 0x9}},
+    {'W', BOOT_NARROW | BOOT_TALL, 4, {0x9, 0x9, 0x9, 0xF, 0xF, 0x9}},
+    {'X', 0, 4, {0, 0x9, 0x9, 0x6, 0x9, 0x9}},
+    {'Y', 0, 3, {0, 0x5, 0x5, 0x2, 0x2, 0x2}},
+    {'Z', 0, 4, {0, 0xF, 0x1, 0x6, 0x8, 0xF}},
+    {'0', 0, 3, {0, 0x7, 0x5, 0x5, 0x5, 0x7}},
+    {'1', 0, 3, {0, 0x2, 0x6, 0x2, 0x2, 0x7}},
+    {'2', 0, 4, {0, 0xE, 0x1, 0x6, 0x8, 0xF}},
+    {'3', 0, 4, {0, 0xE, 0x1, 0x6, 0x1, 0xE}},
+    {'4', 0, 4, {0, 0x9, 0x9, 0xF, 0x1, 0x1}},
+    {'5', 0, 4, {0, 0xF, 0x8, 0xE, 0x1, 0xE}},
+    {'6', 0, 4, {0, 0x6, 0x8, 0xE, 0x9, 0x6}},
+    {'7', 0, 4, {0, 0xF, 0x1, 0x2, 0x4, 0x4}},
+    {'8', 0, 4, {0, 0x6, 0x9, 0x6, 0x9, 0x6}},
+    {'9', 0, 4, {0, 0x6, 0x9, 0x7, 0x1, 0x6}},
+    {'-', 0, 3, {0, 0x0, 0x0, 0x7, 0x0, 0x0}},
+    {'!', 0, 1, {0, 0x1, 0x1, 0x1, 0x0, 0x1}},
+    {'.', 0, 1, {0, 0x0, 0x0, 0x0, 0x0, 0x1}},
+    {' ', 0, 2, {0, 0, 0, 0, 0, 0}},
 };
 
-static const boot_glyph_t *boot_glyph(char c) {
+// The glyph for c. narrow: the letter must fit four columns. Unknown
+// characters draw as a space.
+static const boot_glyph_t *boot_glyph(char c, bool narrow) {
+    bool    tall = c >= 'A' && c <= 'Z';
+    char    up   = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+    uint8_t want = (narrow ? BOOT_NARROW : 0) | (tall ? BOOT_TALL : 0);
+    const boot_glyph_t *any = NULL;
     for (uint8_t i = 0; i < sizeof(boot_font) / sizeof(boot_font[0]); i++) {
-        if (boot_font[i].ch == c) return &boot_font[i];
+        const boot_glyph_t *g = &boot_font[i];
+        if (g->ch != up) continue;
+        if (g->flags == want) return g;
+        if (!any && !(g->flags & BOOT_NARROW) && !(g->flags & BOOT_TALL)) any = g;
     }
-    return &boot_font[0];
+    return any ? any : &boot_font[sizeof(boot_font) / sizeof(boot_font[0]) - 1];
 }
 
 // Is key (r, c) part of glyph g, centered in the 4 columns?
@@ -1490,9 +1545,37 @@ static bool boot_glyph_lit(const boot_glyph_t *g, uint8_t r, uint8_t c) {
     return (g->rows[r] >> (g->w - 1 - (c - x0))) & 1;
 }
 
-// --- marquee ---
+// Text color modes.
+#define BOOT_TXT_RAINBOW 0 // each lit key in its own rainbow color (a stencil)
+#define BOOT_TXT_LETTERS 1 // each letter in its own color, red to violet
+#define BOOT_TXT_WHITE 2
 
-#define BOOT_TEXT_MAXCOLS 80
+// Hue of the k-th non-space letter out of n, spread over the rainbow.
+static uint8_t boot_letter_hue(uint8_t k, uint8_t n) {
+    return boot_hue_at(n > 1 ? (int16_t)(k * 255 / (n - 1)) : 0);
+}
+
+static uint8_t boot_text_letters(const char *txt) {
+    uint8_t n = 0;
+    for (const char *p = txt; *p; p++) n += *p != ' ';
+    return n;
+}
+
+static uint8_t boot_text_len(const char *txt) {
+    uint8_t n = 0;
+    while (txt[n]) n++;
+    return n;
+}
+
+// The color of a lit text key in a color mode, at saturation s (0 = white).
+static RGB boot_text_rgb(uint8_t mode, uint8_t i, uint8_t letter_hue, uint8_t s, uint8_t v) {
+    if (mode == BOOT_TXT_WHITE) return boot_hsv(0, 0, v);
+    return boot_hsv(mode == BOOT_TXT_LETTERS ? letter_hue : boot_hue[i], s, v);
+}
+
+// --- ticker ---
+
+#define BOOT_TEXT_MAXCOLS 160
 #define BOOT_TEXT_BLOCK 0x80 // a column of the closing rainbow block (all rows)
 static uint8_t     boot_text_cols[BOOT_TEXT_MAXCOLS]; // bits 0-5 = pad rows 0-5
 static uint8_t     boot_text_hue[BOOT_TEXT_MAXCOLS];  // per-letter color of each column
@@ -1501,17 +1584,14 @@ static const char *boot_text_built = NULL;
 
 // Lay the text out as columns: each glyph, a blank column, and at the end a
 // 4-column block of the rainbow itself that scrolls in and docks.
-// Each letter also gets its own hue, spread over the rainbow in reading order
-// (spaces don't count), for the per-letter coloring.
 static void boot_text_build(const char *txt) {
     if (boot_text_built == txt) return;
-    uint8_t letters = 0, k = 0, n = 0;
-    for (const char *p = txt; *p; p++) letters += *p != ' ';
-    for (const char *p = txt; *p; p++) {
-        const boot_glyph_t *g   = boot_glyph(*p);
-        uint8_t             hue = boot_hue_at(letters > 1 ? (int16_t)(k * 255 / (letters - 1)) : 0);
+    uint8_t letters = boot_text_letters(txt), k = 0, n = 0;
+    for (const char *p = txt; *p && n < BOOT_TEXT_MAXCOLS - 10; p++) {
+        const boot_glyph_t *g   = boot_glyph(*p, false);
+        uint8_t             hue = boot_letter_hue(k, letters);
         k += *p != ' ';
-        for (uint8_t x = 0; x < g->w && n < BOOT_TEXT_MAXCOLS - 5; x++) {
+        for (uint8_t x = 0; x < g->w; x++) {
             uint8_t m = 0;
             for (uint8_t r = 0; r < 6; r++) {
                 if ((g->rows[r] >> (g->w - 1 - x)) & 1) m |= 1 << r;
@@ -1522,7 +1602,7 @@ static void boot_text_build(const char *txt) {
         boot_text_hue[n]    = hue;
         boot_text_cols[n++] = 0;
     }
-    for (uint8_t k = 0; k < 4; k++) boot_text_cols[n++] = BOOT_TEXT_BLOCK;
+    for (uint8_t q = 0; q < 4; q++) boot_text_cols[n++] = BOOT_TEXT_BLOCK;
     boot_text_ncols = n;
     boot_text_built = txt;
 }
@@ -1534,17 +1614,27 @@ static uint8_t boot_text_px(int32_t col, uint8_t r) {
     return ((m >> r) & 1) ? 255 : 0;
 }
 
-// Scroll txt right to left at cps columns/s, easing to a stop as the rainbow
-// block docks. Sub-column positions blend neighboring columns. The text is
-// either a stencil -- drawn in the rainbow colors of the keys it passes over,
-// so a letter changes color as it moves -- or each letter keeps its own color.
-static void boot_text_scroll(uint16_t t, const char *txt, uint16_t cps, bool per_letter) {
+// Full-speed and slowing-down times of a ticker, ms (it decelerates over the
+// last two columns as the rainbow block docks).
+static void boot_text_scroll_times(const char *txt, uint16_t cps, int32_t *t1, int32_t *td) {
     boot_text_build(txt);
-    const int32_t D  = (int32_t)boot_text_ncols * 256; // from -4 to ncols-4 columns
-    const int32_t L  = 2 * 256;                         // decelerate over the last 2
-    const int32_t v  = (int32_t)cps * 256;              // 1/256 columns per second
-    const int32_t t1 = (D - L) * 1000 / v;              // ms at full speed
-    const int32_t td = 2 * L * 1000 / v;                // ms decelerating
+    int32_t D = (int32_t)boot_text_ncols * 256, L = 2 * 256, v = (int32_t)MAX(cps, 1) * 256;
+    *t1       = (D - L) * 1000 / v;
+    *td       = 2 * L * 1000 / v;
+}
+
+static uint16_t boot_text_scroll_ms(const char *txt, uint16_t cps) {
+    int32_t t1, td;
+    boot_text_scroll_times(txt, cps, &t1, &td);
+    return (uint16_t)MIN(t1 + td + 150, 65000);
+}
+
+// Scroll txt right to left at cps columns/s, easing to a stop as the rainbow
+// block docks. Sub-column positions blend neighboring columns.
+static void boot_text_scroll(uint16_t t, const char *txt, uint16_t cps, uint8_t mode) {
+    int32_t t1, td;
+    boot_text_scroll_times(txt, cps, &t1, &td);
+    const int32_t D = (int32_t)boot_text_ncols * 256, L = 2 * 256, v = (int32_t)MAX(cps, 1) * 256;
     int32_t       p;
     if (t < t1) {
         p = v * t / 1000;
@@ -1561,62 +1651,49 @@ static void boot_text_scroll(uint16_t t, const char *txt, uint16_t cps, bool per
         for (uint8_t c = 0; c < 4; c++) {
             int32_t a = base + c, b = a + 1;
             uint8_t i = BOOT_KEY(r, c);
-            RGB     ca = boot_own[i], cb = boot_own[i];
-            if (per_letter) {
-                // Letter columns carry their own color; the closing block and
-                // empty space keep the key's rainbow color.
-                if (a >= 0 && a < boot_text_ncols && !(boot_text_cols[a] & BOOT_TEXT_BLOCK)) ca = boot_hsv(boot_text_hue[a], 255, 255);
-                if (b >= 0 && b < boot_text_ncols && !(boot_text_cols[b] & BOOT_TEXT_BLOCK)) cb = boot_hsv(boot_text_hue[b], 255, 255);
-            }
+            // Letter columns take the text color; the closing block keeps the
+            // key's own rainbow color.
+            RGB ca = boot_own[i], cb = boot_own[i];
+            if (a >= 0 && a < boot_text_ncols && !(boot_text_cols[a] & BOOT_TEXT_BLOCK)) ca = boot_text_rgb(mode, i, boot_text_hue[a], 255, 255);
+            if (b >= 0 && b < boot_text_ncols && !(boot_text_cols[b] & BOOT_TEXT_BLOCK)) cb = boot_text_rgb(mode, i, boot_text_hue[b], 255, 255);
             RGB o = boot_rgb_lerp(boot_rgb_scale(ca, boot_text_px(a, r)), boot_rgb_scale(cb, boot_text_px(b, r)), fr);
             rgb_matrix_set_color(i, o.r, o.g, o.b);
         }
     }
 }
 
-// 18 FW16 scroll: "FW16" scrolls through like an LED ticker, then the rainbow
-// slides in behind it.
-#define BOOT_TEXT_FW16_MS 3050
-static void boot_anim_text_fw16(uint16_t t) {
-    boot_text_scroll(t, "FW16", 9, false);
+// --- one letter at a time ---
+
+// Letters pop up one at a time, slot_ms each: a white flash cooling into the
+// text color. The last stays, and the rest of the pad sparkles in around it.
+static uint16_t boot_text_pop_ms(const char *txt, uint16_t slot_ms) {
+    uint8_t n = boot_text_len(txt);
+    return (uint16_t)MIN(100 + (uint32_t)(n ? n - 1 : 0) * slot_ms + 500 + 300 + 580 + 60, 65000);
 }
 
-// 19 FRAMEWORK scroll: the same with the full name, at an easy reading pace.
-#define BOOT_TEXT_FWK_MS 7750
-static void boot_anim_text_framework(uint16_t t) {
-    boot_text_scroll(t, "FRAMEWORK", 7, false);
-}
-
-// 21 FRAMEWORK scroll, letter colors: each letter keeps its own color as it
-// moves, F red through K violet.
-static void boot_anim_text_framework_letters(uint16_t t) {
-    boot_text_scroll(t, "FRAMEWORK", 7, true);
-}
-
-// 22 FRAMEWORK 16 scroll, letter colors.
-#define BOOT_TEXT_FWK16_MS 9450
-static void boot_anim_text_framework16(uint16_t t) {
-    boot_text_scroll(t, "FRAMEWORK 16", 7, true);
-}
-
-// 17 FW16 pop: F, W, 1, 6 pop up one at a time as big letters -- a white flash
-// cooling into the rainbow colors under them. The 6 stays, and the rest of
-// the pad sparkles in around it.
-#define BOOT_TEXT_POP_MS 2800
-#define BOOT_POP_SLOT 420
-static void boot_anim_text_pop(uint16_t t) {
-    static const char text[4] = {'F', 'w', '1', '6'};
-    int32_t           k       = ((int32_t)t - 100) / BOOT_POP_SLOT;
-    if (t < 100) k = -1;
-    if (k > 3) k = 3;
-    int32_t  dt   = (int32_t)t - 100 - k * BOOT_POP_SLOT;
-    int32_t  fill = (int32_t)t - (100 + 3 * BOOT_POP_SLOT + 500); // the sparkle finish
+static void boot_text_pop(uint16_t t, const char *txt, uint16_t slot_ms, uint8_t mode) {
+    uint8_t n = boot_text_len(txt);
+    if (!n || !slot_ms) return;
+    int32_t k = t < 100 ? -1 : MIN(((int32_t)t - 100) / slot_ms, n - 1);
+    int32_t dt   = (int32_t)t - 100 - k * slot_ms;
+    int32_t fill = (int32_t)t - (100 + (int32_t)(n - 1) * slot_ms + 500); // the sparkle finish
+    uint8_t hue  = 0;
+    if (k >= 0) {
+        uint8_t before = 0;
+        for (int32_t q = 0; q < k; q++) before += txt[q] != ' ';
+        hue = boot_letter_hue(before, boot_text_letters(txt));
+    }
+    const boot_glyph_t *g = k >= 0 ? boot_glyph(txt[k], true) : NULL;
     for (uint8_t i = 0; i < BOOT_N; i++) {
-        bool on = k >= 0 && boot_glyph_lit(boot_glyph(text[k]), boot_row[i], boot_col[i]);
-        if (on) {
+        if (g && boot_glyph_lit(g, boot_row[i], boot_col[i])) {
             uint8_t v = boot_prog(dt, 0, 70);
-            if (k < 3) v = boot_mul(v, 255 - boot_prog(dt, 340, 70)); // the last letter stays
-            boot_set(i, boot_hue[i], boot_prog(dt, 70, 150), v);
+            if (k < n - 1) v = boot_mul(v, 255 - boot_prog(dt, slot_ms - 80, 70)); // the last letter stays
+            RGB c = boot_text_rgb(mode, i, hue, boot_prog(dt, 70, 150), v);
+            if (k == n - 1 && mode != BOOT_TXT_RAINBOW) {
+                // The last letter ends in the key's own color, like the rest.
+                c = boot_rgb_lerp(c, boot_rgb_scale(boot_own[i], v), boot_prog(fill, 0, 600));
+            }
+            rgb_matrix_set_color(i, c.r, c.g, c.b);
         } else if (fill >= 0) {
             boot_spark(i, (int16_t)(fill - (int32_t)boot_rank[i] * 300 / 255));
         } else {
@@ -1625,25 +1702,107 @@ static void boot_anim_text_pop(uint16_t t) {
     }
 }
 
-// 20 FRAMEWORK flash: the letters flash one at a time in white, like a sign
+// Letters flash on for about three quarters of each period_ms, like a sign
 // spelling itself out, then the whole rainbow sputters on like neon.
-#define BOOT_TEXT_FLASH_MS 2650
-static void boot_anim_text_flash(uint16_t t) {
-    static const char text[] = "FRAmEwORK";
-    int32_t           end    = 100 + 9 * 220; // after the last letter
-    if ((int32_t)t >= end) {
-        // Neon switch-on: on, off, on, off, then steady.
+static uint16_t boot_text_flash_ms(const char *txt, uint16_t period_ms) {
+    return (uint16_t)MIN(100 + (uint32_t)boot_text_len(txt) * period_ms + 180 + 300, 65000);
+}
+
+static void boot_text_flash(uint16_t t, const char *txt, uint16_t period_ms, uint8_t mode) {
+    uint8_t n   = boot_text_len(txt);
+    int32_t end = 100 + (int32_t)n * period_ms; // after the last letter
+    if ((int32_t)t >= end || !period_ms) {
         int32_t dt = (int32_t)t - end;
-        bool    on = dt < 50 || (dt >= 90 && dt < 120) || dt >= 180;
+        bool    on = dt < 50 || (dt >= 90 && dt < 120) || dt >= 180; // on, off, on, off, steady
         for (uint8_t i = 0; i < BOOT_N; i++) boot_set(i, boot_hue[i], 255, on ? 255 : 0);
         return;
     }
-    int32_t k  = ((int32_t)t - 100) / 220;
-    int32_t dt = (int32_t)t - 100 - k * 220;
-    bool    lit_phase = t >= 100 && dt < 160;
+    int32_t k  = t < 100 ? 0 : ((int32_t)t - 100) / period_ms;
+    int32_t dt = (int32_t)t - 100 - k * period_ms;
+    bool    lit_phase = t >= 100 && dt < (int32_t)period_ms * 8 / 11;
+    uint8_t before    = 0;
+    for (int32_t q = 0; q < k; q++) before += txt[q] != ' ';
+    uint8_t             hue = boot_letter_hue(before, boot_text_letters(txt));
+    const boot_glyph_t *g   = boot_glyph(txt[k], true);
     for (uint8_t i = 0; i < BOOT_N; i++) {
-        bool on = lit_phase && boot_glyph_lit(boot_glyph(text[k]), boot_row[i], boot_col[i]);
-        boot_set(i, 0, 0, on ? 255 : 0);
+        RGB c = {0, 0, 0};
+        if (lit_phase && boot_glyph_lit(g, boot_row[i], boot_col[i])) c = boot_text_rgb(mode, i, hue, 255, 255);
+        rgb_matrix_set_color(i, c.r, c.g, c.b);
+    }
+}
+
+// --- the text animations in the table (preview only, not in the pool) ---
+
+// 17 FW16 pop
+#define BOOT_TEXT_POP_MS 2800
+static void boot_anim_text_pop(uint16_t t) {
+    boot_text_pop(t, "FW16", 420, BOOT_TXT_RAINBOW);
+}
+
+// 18 FW16 ticker
+#define BOOT_TEXT_FW16_MS 3050
+static void boot_anim_text_fw16(uint16_t t) {
+    boot_text_scroll(t, "FW16", 9, BOOT_TXT_RAINBOW);
+}
+
+// 19 FRAMEWORK ticker, at an easy reading pace
+#define BOOT_TEXT_FWK_MS 7750
+static void boot_anim_text_framework(uint16_t t) {
+    boot_text_scroll(t, "FRAMEWORK", 7, BOOT_TXT_RAINBOW);
+}
+
+// 20 FRAMEWORK flash, white
+#define BOOT_TEXT_FLASH_MS 2650
+static void boot_anim_text_flash(uint16_t t) {
+    boot_text_flash(t, "FRAMEWORK", 220, BOOT_TXT_WHITE);
+}
+
+// 21 FRAMEWORK ticker, each letter its own color
+static void boot_anim_text_framework_letters(uint16_t t) {
+    boot_text_scroll(t, "FRAMEWORK", 7, BOOT_TXT_LETTERS);
+}
+
+// 22 FRAMEWORK 16 ticker, each letter its own color
+#define BOOT_TEXT_FWK16_MS 9450
+static void boot_anim_text_framework16(uint16_t t) {
+    boot_text_scroll(t, "FRAMEWORK 16", 7, BOOT_TXT_LETTERS);
+}
+
+// --- custom text (BOOT REPLAY 0xFB) ---
+//
+// Any text sent from the host, in any style, for trying things out; it plays
+// through the normal playback, unnumbered, as variant BOOT_CTEXT.
+
+#define BOOT_CTEXT 0xF0
+#define BOOT_CTEXT_FLASH 0
+#define BOOT_CTEXT_TICKER 1
+#define BOOT_CTEXT_POP 2
+static char     boot_ctext[24];
+static uint8_t  boot_ctext_style, boot_ctext_color;
+static uint16_t boot_ctext_speed; // flash/pop: ms per letter; ticker: columns/s
+
+static uint16_t boot_ctext_ms(void) {
+    switch (boot_ctext_style) {
+        case BOOT_CTEXT_TICKER:
+            return boot_text_scroll_ms(boot_ctext, boot_ctext_speed);
+        case BOOT_CTEXT_POP:
+            return boot_text_pop_ms(boot_ctext, boot_ctext_speed);
+        default:
+            return boot_text_flash_ms(boot_ctext, boot_ctext_speed);
+    }
+}
+
+static void boot_ctext_render(uint16_t t) {
+    switch (boot_ctext_style) {
+        case BOOT_CTEXT_TICKER:
+            boot_text_scroll(t, boot_ctext, boot_ctext_speed, boot_ctext_color);
+            break;
+        case BOOT_CTEXT_POP:
+            boot_text_pop(t, boot_ctext, boot_ctext_speed, boot_ctext_color);
+            break;
+        default:
+            boot_text_flash(t, boot_ctext, boot_ctext_speed, boot_ctext_color);
+            break;
     }
 }
 
@@ -1683,6 +1842,19 @@ static const boot_anim_t boot_anims[] = {
 // pick. Every animation can be replayed by number; only these play at boot.
 static const uint8_t boot_pool[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
 #define BOOT_POOL_COUNT ((uint8_t)(sizeof(boot_pool) / sizeof(boot_pool[0])))
+
+// A variant's length and render, the custom text (BOOT_CTEXT) included.
+static uint16_t boot_variant_ms(uint8_t v) {
+    return v == BOOT_CTEXT ? boot_ctext_ms() : boot_anims[v].duration_ms;
+}
+
+static void boot_variant_render(uint8_t v, uint16_t t) {
+    if (v == BOOT_CTEXT) {
+        boot_ctext_render(t);
+    } else {
+        boot_anims[v].render(t);
+    }
+}
 
 // --- picking ---------------------------------------------------------------
 
@@ -1744,6 +1916,24 @@ static void boot_replay(const uint8_t *args) {
         return;
     }
     boot_armed = false; // a replay before the first frame replaces the boot play
+    if (args[0] == 0xFB) {
+        // Custom text: [1] style (0 flash, 1 ticker, 2 pop), [2] color (0
+        // rainbow, 1 per letter, 2 white), [3..4] speed (u16 LE: ms per letter
+        // for flash/pop, columns/s for the ticker; 0 = default), [5..] text,
+        // NUL-terminated or up to 23 characters.
+        static const uint16_t defaults[3] = {220, 7, 420};
+        boot_ctext_style = args[1] <= BOOT_CTEXT_POP ? args[1] : BOOT_CTEXT_FLASH;
+        boot_ctext_color = args[2] <= BOOT_TXT_WHITE ? args[2] : BOOT_TXT_RAINBOW;
+        boot_ctext_speed = (uint16_t)(args[3] | (args[4] << 8));
+        if (!boot_ctext_speed) boot_ctext_speed = defaults[boot_ctext_style];
+        uint8_t q = 0;
+        for (; q < sizeof(boot_ctext) - 1 && args[5 + q]; q++) boot_ctext[q] = (char)args[5 + q];
+        boot_ctext[q]   = 0;
+        boot_text_built = NULL; // same buffer, new contents
+        boot_base_seed  = boot_hash32(timer_read32());
+        boot_start(BOOT_CTEXT, 1, 1, false);
+        return;
+    }
     if (args[0] == 0xFE) {
         boot_start(boot_next_pick(), 1, 1, false);
         return;
@@ -1772,7 +1962,8 @@ static void boot_status(uint8_t *out) {
     boot_put32(out, boot_counter);
     out[4] = boot_powerup_pick;
     boot_put32(out + 5, eeconfig_read_user());
-    out[9] = sysmon_disp;
+    out[9]  = sysmon_disp;
+    out[10] = boot_playing;
 }
 
 // Variant n's name tag. Up to 9: n white dots in reading order from the
@@ -1790,7 +1981,7 @@ static void boot_render_dots(uint8_t n) {
 
 // Length of one playlist slot showing variant v.
 static uint32_t boot_slot_ms(uint8_t v) {
-    uint32_t len = boot_anims[v].duration_ms;
+    uint32_t len = boot_variant_ms(v);
     if (boot_numbered) len += BOOT_DOTS_MS + BOOT_GAP_MS + BOOT_HOLD_MS;
     return len;
 }
@@ -1819,9 +2010,9 @@ static bool boot_render(void) {
             }
             t -= BOOT_GAP_MS;
         }
-        uint16_t len = boot_anims[v].duration_ms;
+        uint16_t len = boot_variant_ms(v);
         if (t < len) {
-            boot_anims[v].render((uint16_t)t);
+            boot_variant_render(v, (uint16_t)t);
             return true;
         }
         t -= len;
