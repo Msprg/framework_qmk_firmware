@@ -651,7 +651,10 @@ static void sysmon_render_row(uint8_t row, sysmon_glide_t *g, sysmon_glide_t *gg
 // written back only after the animation, clear of USB enumeration.
 // ---------------------------------------------------------------------------
 
-#define BOOT_BRIGHTNESS 64 // 0..255, same scale as the host's brightness byte
+// 0..255, same scale as the host's brightness byte. The scale is squared on the
+// way to the global current: 33 is GCC 3, about half as bright to the eye as
+// the earlier 64 (GCC 11). (32 would truncate to GCC 2.)
+#define BOOT_BRIGHTNESS 33
 #define BOOT_HUE_START 0   // top-left: red
 #define BOOT_HUE_END 205   // bottom-right: violet (191 reads as blue on these LEDs)
 
