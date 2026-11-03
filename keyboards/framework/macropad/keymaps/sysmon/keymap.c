@@ -333,12 +333,23 @@ static const uint8_t sysmon_row_leds[6][4] = {
 // scale8() at a dim host setting. The board's ISSI_GLOBALCURRENT (185) is a
 // current-budget cap, so the host value scales within it, never above —
 // val=255 lands exactly on the stock value, which is also the idle state.
-// Safe to call mid-frame: the driver re-selects the PWM page on every flush.
 //
 // The map is val squared, not linear: PWM dimming is linear in light output,
 // but GCC dims by LED current, and LEDs convert low currents to light more
 // efficiently, so a linear map runs visibly too bright at the dim end.
-static uint8_t sysmon_gcc = ISSI_GLOBALCURRENT; // last value written to the chip
+//
+// A GCC write takes effect at once, but a PWM frame takes about 5 ms to
+// stream out (198 registers over 400 kHz I2C), and the frame is drawn over
+// five main-loop passes before that. Written at the start of a frame, as it
+// used to be, a rising GCC lit the previous frame at the new current until
+// the new PWM arrived: a visible flash when the dim boot rainbow handed over
+// to brighter bars. So a frame only requests its GCC
+// (sysmon_write_gcc), and it goes out together with the frame's PWM once the
+// frame is drawn (sysmon_gcc_commit), ordered so the in-between state is a
+// brief dip, never a flash.
+static uint8_t sysmon_gcc      = ISSI_GLOBALCURRENT; // on the chip
+static uint8_t sysmon_gcc_next = ISSI_GLOBALCURRENT; // goes out with this frame
+static uint8_t sysmon_gcc_bars = ISSI_GLOBALCURRENT; // what the bars are drawn for
 
 static uint8_t sysmon_gcc_for(uint8_t val) {
     uint8_t gcc = (uint8_t)((uint32_t)val * val * ISSI_GLOBALCURRENT / (255UL * 255));
@@ -347,10 +358,32 @@ static uint8_t sysmon_gcc_for(uint8_t val) {
 }
 
 static void sysmon_write_gcc(uint8_t gcc) {
-    if (gcc == sysmon_gcc) return;
-    sysmon_gcc = gcc;
+    sysmon_gcc_next = gcc;
+}
+
+// Called once the frame is fully drawn. Rising: send the PWM (drawn for the
+// higher current, so dimmer) first, then raise the current. Falling: lower
+// the current first, then send the PWM. Either way, keys whose PWM is out of
+// step with the current for those few ms run dim, never bright. The regular
+// flush that follows finds nothing left to send.
+static void sysmon_gcc_commit(void) {
+    uint8_t g = sysmon_gcc_next;
+    if (g == sysmon_gcc) return;
+    bool rising = g > sysmon_gcc;
+    if (rising) rgb_matrix_driver.flush();
+    sysmon_gcc = g;
     IS31FL_unlock_register(DRIVER_ADDR_1, ISSI_PAGE_FUNCTION);
-    IS31FL_write_single_register(DRIVER_ADDR_1, ISSI_REG_GLOBALCURRENT, gcc);
+    IS31FL_write_single_register(DRIVER_ADDR_1, ISSI_REG_GLOBALCURRENT, g);
+    if (!rising) rgb_matrix_driver.flush();
+}
+
+// One frame's step of the chip's current toward target: about an eighth of
+// the way there, at least 1, so each step's brief dip stays small.
+static uint8_t sysmon_gcc_toward(uint8_t target) {
+    uint8_t g = sysmon_gcc, step = MAX(g / 8, 1);
+    if (target > g) return target - g > step ? g + step : target;
+    if (target < g) return g - target > step ? g - step : target;
+    return g;
 }
 
 static void sysmon_set_gcc(uint8_t val) {
@@ -371,7 +404,7 @@ static RGB sysmon_fb[RGB_MATRIX_LED_COUNT];
 // (the fractional fade) and for the battery row's steady dim fills, which
 // would otherwise drop out entirely at low screen brightness.
 static uint16_t sysmon_visible_pwm(uint16_t pwm) {
-    uint16_t fl = 128 / sysmon_gcc;
+    uint16_t fl = 128 / MAX(sysmon_gcc_bars, 1);
     if (fl == 0) fl = 1;
     return fl + pwm * (255 - fl) / 255;
 }
@@ -2165,8 +2198,9 @@ static bool warn_preview_render(void) {
 // Coming from the boot rainbow or the warning, the bars cross-fade in over
 // SYSMON_XFADE_MS instead of cutting (the cut used to read as a dark gap,
 // with the bars gliding up from empty). The two frames ran at different
-// global currents, so the blend runs at the higher one with the dimmer
-// frame's PWM scaled down to match. From the regular effect it still cuts.
+// global currents, so the blend heads for the higher one a step per frame
+// (sysmon_gcc_toward), and each frame's PWM is scaled to the current it goes
+// out at. From the regular effect it still cuts.
 #define SYSMON_XFADE_MS 700
 static uint8_t  sysmon_xf_from = DISP_EFFECT;
 static uint32_t sysmon_xf_t0;
@@ -2179,23 +2213,30 @@ static uint8_t sysmon_xf_from_gcc(void) {
     return sysmon_gcc_for(sysmon_xf_from == DISP_BOOT ? BOOT_BRIGHTNESS : sysmon_brightness);
 }
 
-static RGB sysmon_gcc_scale(RGB c, uint8_t gcc, uint8_t gmax) {
-    return (RGB){.r = (uint8_t)((uint16_t)c.r * gcc / gmax), .g = (uint8_t)((uint16_t)c.g * gcc / gmax), .b = (uint8_t)((uint16_t)c.b * gcc / gmax)};
+// c, drawn for global current gcc, as PWM for current g (clipped at full).
+static RGB sysmon_gcc_scale(RGB c, uint8_t gcc, uint8_t g) {
+    if (gcc == g) return c;
+    g = MAX(g, 1);
+    return (RGB){.r = (uint8_t)MIN((uint16_t)c.r * gcc / g, 255), .g = (uint8_t)MIN((uint16_t)c.g * gcc / g, 255), .b = (uint8_t)MIN((uint16_t)c.b * gcc / g, 255)};
 }
 
-// Write the bars' frame, blended with the previous display while a
-// cross-fade runs. The chip is already at max(from, bars) GCC by then.
-static void sysmon_flush(uint8_t gcc_bars) {
+// Write the bars' frame for global current g, blended with the previous
+// display while a cross-fade runs. Early in the blend, while g is still
+// climbing, the bars clip a little; they barely show yet.
+static void sysmon_flush(uint8_t gcc_bars, uint8_t g) {
     if (!sysmon_xfading()) {
-        for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) rgb_matrix_set_color(i, sysmon_fb[i].r, sysmon_fb[i].g, sysmon_fb[i].b);
+        // g only differs from gcc_bars while on its way: scale down, never up
+        for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
+            RGB c = sysmon_gcc_scale(sysmon_fb[i], MIN(gcc_bars, g), g);
+            rgb_matrix_set_color(i, c.r, c.g, c.b);
+        }
         return;
     }
-    uint8_t gf   = sysmon_xf_from_gcc();
-    uint8_t gmax = MAX(MAX(gf, gcc_bars), 1);
-    uint8_t f    = ease8InOutQuad((uint8_t)(timer_elapsed32(sysmon_xf_t0) * 255 / SYSMON_XFADE_MS));
+    uint8_t gf = sysmon_xf_from_gcc();
+    uint8_t f  = ease8InOutQuad((uint8_t)(timer_elapsed32(sysmon_xf_t0) * 255 / SYSMON_XFADE_MS));
     for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
         RGB a = sysmon_xf_from == DISP_BOOT ? boot_own[i] : sysmon_warn_rgb(sysmon_warn_shown, i, sysmon_warn_el);
-        RGB o = boot_rgb_lerp(sysmon_gcc_scale(a, gf, gmax), sysmon_gcc_scale(sysmon_fb[i], gcc_bars, gmax), f);
+        RGB o = boot_rgb_lerp(sysmon_gcc_scale(a, gf, g), sysmon_gcc_scale(sysmon_fb[i], gcc_bars, g), f);
         rgb_matrix_set_color(i, o.r, o.g, o.b);
     }
 }
@@ -2209,10 +2250,8 @@ static void sysmon_flush(uint8_t gcc_bars) {
 //      SYSMON_WARN_MS after the no-data timeout
 //   5. otherwise (goodbye, warning over, or rainbow dismissed): the regular
 //      RGB effect
-bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
-    (void)led_min;
-    (void)led_max;
-
+// Every mode draws all the keys on every call (5 per frame, one per chunk).
+static bool sysmon_indicators(void) {
     static bool geometry_ready = false;
     if (!geometry_ready) {
         geometry_ready = true;
@@ -2273,8 +2312,13 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
         sysmon_xf_t0   = timer_read32();
         sysmon_disp    = DISP_SYSMON;
     }
+    // Coming from the regular effect it's a cut, so the current jumps
+    // straight there; after a cross-fade it steps, PWM scaled to match.
     uint8_t gcc_bars = sysmon_gcc_for(sysmon_slewed_val());
-    sysmon_write_gcc(sysmon_xfading() ? MAX(gcc_bars, sysmon_xf_from_gcc()) : gcc_bars);
+    uint8_t target   = sysmon_xfading() ? MAX(gcc_bars, sysmon_xf_from_gcc()) : gcc_bars;
+    uint8_t g        = sysmon_xf_from == DISP_EFFECT ? target : sysmon_gcc_toward(target);
+    sysmon_write_gcc(g);
+    sysmon_gcc_bars = gcc_bars;
 
     uint32_t glide_ms = (uint32_t)sysmon_glide_units * 4;
 
@@ -2283,9 +2327,16 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
     for (uint8_t row = 0; row < 6; row++) {
         sysmon_render_row(row, &glides[row], &ghost_glides[row], glide_ms, timeout_ms);
     }
-    sysmon_flush(gcc_bars);
+    sysmon_flush(gcc_bars, g);
 
     return false;
+}
+
+bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
+    (void)led_min;
+    bool effect = sysmon_indicators();
+    if (led_max >= RGB_MATRIX_LED_COUNT) sysmon_gcc_commit(); // the frame is complete
+    return effect;
 }
 
 #endif // RGB_MATRIX_ENABLE
