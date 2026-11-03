@@ -840,8 +840,10 @@ static uint8_t boot_lerp(uint8_t a, uint8_t b, uint8_t f) {
     return (uint8_t)(a + ((int16_t)b - a) * f / 255);
 }
 
+// QMK's RGB is laid out g, r, b (the WS2812 byte order), so an RGB must be
+// built with named fields: a positional (RGB){r, g, b} swaps red and green.
 static RGB boot_rgb_lerp(RGB a, RGB b, uint8_t f) {
-    return (RGB){boot_lerp(a.r, b.r, f), boot_lerp(a.g, b.g, f), boot_lerp(a.b, b.b, f)};
+    return (RGB){.r = boot_lerp(a.r, b.r, f), .g = boot_lerp(a.g, b.g, f), .b = boot_lerp(a.b, b.b, f)};
 }
 
 // Smooth value noise, 0..255: hashed random values every period_ms, eased
@@ -1019,7 +1021,7 @@ static void boot_anim_fire(uint16_t t) {
             amp       = boot_mul(amp, 255 - k);
         }
         v     = boot_mul(v, 255 - boot_mul(amp, boot_noise(i, t, 70)));
-        px[i] = (RGB){boot_mul(c.r, v), boot_mul(c.g, v), boot_mul(c.b, v)};
+        px[i] = (RGB){.r = boot_mul(c.r, v), .g = boot_mul(c.g, v), .b = boot_mul(c.b, v)};
     }
 
     // Embers: born at the flame tips at staggered, jittered moments, each
@@ -1145,7 +1147,7 @@ static void boot_fb_flush(void) {
 }
 
 static RGB boot_rgb_scale(RGB c, uint8_t v) {
-    return (RGB){boot_mul(c.r, v), boot_mul(c.g, v), boot_mul(c.b, v)};
+    return (RGB){.r = boot_mul(c.r, v), .g = boot_mul(c.g, v), .b = boot_mul(c.b, v)};
 }
 
 static RGB boot_hsv(uint8_t h, uint8_t s, uint8_t v) {
@@ -2178,7 +2180,7 @@ static uint8_t sysmon_xf_from_gcc(void) {
 }
 
 static RGB sysmon_gcc_scale(RGB c, uint8_t gcc, uint8_t gmax) {
-    return (RGB){(uint8_t)((uint16_t)c.r * gcc / gmax), (uint8_t)((uint16_t)c.g * gcc / gmax), (uint8_t)((uint16_t)c.b * gcc / gmax)};
+    return (RGB){.r = (uint8_t)((uint16_t)c.r * gcc / gmax), .g = (uint8_t)((uint16_t)c.g * gcc / gmax), .b = (uint8_t)((uint16_t)c.b * gcc / gmax)};
 }
 
 // Write the bars' frame, blended with the previous display while a
