@@ -11,6 +11,9 @@
                                    each named by amber dots; queues behind a replay
   bootanim_preview.py goodbye      send the host's clean-stop notice (0x04), as a
                                    stopping host would -- for testing the warning
+  bootanim_preview.py reboot [N]   restart the macropad, like replugging it, and
+                                   name the animation it picked; N times in a row,
+                                   each after the previous animation has finished
   bootanim_preview.py text TEXT [TEXT ...] [options]
                                    show text; several texts play one after another
                                    (A/B testing). See `text --help`.
@@ -35,11 +38,20 @@ MODES = {0: "rgb-effect", 1: "boot-rainbow", 2: "sysmon", 3: "warning"}
 STYLES = {"flash": 0, "ticker": 1, "pop": 2}
 COLORS = {"rainbow": 0, "letters": 1, "white": 2}
 TEXT_MAX = 23
+NAMES = ["Wipe", "Shine", "Spin", "Bloom", "Twinkle", "Rotate", "Twinkle, scatter",
+         "Fire", "Converge", "Flicker", "Lock-in", "Fireworks", "Lightning", "Stack",
+         "Spotlight", "Glitch", "FW16 pop", "FW16 scroll", "FRAMEWORK scroll",
+         "FRAMEWORK flash", "FRAMEWORK scroll, letter colours",
+         "FRAMEWORK 16 scroll, letter colours"]
+
+
+def raw_path():
+    return next((d["path"] for d in hid.enumerate(VID, PID)
+                 if d["usage_page"] == RAW_USAGE_PAGE and d["usage"] == RAW_USAGE), None)
 
 
 def open_dev():
-    path = next((d["path"] for d in hid.enumerate(VID, PID)
-                 if d["usage_page"] == RAW_USAGE_PAGE and d["usage"] == RAW_USAGE), None)
+    path = raw_path()
     if path is None:
         sys.exit("macropad not found")
     dev = hid.device()
@@ -79,6 +91,49 @@ def wait_done(dev, timeout=70.0):
         if rep is not None and not rep[21]:
             return
         time.sleep(0.2)
+
+
+def wait_for(present, timeout):
+    """Poll until the macropad's raw HID interface is (or isn't) there."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if (raw_path() is not None) == present:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def reboot_main(dev, argv):
+    """Restart the macropad N times; returns the handle to close."""
+    times = int(argv[0]) if argv else 1
+    for k in range(times):
+        dev.write(b"\x00" + bytes([0x07, 0x42, 0x11]) + bytes(29))
+        dev.close()
+        if not wait_for(False, 3):
+            sys.exit("the macropad didn't restart (firmware without REBOOT?)")
+        if not wait_for(True, 15):
+            sys.exit("the macropad didn't come back within 15 s")
+        for _ in range(40):  # Windows can list it a moment before it opens
+            try:
+                dev = open_dev()
+                break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            sys.exit("the macropad came back but can't be opened")
+        rep = None
+        for _ in range(20):  # the pick is drawn on the first frame
+            rep = replay(dev, [0xFD])
+            if rep is not None and rep[15]:
+                break
+            time.sleep(0.1)
+        pick = rep[15] if rep is not None else 0
+        name = NAMES[pick - 1] if 0 < pick <= len(NAMES) else "?"
+        print(f"restart {k + 1}/{times}: playing {pick} {name}")
+        if k + 1 < times:
+            wait_done(dev)
+            time.sleep(1.0)  # a moment on the finished rainbow
+    return dev
 
 
 def text_main(dev, argv):
@@ -141,6 +196,9 @@ def main():
     try:
         if argv[:1] == ["text"]:
             text_main(dev, argv[1:])
+            return
+        if argv[:1] == ["reboot"]:
+            dev = reboot_main(dev, argv[1:])
             return
         if argv[:1] == ["goodbye"]:
             dev.write(b"\x00" + bytes([0x07, 0x42, 0x04]) + bytes(29))
