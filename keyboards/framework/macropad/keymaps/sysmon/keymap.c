@@ -140,8 +140,13 @@ void enable_factory_mode(bool enable) {
 // GOODBYE (value_id 0x04, no payload): the host is stopping on purpose (service
 // stop, shutdown, Ctrl+C). The firmware hands over to the regular RGB effect at
 // once. Without it, frames simply stop: after the timeout the macropad shows a
-// disconnect warning (an amber triangle with a "!") for SYSMON_WARN_MS, then
-// falls back to the regular effect. The next FRAME A/B cancels either state.
+// disconnect warning (caution stripes) for SYSMON_WARN_MS, then falls back to
+// the regular effect. The next FRAME A/B cancels either state.
+//
+// REBOOT (value_id 0x11, no payload): restart the macropad as a power-up
+// would, boot animation included -- for trying the startup without
+// replugging. It goes about 300 ms after the echo; a boot pick still playing
+// is saved first, so the next start moves on to the next one.
 //
 // BOOT REPLAY (value_id 0x10) replays boot animations, for previewing and
 // tuning them. Numbered playback shows N white dots before variant N.
@@ -156,7 +161,8 @@ void enable_factory_mode(bool enable) {
 // power-up picked (1-based, 0 = none yet), and the counter as stored in
 // EEPROM (u32 LE; lags by one until this boot's animation has finished).
 // data[20] is what the display shows: 0 = regular RGB effect, 1 = boot
-// rainbow, 2 = sysmon bars, 3 = disconnect warning.
+// rainbow, 2 = sysmon bars, 3 = disconnect warning. data[21] is 1 while an
+// animation plays.
 // It never counts as host data, so it doesn't end the pre-connect rainbow.
 //
 // VIA echoes the buffer back, which serves as the ACK.
@@ -168,6 +174,7 @@ void enable_factory_mode(bool enable) {
 #define SYSMON_FRAME_C 0x03 // ghost bars, rows 0..5
 #define SYSMON_GOODBYE 0x04 // host stopping on purpose: no disconnect warning
 #define SYSMON_BOOT_REPLAY 0x10 // replay the boot animation (preview/tuning)
+#define SYSMON_REBOOT 0x11 // restart the macropad (testing the startup)
 
 #define SYSMON_ROW_BYTES 8   // per-row descriptor size in the payload
 #define SYSMON_GHOST_BYTES 4 // per-row ghost descriptor size in FRAME C
@@ -242,6 +249,7 @@ static uint8_t warn_prev_first = 0, warn_prev_last = 0; // warning-style preview
 static void boot_replay(const uint8_t *args);
 static void boot_status(uint8_t *out);
 static bool warn_prev_started;
+static uint32_t sysmon_reboot_at = 0; // nonzero: REBOOT asked for at this time
 
 // Decode one 8-byte descriptor at src into sysmon_rows[row].
 static void sysmon_decode_row(uint8_t row, const uint8_t *src) {
@@ -294,6 +302,8 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
             payload[6 * SYSMON_GHOST_BYTES] = SYSMON_GHOST_ACK;
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_GOODBYE) {
             sysmon_goodbye = true;
+        } else if (*command_id == id_custom_set_value && *value_id == SYSMON_REBOOT) {
+            sysmon_reboot_at = timer_read32() | 1; // restart once the echo is out
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_BOOT_REPLAY) {
             // Deliberately leaves sysmon_last_update alone: a preview is not
             // the host connecting.
@@ -2038,6 +2048,16 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         boot_playing   = false;
     }
     return true;
+}
+
+// REBOOT: restart a moment after the command, so its echo still goes out. The
+// boot counter is normally saved after the animation; save it now, or a
+// reboot during the animation would replay the same pick.
+void housekeeping_task_user(void) {
+    if (sysmon_reboot_at && timer_elapsed32(sysmon_reboot_at) >= 50) {
+        if (boot_counter_dirty) eeconfig_update_user(boot_counter);
+        soft_reset_keyboard();
+    }
 }
 
 // A USB suspend (sleep) silences the host for an expected reason: don't greet

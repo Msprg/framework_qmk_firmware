@@ -85,6 +85,8 @@ alongside the running service. From `host\`:
 .venv\Scripts\python.exe -I bootanim_preview.py 5        # just one
 .venv\Scripts\python.exe -I bootanim_preview.py boot     # the next power-up pick, as a boot plays it
 .venv\Scripts\python.exe -I bootanim_preview.py status   # boot counter + this power-up's pick
+.venv\Scripts\python.exe -I bootanim_preview.py reboot   # restart the macropad, like replugging it
+.venv\Scripts\python.exe -I bootanim_preview.py reboot 5 # five starts in a row, each after the last finished
 .venv\Scripts\python.exe -I bootanim_preview.py text FRAMEWORK FRAmEWORK -r 3   # A/B, three times
 .venv\Scripts\python.exe -I bootanim_preview.py text "FRAMEWORK 16" -s ticker -c letters
 ```
@@ -476,6 +478,7 @@ Three 32-byte VIA "custom set value" reports are sent per interval on channel
                0x02 = FRAME B (rows 3,4,5 + globals)
                0x03 = FRAME C (ghost bars, rows 0..5; optional)
                0x04 = GOODBYE (no payload; sent once on a clean exit)
+               0x10 = BOOT REPLAY, 0x11 = REBOOT (testing only, see below)
 [3..] payload: FRAME A/B: three back-to-back 8-byte row descriptors
                FRAME C:   six back-to-back 4-byte ghost descriptors
 
@@ -538,9 +541,14 @@ it doesn't end the pre-connect rainbow:
 echo [11..14] boot counter in RAM (u32 LE)   [15] this power-up's pick (1-based)
      [16..19] boot counter in EEPROM (u32 LE; lags by one until the boot animation ends)
      [20]     display: 0 = regular RGB effect, 1 = boot rainbow, 2 = bars, 3 = warning
-     [21]     1 while a replay is playing
+     [21]     1 while an animation is playing (the power-up one too)
 
 custom text (0xFB): [4] style 0 flash / 1 ticker / 2 pop, [5] colour 0 rainbow /
 1 per letter / 2 white, [6..7] speed (u16 LE; 0 = default), [8..] text, NUL-terminated
 or 23 characters
 ```
+
+Value `0x11` (REBOOT, no payload) restarts the macropad about 300 ms after the
+echo, exactly as a power-up would, for trying the startup without replugging
+(`bootanim_preview.py reboot`). If the boot animation is still playing, its
+pick is saved first, so the next start moves on to the next pick.
