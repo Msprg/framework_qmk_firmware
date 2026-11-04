@@ -903,6 +903,29 @@ static uint8_t boot_ease_out(uint8_t x) {
     return 255 - boot_mul(r, r);
 }
 
+// A key's color at saturation s (0 = white) and value v, for a white flash
+// cooling into it. Warm hues (red to yellow) cool the way glowing metal does,
+// through cream and orange, and fast: what is left of the extra green goes as
+// (1-s)^4, of the blue as (1-s)^8 (so blue always leads). The plain way (the
+// other channels evenly, linearly) took red through pink, and red and orange
+// keys looked pale and late next to the green ones: those keep their (very
+// bright) green and only lose red and blue, so they look colored almost at
+// once, while a red or orange key looks whitish until nearly all its extra
+// green is gone. Other hues go the plain way: a pale tint of themselves,
+// which reads as the same color. Full saturation is exactly the key's
+// rainbow color either way.
+static RGB boot_cool(uint8_t hue, uint8_t s, uint8_t v) {
+    RGB c = hsv_to_rgb((HSV){hue, 255, 255});
+    if (c.r == 255 && c.b == 0) {
+        uint8_t left2 = boot_mul(255 - s, 255 - s), left4 = boot_mul(left2, left2);
+        c.g           = (uint8_t)(c.g + boot_mul(255 - c.g, left4));
+        c.b           = boot_mul(left4, left4);
+    } else {
+        c = hsv_to_rgb((HSV){hue, s, 255});
+    }
+    return (RGB){.r = boot_mul(c.r, v), .g = boot_mul(c.g, v), .b = boot_mul(c.b, v)};
+}
+
 // a -> b by f/255, exact at both ends (lerp8by8 stops one short of b, the
 // same PWM-1 residue as scale8).
 static uint8_t boot_lerp(uint8_t a, uint8_t b, uint8_t f) {
@@ -959,7 +982,8 @@ static void boot_spark(uint8_t i, int16_t dt) {
     } else if (dt < 80) {
         boot_set(i, boot_hue[i], 0, (uint8_t)(dt * 255 / 80));
     } else {
-        boot_set(i, boot_hue[i], boot_prog(dt, 80, 500), 255);
+        RGB c = boot_cool(boot_hue[i], boot_prog(dt, 80, 500), 255);
+        rgb_matrix_set_color(i, c.r, c.g, c.b);
     }
 }
 
@@ -1654,7 +1678,7 @@ static uint8_t boot_text_len(const char *txt) {
 // The color of a lit text key in a color mode, at saturation s (0 = white).
 static RGB boot_text_rgb(uint8_t mode, uint8_t i, uint8_t letter_hue, uint8_t s, uint8_t v) {
     if (mode == BOOT_TXT_WHITE) return boot_hsv(0, 0, v);
-    return boot_hsv(mode == BOOT_TXT_LETTERS ? letter_hue : boot_hue[i], s, v);
+    return boot_cool(mode == BOOT_TXT_LETTERS ? letter_hue : boot_hue[i], s, v);
 }
 
 // --- ticker ---
