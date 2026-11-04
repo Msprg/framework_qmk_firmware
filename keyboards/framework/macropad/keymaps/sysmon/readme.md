@@ -113,9 +113,14 @@ very low PWM runs at a high current), and a timeline PNG with a column per
 frame: the display mode, the current, and a band per key (pad rows named on
 the left) colored by its light (PWM x current) relative to the trace's
 brightest moment, over a ruler in ms. Where a fade into the bars is in the
-trace, the summary also checks it: a key dipping after it had nearly reached
-its final brightness (a live bar, such as the CPU's, can move on its own and
-trip this), and the current still changing at or after the end of the fade.
+trace, the summary also checks it: a key jumping from one frame to the next
+(a step much bigger than the steps either side of it), a key going brighter or
+dimmer than both where it started and where it ends up, a key dipping after it
+had nearly reached its final brightness, and big steps of the current late in
+the fade (a live bar, such as the CPU's, can move on its own and trip the key
+checks). Notes list what is expected: whole-PWM rounding steps on keys fading
+out at a very low PWM, and the current stepping down after the fade when the
+bars are dimmer than the rainbow.
 `trace --render FILE.csv` redraws a saved trace's PNG and summary. `trace N` records
 animation N from the start and the fade after it. After a `reboot`, the ring
 starts at power-up, so a `trace` within ~13 s holds the whole startup. It shows
