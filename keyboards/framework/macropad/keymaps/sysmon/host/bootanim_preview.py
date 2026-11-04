@@ -31,6 +31,7 @@ Safe to run while the FW16Sysmon service is running: it only writes, and the
 service just drains the extra VIA echo.
 """
 import argparse
+import math
 import os
 import struct
 import sys
@@ -360,20 +361,47 @@ def trace_summary(frames):
 
 def fade_checks(frames, a, b, light):
     """Check a fade into the bars (frames a..b fading) for what has looked
-    wrong before: a key dipping after it had (nearly) reached its final
-    brightness (luminance: PWM x current, green weighted most) and coming
-    back, and the current still changing at, or after, the end."""
+    wrong before (brightness as luminance: PWM x current, green weighted
+    most): a key jumping from one frame to the next -- a step much bigger
+    than the ones either side of it, as when the current stepped under a key
+    held at full PWM, or just a big one -- a key going brighter or dimmer
+    than both where it started and where it ends up, a key dipping after it
+    had (nearly) reached its final brightness, and big steps of the current
+    late in the fade. A live bar (the CPU's, say) moves on its own and can
+    trip the first three."""
     t0, end = frames[0]["t"], frames[b]["t"]
     window = list(range(a, b + 1)) + [i for i in range(b + 1, len(frames)) if frames[i]["t"] - end <= 300]
-    ref = frames[window[-1]]
-    problems = []
+    start, ref = frames[max(a - 1, 0)], frames[window[-1]]
+    problems, rounding = [], []
     for k in range(24):
-        final = light(ref, k)
+        final, first = light(ref, k), light(start, k)
+        vals = [light(frames[i], k) for i in window]
+        top = max(vals + [first])
+        floor = max(50, 0.02 * top)  # below that the eye can't follow a step
+        steps = [math.log(v1 / v0) if min(v0, v1) >= floor else 0.0 for v0, v1 in zip(vals, vals[1:])]
+        for n, d in enumerate(steps):
+            side = max(abs(steps[n - 1]) if n else 0.0, abs(steps[n + 1]) if n + 1 < len(steps) else 0.0)
+            if abs(d) > math.log(1.5) or (abs(d) > math.log(1.12) and abs(d) > 2.5 * side):
+                f0, f1 = frames[window[n]], frames[window[n + 1]]
+                pwm = max(abs(f1["px"][k * 3 + c] - f0["px"][k * 3 + c]) for c in range(3))
+                top_pwm = max(f0["px"][k * 3:k * 3 + 3] + f1["px"][k * 3:k * 3 + 3])
+                line = f"  row {k // 4} key {k % 4} jumps {vals[n]} -> {vals[n + 1]} at {f1['t'] - t0} ms"
+                if pwm <= 2 and top_pwm <= 12:  # whole PWM steps, all it can do down there
+                    rounding.append(f"{line} (PWM {top_pwm} or less, current {f0['gcc']} -> {f1['gcc']})")
+                else:
+                    problems.append(line)
+                break
+        if min(first, final) >= 50:
+            lo_, hi_ = min(first, final), max(first, final)
+            for i, v in zip(window, vals):
+                if v < 0.9 * lo_ or v > 1.1 * hi_:
+                    problems.append(f"  row {k // 4} key {k % 4} goes to {v} at {frames[i]['t'] - t0} ms, "
+                                    f"outside its start {first} and end {final}")
+                    break
         if final < 50:
             continue
         near, peak = False, 0
-        for i in window:
-            v = light(frames[i], k)
+        for i, v in zip(window, vals):
             if not near and abs(v - final) <= 0.15 * final:
                 near = True
             if near:
@@ -382,12 +410,20 @@ def fade_checks(frames, a, b, light):
                 problems.append(f"  row {k // 4} key {k % 4} dips to {v} at {frames[i]['t'] - t0} ms "
                                 f"after nearing its final {final}")
                 break
-    changes = [frames[i]["t"] for i in window[1:] if frames[i]["gcc"] != frames[i - 1]["gcc"]]
-    if changes and end - changes[-1] < 150:
-        when = "after" if changes[-1] > end else "before"
-        problems.append(f"  the current last changes {abs(end - changes[-1])} ms {when} the fade ends "
-                        f"(want it settled 150 ms before)")
-    return ["fade checks: " + ("OK" if not problems else f"{len(problems)} problem(s)")] + problems
+    notes = rounding
+    for i in window[1:]:
+        g0, g1 = frames[i - 1]["gcc"], frames[i]["gcc"]
+        if g0 == g1 or max(g0, g1) <= 1.1 * min(g0, g1):
+            continue  # small steps go by unseen while the keys move
+        t = frames[i]["t"]
+        if t > end:
+            notes.append(f"  the current steps {g0} -> {g1} {t - end} ms after the fade (bars dimmer than "
+                         f"the rainbow: it holds the rainbow's for the fade)")
+        elif end - t < 150:
+            problems.append(f"  the current steps {g0} -> {g1} only {end - t} ms before the fade ends")
+    return (["fade checks: " + ("OK" if not problems else f"{len(problems)} problem(s)")] + problems
+            + (["fade notes (rounding at a very low PWM; the current stepping after the fade):"] + notes
+               if notes else []))
 
 
 def trace_main(dev, argv):
