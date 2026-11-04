@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Replay macropad boot animations and try out text (VIA channel 0x42, value_id 0x10).
 
-  bootanim_preview.py              numbered demo of every variant
-  bootanim_preview.py N            variant N, numbered
-  bootanim_preview.py N-M [xR]     variants N..M, numbered, R rounds
+  bootanim_preview.py              demo of every variant, each named by dots first
+  bootanim_preview.py N [xR]       variant N (R times), without the naming dots
+  bootanim_preview.py N-M [xR]     variants N..M, each named by dots, R rounds
   bootanim_preview.py boot         the next power-up pick, exactly as a boot plays it
   bootanim_preview.py stop         stop a running replay
   bootanim_preview.py status       boot counter, this power-up's pick, display mode
