@@ -168,6 +168,9 @@ void enable_factory_mode(bool enable) {
 //             value past the last variant stops a running replay)
 //   data[4] = last variant (0 = only the first)
 //   data[5] = rounds (0 = 1)
+//   data[6..7] = speed, percent of normal (u16 LE; 0 = 100; 10..1000): the
+//             animations run that much faster or slower (the dots, the dark
+//             gap before and the hold after them don't)
 //   (0xFD in data[3] changes nothing: a status query)
 // The echo carries status in data[11..]: the power-up counter (u32 LE, as
 // RAM holds it: already advanced past this boot's pick), the variant this
@@ -775,6 +778,7 @@ static uint8_t  boot_span;     // variants in the playlist
 static uint8_t  boot_count;    // playlist slots (span x rounds)
 static bool     boot_framed;   // a dark gap before and a hold after each slot
 static bool     boot_dots;     // and, before the gap, dots naming the variant
+static uint16_t boot_speed = 100; // a replay's animation speed, percent of normal
 
 static bool     boot_counter_loaded = false;
 static bool     boot_counter_dirty  = false;
@@ -1980,6 +1984,7 @@ static void boot_start(uint8_t first, uint8_t span, uint8_t rounds, bool framed)
     boot_count    = span * rounds;
     boot_framed   = framed;
     boot_dots     = framed && span > 1; // one animation needs no naming
+    boot_speed    = 100;
     boot_t0       = timer_read32();
     boot_playing  = true;
     boot_seed_slot = 0xFF; // reseed on the first frame
@@ -1987,7 +1992,8 @@ static void boot_start(uint8_t first, uint8_t span, uint8_t rounds, bool framed)
 
 // BOOT REPLAY command: args[0] = first variant (1-based; 0 = all of them,
 // 0xFE = a power-up pick, anything else past the end = stop), args[1] = last
-// variant (0 = just the first), args[2] = rounds (0 = 1).
+// variant (0 = just the first), args[2] = rounds (0 = 1), args[3..4] = speed
+// in percent (u16 LE, 0 = 100).
 static void boot_replay(const uint8_t *args) {
     if (args[0] == 0xFD) return; // status query only
     if (args[0] == 0xFC) {       // preview warning styles args[1]..args[2]
@@ -2032,6 +2038,8 @@ static void boot_replay(const uint8_t *args) {
         return;
     }
     boot_start(first - 1, last - first + 1, args[2], true);
+    uint16_t speed = (uint16_t)(args[3] | (args[4] << 8));
+    boot_speed     = speed ? MIN(MAX(speed, 10), 1000) : 100;
 }
 
 static void boot_put32(uint8_t *out, uint32_t v) {
@@ -2060,9 +2068,14 @@ static void boot_render_dots(uint8_t n) {
     for (uint8_t k = 0; k < n % 10; k++) boot_set(BOOT_KEY(1 + k / 4, k % 4), 0, 0, 255);
 }
 
+// How long variant v takes to play at the replay's speed, ms.
+static uint32_t boot_play_ms(uint8_t v) {
+    return (uint32_t)boot_variant_ms(v) * 100 / boot_speed;
+}
+
 // Length of one playlist slot showing variant v.
 static uint32_t boot_slot_ms(uint8_t v) {
-    uint32_t len = boot_variant_ms(v);
+    uint32_t len = boot_play_ms(v);
     if (boot_framed) len += (boot_dots ? BOOT_DOTS_MS : 0) + BOOT_GAP_MS + BOOT_HOLD_MS;
     return len;
 }
@@ -2093,9 +2106,10 @@ static bool boot_render(void) {
             }
             t -= BOOT_GAP_MS;
         }
-        uint16_t len = boot_variant_ms(v);
+        uint32_t len = boot_play_ms(v);
         if (t < len) {
-            boot_variant_render(v, (uint16_t)t);
+            // the animation's own clock, at the replay's speed
+            boot_variant_render(v, (uint16_t)MIN(t * boot_speed / 100, (uint32_t)boot_variant_ms(v) - 1));
             return true;
         }
         t -= len;
