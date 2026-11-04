@@ -569,9 +569,20 @@ typedef struct {
     uint32_t t0;
 } sysmon_glide_t;
 
+// Set for the first render of a fade into the bars: every bar jumps to its
+// level, so the fade heads for what the bars actually show instead of for
+// bars that are still growing from empty (or from where they stood before
+// the warning).
+static bool sysmon_glide_snap;
+
 static uint8_t sysmon_glide(sysmon_glide_t *g, uint8_t target, uint32_t glide_ms) {
     if (glide_ms == 0) glide_ms = 1;
     uint32_t now = timer_read32();
+    if (sysmon_glide_snap) {
+        g->shown = g->start = g->target = target;
+        g->t0                           = now;
+        return target;
+    }
     if (target != g->target) {
         g->start  = g->shown;
         g->target = target;
@@ -2502,10 +2513,11 @@ static bool sysmon_indicators(void) {
     }
 
     if (sysmon_disp != DISP_SYSMON) {
-        sysmon_xf_from  = sysmon_disp; // blend in from whatever was showing
-        sysmon_xf_t0    = timer_read32();
-        sysmon_xf_ready = false;
-        sysmon_disp     = DISP_SYSMON;
+        sysmon_xf_from    = sysmon_disp; // blend in from whatever was showing
+        sysmon_xf_t0      = timer_read32();
+        sysmon_xf_ready   = false;
+        sysmon_glide_snap = sysmon_xf_from != DISP_EFFECT;
+        sysmon_disp       = DISP_SYSMON;
     }
     uint8_t gcc_bars = sysmon_gcc_for(sysmon_slewed_val());
     sysmon_gcc_bars  = gcc_bars;
@@ -2517,6 +2529,7 @@ static bool sysmon_indicators(void) {
     for (uint8_t row = 0; row < 6; row++) {
         sysmon_render_row(row, &glides[row], &ghost_glides[row], glide_ms, timeout_ms);
     }
+    sysmon_glide_snap = false;
     sysmon_flush(gcc_bars); // and picks the frame's current
 
     return false;
