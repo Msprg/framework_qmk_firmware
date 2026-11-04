@@ -38,7 +38,7 @@ power-up pool (`boot_pool[]` in `keymap.c`), currently all 22:
 | 14 | Stack | colours drop in from above like falling blocks, bottom row first, each landing with a flash |
 | 15 | Spotlight | a spotlight wanders the dark pad showing the rainbow where it shines, then widens to light it all |
 | 16 | Glitch | the picture boots like a corrupted video signal until it holds clean |
-| 17 | FW16 pop | F, W, 1, 6 pop up one at a time as big letters in the rainbow colours; the rest sparkles in around the 6 |
+| 17 | FW16 pop | F, W, 1, 6 pop up one at a time as big letters in the rainbow colours; the rest sparkles in around the 6, darkest patches first, so the pad fills in evenly |
 | 18 | FW16 scroll | "FW16" scrolls through like an LED ticker, then the rainbow slides in behind it |
 | 19 | FRAMEWORK scroll | the same with "FRAMEWORK", at an easy reading pace (~7.5 s) |
 | 20 | FRAMEWORK flash | white letters flash one at a time like a sign spelling itself out, then the rainbow sputters on like neon |

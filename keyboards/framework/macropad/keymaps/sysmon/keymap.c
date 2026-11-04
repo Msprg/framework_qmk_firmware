@@ -1772,6 +1772,52 @@ static void boot_text_scroll(uint16_t t, const char *txt, uint16_t cps, uint8_t 
 
 // --- one letter at a time ---
 
+// The order the rest of the pad sparkles in around the last letter (rank
+// 0..255 per key): each next key the one whose surroundings are darkest (the
+// share of its neighbors still dark, so corners count fully), give or take a
+// random nudge. Dark patches break up from the middle and the last keys to
+// light are single gaps, never a patch. A plain shuffle often left one for
+// last -- most often around the top-left, where the top row (only a W uses
+// it) had been dark since. Worked out once per playback.
+#define BOOT_FILL_NEAR (150L * 150) // around: next to it, diagonals included (boot_px/py units)
+static const uint8_t *boot_fill_ranks(const boot_glyph_t *g) {
+    static uint8_t             rank[BOOT_N];
+    static uint32_t            for_seed;
+    static const boot_glyph_t *for_glyph = NULL;
+    if (for_glyph == g && for_seed == boot_seed) return rank;
+    bool    dark[BOOT_N];
+    uint8_t m = 0;
+    for (uint8_t i = 0; i < BOOT_N; i++) {
+        dark[i] = !(g && boot_glyph_lit(g, boot_row[i], boot_col[i]));
+        m += dark[i];
+    }
+    for (uint8_t k = 0; k < m; k++) {
+        int32_t best = -1;
+        uint8_t pick = 0;
+        for (uint8_t i = 0; i < BOOT_N; i++) {
+            if (!dark[i]) continue;
+            int32_t around = 0, still = 0;
+            for (uint8_t j = 0; j < BOOT_N; j++) {
+                int32_t dx = (int32_t)boot_px[i] - boot_px[j], dy = (int32_t)boot_py[i] - boot_py[j];
+                if (j == i || dx * dx + dy * dy > BOOT_FILL_NEAR) continue;
+                around++;
+                still += dark[j];
+            }
+            // all neighbors dark outweighs the largest nudge three times over
+            int32_t score = still * 18000 / MAX(around, 1) + (int32_t)(boot_rnd(0xF1u + i) % 6000);
+            if (score > best) {
+                best = score;
+                pick = i;
+            }
+        }
+        dark[pick] = false;
+        rank[pick] = (uint8_t)(m > 1 ? (uint16_t)k * 255 / (m - 1) : 0);
+    }
+    for_glyph = g;
+    for_seed  = boot_seed;
+    return rank;
+}
+
 // Letters pop up one at a time, slot_ms each: a white flash cooling into the
 // text color. The last stays, and the rest of the pad sparkles in around it.
 static uint16_t boot_text_pop_ms(const char *txt, uint16_t slot_ms) {
@@ -1791,7 +1837,8 @@ static void boot_text_pop(uint16_t t, const char *txt, uint16_t slot_ms, uint8_t
         for (int32_t q = 0; q < k; q++) before += txt[q] != ' ';
         hue = boot_letter_hue(before, boot_text_letters(txt));
     }
-    const boot_glyph_t *g = k >= 0 ? boot_glyph(txt[k], true) : NULL;
+    const boot_glyph_t *g    = k >= 0 ? boot_glyph(txt[k], true) : NULL;
+    const uint8_t      *rank = fill >= 0 ? boot_fill_ranks(g) : NULL;
     for (uint8_t i = 0; i < BOOT_N; i++) {
         if (g && boot_glyph_lit(g, boot_row[i], boot_col[i])) {
             uint8_t v = boot_prog(dt, 0, 70);
@@ -1803,7 +1850,7 @@ static void boot_text_pop(uint16_t t, const char *txt, uint16_t slot_ms, uint8_t
             }
             rgb_matrix_set_color(i, c.r, c.g, c.b);
         } else if (fill >= 0) {
-            boot_spark(i, (int16_t)(fill - (int32_t)boot_rank[i] * 300 / 255));
+            boot_spark(i, (int16_t)(fill - (int32_t)rank[i] * 300 / 255));
         } else {
             boot_set(i, 0, 0, 0);
         }
