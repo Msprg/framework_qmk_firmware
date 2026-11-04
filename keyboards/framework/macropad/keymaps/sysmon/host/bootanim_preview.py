@@ -4,6 +4,10 @@
   bootanim_preview.py              demo of every variant, each named by dots first
   bootanim_preview.py N [xR]       variant N (R times), without the naming dots
   bootanim_preview.py N-M [xR]     variants N..M, each named by dots, R rounds
+      --speed X                    (with any of the above, and with trace N) play
+                                   the animations X times as fast: 0.25 = at a
+                                   quarter of the speed, 2 = twice as fast
+                                   (0.1 to 10)
   bootanim_preview.py boot         the next power-up pick, exactly as a boot plays it
   bootanim_preview.py stop         stop a running replay
   bootanim_preview.py status       boot counter, this power-up's pick, display mode
@@ -433,7 +437,7 @@ def fade_checks(frames, a, b, light):
                if notes else []))
 
 
-def trace_main(dev, argv):
+def trace_main(dev, argv, speed=None):
     label = ""
     if argv[:1] == ["--render"]:  # redraw the PNG (and summary) of saved traces
         for path in argv[1:]:
@@ -449,10 +453,12 @@ def trace_main(dev, argv):
         rounds = int(argv[1].lstrip("x")) if len(argv) > 1 else 1
         label = f"anim{anim}"
         trace_cmd(dev, 3)  # start a fresh recording
-        replay(dev, [anim, 0, rounds])
-        print(f"recording animation {anim}" + (f" x{rounds}" if rounds > 1 else "") + " and the fade after it")
+        pct = speed or 100
+        replay(dev, [anim, 0, rounds, pct & 0xFF, pct >> 8])
+        print(f"recording animation {anim}" + (f" x{rounds}" if rounds > 1 else "")
+              + (f" at {pct / 100:g}x speed" if pct != 100 else "") + " and the fade after it")
         time.sleep(0.5)
-        wait_done(dev, 70.0 * rounds)
+        wait_done(dev, 70.0 * rounds * 100 / pct)
         time.sleep(1.5)  # the fade into the bars, and a little after
     frames = trace_download(dev)
     trace_cmd(dev, 3)  # record again
@@ -529,8 +535,26 @@ def parse(argv):
     return [int(arg), 0, rounds]
 
 
+def take_speed(argv):
+    """Pull --speed X out of argv: (the rest, percent for BOOT REPLAY or None)."""
+    if "--speed" not in argv:
+        return argv, None
+    i = argv.index("--speed")
+    try:
+        x = float(argv[i + 1])
+    except (IndexError, ValueError):
+        sys.exit("--speed needs a number: 0.25 = a quarter of the speed, 2 = twice as fast")
+    if not 0.1 <= x <= 10:
+        sys.exit("--speed goes from 0.1 to 10")
+    return argv[:i] + argv[i + 2:], round(x * 100)
+
+
 def main():
-    argv = sys.argv[1:]
+    argv, speed = sys.argv[1:], None
+    if argv[:1] != ["text"]:  # text's own -v/--speed is ms per letter
+        argv, speed = take_speed(argv)
+    if speed is not None and argv and not (argv[0] == "trace" or argv[0][0].isdigit()):
+        sys.exit("--speed works with replays of animations (N, N-M, all) and trace N")
     if argv[:2] == ["trace", "--render"]:  # no macropad needed
         trace_main(None, argv[1:])
         return
@@ -540,7 +564,7 @@ def main():
             text_main(dev, argv[1:])
             return
         if argv[:1] == ["trace"]:
-            trace_main(dev, argv[1:])
+            trace_main(dev, argv[1:], speed)
             return
         if argv[:1] == ["reboot"]:
             dev = reboot_main(dev, argv[1:])
@@ -550,6 +574,8 @@ def main():
             print("sent goodbye")
             return
         cmd = parse(argv)
+        if speed is not None:
+            cmd += [speed & 0xFF, speed >> 8]
         print(describe(replay(dev, cmd)))
         print(f"sent {cmd}")
     finally:

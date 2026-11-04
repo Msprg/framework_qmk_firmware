@@ -84,6 +84,7 @@ alongside the running service. From `host\`:
 .venv\Scripts\python.exe -I bootanim_preview.py          # every animation, each named by dots
 .venv\Scripts\python.exe -I bootanim_preview.py 7-12 x2  # a range, twice
 .venv\Scripts\python.exe -I bootanim_preview.py 5        # just one (5 x3: three times)
+.venv\Scripts\python.exe -I bootanim_preview.py 17 --speed 0.25  # at a quarter of the speed (0.1 to 10; trace N too)
 .venv\Scripts\python.exe -I bootanim_preview.py boot     # the next power-up pick, as a boot plays it
 .venv\Scripts\python.exe -I bootanim_preview.py status   # boot counter + this power-up's pick
 .venv\Scripts\python.exe -I bootanim_preview.py reboot   # restart the macropad, like replugging it
@@ -567,6 +568,9 @@ it doesn't end the pre-connect rainbow:
     0xFE = the next power-up pick, unnumbered; past the end = stop)
 [4] last variant (0 = only the first)
 [5] rounds (0 = 1)
+[6..7] speed, percent of normal (u16 LE; 0 = 100; 10..1000): the animations
+       play that much faster or slower; the naming dots, the dark gap before
+       and the hold after each don't change
 echo [11..14] boot counter in RAM (u32 LE)   [15] this power-up's pick (1-based)
      [16..19] boot counter in EEPROM (u32 LE; lags by one until the boot animation ends)
      [20]     display: 0 = regular RGB effect, 1 = boot rainbow, 2 = bars, 3 = warning
