@@ -160,7 +160,9 @@ void enable_factory_mode(bool enable) {
 //           (u16 LE) in data[12..13]
 //
 // BOOT REPLAY (value_id 0x10) replays boot animations, for previewing and
-// tuning them. Numbered playback shows N white dots before variant N.
+// tuning them. Each animation plays from dark and holds its finished rainbow
+// a moment; a replay of several first names each with dots (N white dots
+// before variant N), a replay of a single one (however many rounds) doesn't.
 //   data[3] = first variant, 1-based (0 = all of them; 0xFE = play the next
 //             power-up pick, unnumbered, exactly as a boot would; any other
 //             value past the last variant stops a running replay)
@@ -730,8 +732,8 @@ static void sysmon_render_row(uint8_t row, sysmon_glide_t *g, sysmon_glide_t *gg
 #define BOOT_HUE_START 0   // top-left: red
 #define BOOT_HUE_END 205   // bottom-right: violet (191 reads as blue on these LEDs)
 
-// Numbered playback (replay previews): N white dots name variant N, then a
-// short dark gap, the animation, and a hold on the finished rainbow.
+// Replay previews: a short dark gap, the animation, and a hold on the
+// finished rainbow; a replay of several first names each with N white dots.
 #define BOOT_DOTS_MS 900
 #define BOOT_GAP_MS 300
 #define BOOT_HOLD_MS 1800
@@ -771,7 +773,8 @@ static uint32_t boot_t0;
 static uint8_t  boot_first;    // first variant of the playlist (0-based)
 static uint8_t  boot_span;     // variants in the playlist
 static uint8_t  boot_count;    // playlist slots (span x rounds)
-static bool     boot_numbered; // dots + hold around each slot
+static bool     boot_framed;   // a dark gap before and a hold after each slot
+static bool     boot_dots;     // and, before the gap, dots naming the variant
 
 static bool     boot_counter_loaded = false;
 static bool     boot_counter_dirty  = false;
@@ -1968,14 +1971,15 @@ static uint8_t boot_next_pick(void) {
 
 // --- playback --------------------------------------------------------------
 
-static void boot_start(uint8_t first, uint8_t span, uint8_t rounds, bool numbered) {
+static void boot_start(uint8_t first, uint8_t span, uint8_t rounds, bool framed) {
     if (span == 0) span = 1;
     if (rounds == 0) rounds = 1;
     if (rounds > 255 / span) rounds = 255 / span; // boot_count is 8-bit
     boot_first    = first;
     boot_span     = span;
     boot_count    = span * rounds;
-    boot_numbered = numbered;
+    boot_framed   = framed;
+    boot_dots     = framed && span > 1; // one animation needs no naming
     boot_t0       = timer_read32();
     boot_playing  = true;
     boot_seed_slot = 0xFF; // reseed on the first frame
@@ -2059,7 +2063,7 @@ static void boot_render_dots(uint8_t n) {
 // Length of one playlist slot showing variant v.
 static uint32_t boot_slot_ms(uint8_t v) {
     uint32_t len = boot_variant_ms(v);
-    if (boot_numbered) len += BOOT_DOTS_MS + BOOT_GAP_MS + BOOT_HOLD_MS;
+    if (boot_framed) len += (boot_dots ? BOOT_DOTS_MS : 0) + BOOT_GAP_MS + BOOT_HOLD_MS;
     return len;
 }
 
@@ -2075,12 +2079,14 @@ static bool boot_render(void) {
             boot_seed_slot = k;
             boot_reseed(boot_hash32(boot_base_seed + k));
         }
-        if (boot_numbered) {
-            if (t < BOOT_DOTS_MS) {
-                boot_render_dots(v + 1);
-                return true;
+        if (boot_framed) {
+            if (boot_dots) {
+                if (t < BOOT_DOTS_MS) {
+                    boot_render_dots(v + 1);
+                    return true;
+                }
+                t -= BOOT_DOTS_MS;
             }
-            t -= BOOT_DOTS_MS;
             if (t < BOOT_GAP_MS) {
                 for (uint8_t i = 0; i < BOOT_N; i++) boot_set(i, 0, 0, 0);
                 return true;
@@ -2093,7 +2099,7 @@ static bool boot_render(void) {
             return true;
         }
         t -= len;
-        if (boot_numbered) {
+        if (boot_framed) {
             if (t < BOOT_HOLD_MS) {
                 boot_render_static();
                 return true;

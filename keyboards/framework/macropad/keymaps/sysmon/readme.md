@@ -81,9 +81,9 @@ prompt, since that interpreter is requireAdministrator-manifested. It is safe
 alongside the running service. From `host\`:
 
 ```powershell
-.venv\Scripts\python.exe -I bootanim_preview.py          # every animation, numbered
+.venv\Scripts\python.exe -I bootanim_preview.py          # every animation, each named by dots
 .venv\Scripts\python.exe -I bootanim_preview.py 7-12 x2  # a range, twice
-.venv\Scripts\python.exe -I bootanim_preview.py 5        # just one
+.venv\Scripts\python.exe -I bootanim_preview.py 5        # just one (5 x3: three times)
 .venv\Scripts\python.exe -I bootanim_preview.py boot     # the next power-up pick, as a boot plays it
 .venv\Scripts\python.exe -I bootanim_preview.py status   # boot counter + this power-up's pick
 .venv\Scripts\python.exe -I bootanim_preview.py reboot   # restart the macropad, like replugging it
@@ -127,9 +127,11 @@ starts at power-up, so a `trace` within ~13 s holds the whole startup. It shows
 the values sent, not the light: how the LEDs turn very low PWM at a high
 current into light, for one, it cannot show.
 
-Numbered playback names each animation with dots before it plays: up to 9,
-N white dots in reading order from the top-left key; from 10, the tens as
-cyan dots on the top row and the units as white dots from the second row.
+A replay of several animations names each with dots before it plays: up to
+9, N white dots in reading order from the top-left key; from 10, the tens as
+cyan dots on the top row and the units as white dots from the second row. A
+replay of a single animation, however many times, plays it without them.
+Either way each one starts from dark and holds its finished rainbow a moment.
 
 ## NPU on the iGPU row
 
