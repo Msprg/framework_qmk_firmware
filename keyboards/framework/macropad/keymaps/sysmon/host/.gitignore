@@ -8,3 +8,6 @@ dist/
 
 __pycache__/
 *.pyc
+
+# LED traces written by bootanim_preview.py trace.
+traces/

@@ -148,6 +148,16 @@ void enable_factory_mode(bool enable) {
 // replugging. It goes about 300 ms after the echo; a boot pick still playing
 // is saved first, so the next start moves on to the next one.
 //
+// TRACE (value_id 0x12): a flight recorder of what the LED chip was sent,
+// every frame, for checking the pad's output without seeing it (see "LED
+// trace" below; read out by bootanim_preview.py trace).
+//   data[3] = 0 status, 1 freeze, 2 read, 3 restart (clear and record again)
+//   read:   data[4..7] = byte offset (u32 LE) into the frozen frames, oldest
+//           first; the echo carries the next 24 bytes in data[8..31]
+//   others: the echo carries frames held (u16 LE) in data[8..9], the frame
+//           size in data[10], frozen in data[11], frames the ring holds
+//           (u16 LE) in data[12..13]
+//
 // BOOT REPLAY (value_id 0x10) replays boot animations, for previewing and
 // tuning them. Numbered playback shows N white dots before variant N.
 //   data[3] = first variant, 1-based (0 = all of them; 0xFE = play the next
@@ -175,6 +185,7 @@ void enable_factory_mode(bool enable) {
 #define SYSMON_GOODBYE 0x04 // host stopping on purpose: no disconnect warning
 #define SYSMON_BOOT_REPLAY 0x10 // replay the boot animation (preview/tuning)
 #define SYSMON_REBOOT 0x11 // restart the macropad (testing the startup)
+#define SYSMON_TRACE 0x12  // LED trace: freeze / read / restart
 
 #define SYSMON_ROW_BYTES 8   // per-row descriptor size in the payload
 #define SYSMON_GHOST_BYTES 4 // per-row ghost descriptor size in FRAME C
@@ -250,6 +261,7 @@ static void boot_replay(const uint8_t *args);
 static void boot_status(uint8_t *out);
 static bool warn_prev_started;
 static uint32_t sysmon_reboot_at = 0; // nonzero: REBOOT asked for at this time
+static void     sysmon_trace_cmd(uint8_t *p); // with the LED trace, below
 
 // Decode one 8-byte descriptor at src into sysmon_rows[row].
 static void sysmon_decode_row(uint8_t row, const uint8_t *src) {
@@ -304,6 +316,8 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
             sysmon_goodbye = true;
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_REBOOT) {
             sysmon_reboot_at = timer_read32() | 1; // restart once the echo is out
+        } else if (*command_id == id_custom_set_value && *value_id == SYSMON_TRACE) {
+            sysmon_trace_cmd(payload);
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_BOOT_REPLAY) {
             // Deliberately leaves sysmon_last_update alone: a preview is not
             // the host connecting.
@@ -366,10 +380,13 @@ static void sysmon_write_gcc(uint8_t gcc) {
 // the current first, then send the PWM. Either way, keys whose PWM is out of
 // step with the current for those few ms run dim, never bright. The regular
 // flush that follows finds nothing left to send.
+static uint8_t sysmon_trace_change; // this frame's GCC change, for the trace: 1 rising, 2 falling
+
 static void sysmon_gcc_commit(void) {
     uint8_t g = sysmon_gcc_next;
     if (g == sysmon_gcc) return;
-    bool rising = g > sysmon_gcc;
+    bool rising         = g > sysmon_gcc;
+    sysmon_trace_change = rising ? 1 : 2;
     if (rising) rgb_matrix_driver.flush();
     sysmon_gcc = g;
     IS31FL_unlock_register(DRIVER_ADDR_1, ISSI_PAGE_FUNCTION);
@@ -2241,6 +2258,82 @@ static void sysmon_flush(uint8_t gcc_bars, uint8_t g) {
     }
 }
 
+// --- LED trace ---------------------------------------------------------------
+
+// A flight recorder, always running: every frame as it goes to the LED chip --
+// the global current, every key's PWM, what was showing -- in a ring holding
+// the last SYSMON_TRACE_FRAMES frames (about 13 s). TRACE freezes it so the
+// host can read it out. It records the values sent, not the light: how the
+// LEDs turn those into light (very low PWM at a high current, say) is
+// outside what it can show.
+#define SYSMON_TRACE_FRAMES 768
+typedef struct {
+    uint16_t t;           // ms, the timer's low 16 bits
+    uint8_t  gcc;         // the global current the frame went out at
+    uint8_t  info;        // bits 0-1 display (DISP_*); bits 2-3 GCC change
+                          // (1 rising: PWM sent first, 2 falling: GCC first);
+                          // bit 4 cross-fading
+    uint8_t  px[6][4][3]; // PWM, pad rows top to bottom, columns left to right, R G B
+} sysmon_trace_frame_t;
+_Static_assert(sizeof(sysmon_trace_frame_t) == 76, "trace frame layout");
+
+extern uint8_t              g_pwm_buffer[DRIVER_COUNT][ISSI_MAX_LEDS]; // the driver's, as sent
+static sysmon_trace_frame_t sysmon_trace[SYSMON_TRACE_FRAMES];
+static uint16_t             sysmon_trace_head;  // the next frame to write
+static uint16_t             sysmon_trace_count; // frames held
+static bool                 sysmon_trace_frozen;
+
+// Record the frame just drawn (once per frame, after the GCC commit).
+static void sysmon_trace_frame(void) {
+    uint8_t change      = sysmon_trace_change;
+    sysmon_trace_change = 0;
+    if (sysmon_trace_frozen) return;
+    sysmon_trace_frame_t *f = &sysmon_trace[sysmon_trace_head];
+    f->t                    = (uint16_t)timer_read32();
+    f->gcc                  = sysmon_gcc;
+    f->info                 = (uint8_t)((sysmon_disp & 3) | (change << 2) | (sysmon_xfading() ? 0x10 : 0));
+    for (uint8_t r = 0; r < 6; r++) {
+        for (uint8_t c = 0; c < 4; c++) {
+            is31_led led;
+            memcpy_P(&led, &g_is31_leds[sysmon_row_leds[r][c]], sizeof(led));
+            f->px[r][c][0] = g_pwm_buffer[led.driver][led.r];
+            f->px[r][c][1] = g_pwm_buffer[led.driver][led.g];
+            f->px[r][c][2] = g_pwm_buffer[led.driver][led.b];
+        }
+    }
+    sysmon_trace_head = (uint16_t)((sysmon_trace_head + 1) % SYSMON_TRACE_FRAMES);
+    if (sysmon_trace_count < SYSMON_TRACE_FRAMES) sysmon_trace_count++;
+}
+
+// TRACE: p = data[3..]; layout in the protocol notes.
+static void sysmon_trace_cmd(uint8_t *p) {
+    if (p[0] == 2) {
+        uint32_t off = (uint32_t)p[1] | ((uint32_t)p[2] << 8) | ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 24);
+        uint32_t end = (uint32_t)sysmon_trace_count * sizeof(sysmon_trace_frame_t);
+        for (uint8_t k = 0; k < 24; k++, off++) {
+            uint8_t v = 0;
+            if (sysmon_trace_frozen && off < end) {
+                uint16_t n = (uint16_t)(off / sizeof(sysmon_trace_frame_t)); // oldest first
+                uint16_t i = (uint16_t)((sysmon_trace_head + SYSMON_TRACE_FRAMES - sysmon_trace_count + n) % SYSMON_TRACE_FRAMES);
+                v          = ((const uint8_t *)&sysmon_trace[i])[off % sizeof(sysmon_trace_frame_t)];
+            }
+            p[5 + k] = v;
+        }
+        return;
+    }
+    if (p[0] == 1) sysmon_trace_frozen = true;
+    if (p[0] == 3) {
+        sysmon_trace_count  = 0;
+        sysmon_trace_frozen = false;
+    }
+    p[5]  = (uint8_t)sysmon_trace_count;
+    p[6]  = (uint8_t)(sysmon_trace_count >> 8);
+    p[7]  = sizeof(sysmon_trace_frame_t);
+    p[8]  = sysmon_trace_frozen;
+    p[9]  = (uint8_t)SYSMON_TRACE_FRAMES;
+    p[10] = (uint8_t)(SYSMON_TRACE_FRAMES >> 8);
+}
+
 // Display priority, highest first:
 //   1. a playing boot animation (it is short; finish it even if the host
 //      connects meanwhile, and a replay preview must show over live data)
@@ -2335,7 +2428,10 @@ static bool sysmon_indicators(void) {
 bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
     (void)led_min;
     bool effect = sysmon_indicators();
-    if (led_max >= RGB_MATRIX_LED_COUNT) sysmon_gcc_commit(); // the frame is complete
+    if (led_max >= RGB_MATRIX_LED_COUNT) { // the frame is complete
+        sysmon_gcc_commit();
+        sysmon_trace_frame();
+    }
     return effect;
 }
 

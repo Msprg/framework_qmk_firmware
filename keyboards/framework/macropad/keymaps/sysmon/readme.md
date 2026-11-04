@@ -89,6 +89,8 @@ alongside the running service. From `host\`:
 .venv\Scripts\python.exe -I bootanim_preview.py reboot 5 # five starts in a row, each after the last finished
 .venv\Scripts\python.exe -I bootanim_preview.py text FRAMEWORK FRAmEWORK -r 3   # A/B, three times
 .venv\Scripts\python.exe -I bootanim_preview.py text "FRAMEWORK 16" -s ticker -c letters
+.venv\Scripts\python.exe -I bootanim_preview.py trace    # what the LEDs were sent over the last ~13 s
+.venv\Scripts\python.exe -I bootanim_preview.py trace 1  # animation 1 and the fade into the bars after it
 ```
 
 `text` shows any text (up to 23 characters: A-Z, 0-9, space, `-`, `!`, `.`)
@@ -99,6 +101,25 @@ after another, each when the previous has finished. Letter case picks the
 form: uppercase W and M are tall (they reach into the small top row, which
 keeps them from reading as an H), lowercase w and m short; every other
 letter has a single form.
+
+`trace` reads out the firmware's LED flight recorder, which always holds the
+last ~13 seconds (768 frames, one every ~16 ms) of what was sent to the LED
+chip: each frame's global current, every key's PWM, what was showing, and any
+change of the current (and in which order it went out). It writes three files
+to `host\traces\`: a CSV with every value, a summary (what showed when, every
+current change, the biggest frame-to-frame jumps on a key, stretches where a
+very low PWM runs at a high current), and a timeline PNG with a column per
+frame: the display mode, the current, and a band per key (pad rows named on
+the left) colored by its light (PWM x current) relative to the trace's
+brightest moment, over a ruler in ms. Where a fade into the bars is in the
+trace, the summary also checks it: a key dipping after it had nearly reached
+its final brightness (a live bar, such as the CPU's, can move on its own and
+trip this), and the current still changing at or after the end of the fade.
+`trace --render FILE.csv` redraws a saved trace's PNG and summary. `trace N` records
+animation N from the start and the fade after it. After a `reboot`, the ring
+starts at power-up, so a `trace` within ~13 s holds the whole startup. It shows
+the values sent, not the light: how the LEDs turn very low PWM at a high
+current into light, for one, it cannot show.
 
 Numbered playback names each animation with dots before it plays: up to 9,
 N white dots in reading order from the top-left key; from 10, the tens as
@@ -478,7 +499,7 @@ Three 32-byte VIA "custom set value" reports are sent per interval on channel
                0x02 = FRAME B (rows 3,4,5 + globals)
                0x03 = FRAME C (ghost bars, rows 0..5; optional)
                0x04 = GOODBYE (no payload; sent once on a clean exit)
-               0x10 = BOOT REPLAY, 0x11 = REBOOT (testing only, see below)
+               0x10 = BOOT REPLAY, 0x11 = REBOOT, 0x12 = TRACE (testing only, see below)
 [3..] payload: FRAME A/B: three back-to-back 8-byte row descriptors
                FRAME C:   six back-to-back 4-byte ghost descriptors
 
@@ -552,3 +573,20 @@ Value `0x11` (REBOOT, no payload) restarts the macropad about 300 ms after the
 echo, exactly as a power-up would, for trying the startup without replugging
 (`bootanim_preview.py reboot`). If the boot animation is still playing, its
 pick is saved first, so the next start moves on to the next pick.
+
+Value `0x12` (TRACE) reads out the LED flight recorder (`bootanim_preview.py
+trace`):
+
+```text
+[3] 0 = status, 1 = freeze (stop recording, so it can be read), 2 = read,
+    3 = restart (clear and record again)
+read:   [4..7] byte offset (u32 LE) into the frozen frames, oldest first;
+        echo [8..31] = the next 24 bytes
+others: echo [8..9] frames held (u16 LE), [10] frame size (76), [11] frozen,
+        [12..13] frames the ring holds (u16 LE)
+frame (76 bytes): [0..1] ms (the timer's low 16 bits), [2] global current,
+        [3] bits 0-1 display (as data[20] of BOOT REPLAY), bits 2-3 current
+        change (1 rising: PWM sent first, 2 falling: current first), bit 4
+        fading into the bars; [4..75] PWM, pad rows top to bottom, keys left
+        to right, R G B
+```
