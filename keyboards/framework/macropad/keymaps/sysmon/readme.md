@@ -52,8 +52,9 @@ the same one twice in a row. The position is a counter in the EEPROM user word
 (twinkles, fire, flicker, fireworks, lightning, glitches...) are re-randomized on
 every boot, and on every round of a replay.
 
-Once the host connects, the bars cross-fade in over the rainbow and the
-rainbow is done until the next power-up. Pressing any RGB key (Fn layer) also
+Once the host connects, the bars fade in over the rainbow, every key going
+straight from its rainbow colour to its bar colour, and the rainbow is done
+until the next power-up. Pressing any RGB key (Fn layer) also
 dismisses it, so the regular effect stays reachable without a host.
 
 If the host later goes away:
