@@ -91,7 +91,7 @@ alongside the running service. From `host\`:
 .venv\Scripts\python.exe -I bootanim_preview.py text FRAMEWORK FRAmEWORK -r 3   # A/B, three times
 .venv\Scripts\python.exe -I bootanim_preview.py text "FRAMEWORK 16" -s ticker -c letters
 .venv\Scripts\python.exe -I bootanim_preview.py trace    # what the LEDs were sent over the last ~13 s
-.venv\Scripts\python.exe -I bootanim_preview.py trace 1  # animation 1 and the fade into the bars after it
+.venv\Scripts\python.exe -I bootanim_preview.py trace 1  # animation 1 and the fade into the bars after it (trace 1 x3: three times)
 ```
 
 `text` shows any text (up to 23 characters: A-Z, 0-9, space, `-`, `!`, `.`)
