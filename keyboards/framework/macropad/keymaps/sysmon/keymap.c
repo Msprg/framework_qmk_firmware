@@ -2213,38 +2213,37 @@ static bool warn_preview_render(void) {
 
 // --- blending into the bars ------------------------------------------------
 
-// Coming from the boot rainbow or the warning, the bars cross-fade in over
-// SYSMON_XFADE_MS instead of cutting (the cut used to read as a dark gap,
-// with the bars gliding up from empty). From the regular effect it still cuts.
+// Coming from the boot rainbow or the warning, the bars fade in over
+// SYSMON_XFADE_MS instead of cutting (the cut read as a dark gap). From the
+// regular effect it still cuts.
 //
-// The two run at different global currents, so for part of the fade one of
-// them shows at a current other than its own, its PWM scaled to match. The
-// LEDs don't hold to PWM x current across currents: raising the current
-// under the still-visible rainbow flashed it brighter, and bars sitting
-// finished at the rainbow's current until it stepped down after the fade
-// looked dimmer, then corrected. So the rule is: a frame may show at a
-// current other than its own only while it is visibly moving, never once
-// it has settled -- the rainbow keeps its current until it is gone, the bars
-// have theirs before they finish (they reach full only at the very end),
-// and the blend works in light (PWM x current).
+// Each key makes its own way, straight from what it showed when the fade
+// began to what the bars want it to show now: the bars are read afresh every
+// frame, so a bar that moves meanwhile is followed, not jumped to at the end.
+// The way is a straight line in a perceptual color space (Oklab, whose
+// cube-root cone responses a lerp can run in directly), so brightness and
+// hue change evenly to the eye: a key going dark fades evenly instead of
+// lingering and then dropping, and one going from red to green passes
+// through orange, not through a dim olive.
 //
-//   bars no brighter than the rainbow: the current steps down during the
-//     fade, as soon as the fading rainbow fits under the lower one, so the
-//     bars spend the end of the fade at their own current
-//   brighter bars: the rainbow dissolves (gone by SYSMON_XF_DISSOLVE) at its
-//     own current, which only starts to climb (from SYSMON_XF_LIFT) once
-//     the rainbow is nearly gone, and reaches the bars' by
-//     SYSMON_XF_CURRENT. Each key goes first to halfway (as the eye judges
-//     brightness) between its rainbow and its bar brightness, as far as the
-//     current then allows, and from there to its bar brightness at the end,
-//     so no key dips below both on the way. A key the current can't show
-//     yet is held back, evenly over its channels so its hue stays.
+// Each frame goes out at just the global current its brightest key needs,
+// the PWM making up the rest, so no key is ever clipped (clipped keys sat
+// still while the current stepped under them: a jerk per step) and the
+// current only moves along with the light. Bars brighter than the rainbow:
+// the current rises with the brightest keys and arrives at the bars' own at
+// the end. Bars no brighter: it stays at the rainbow's for the fade and
+// steps down to the bars' after it.
 #define SYSMON_XFADE_MS 700
-#define SYSMON_XF_LIFT 0.2f
-#define SYSMON_XF_DISSOLVE 0.4f
-#define SYSMON_XF_CURRENT 0.75f
 static uint8_t  sysmon_xf_from = DISP_EFFECT;
 static uint32_t sysmon_xf_t0;
+static bool     sysmon_new_frame;                      // this call starts a frame (the first of its 5)
+static bool     sysmon_xf_ready;                       // this fade's start frame is taken
+static float    sysmon_xf_s[RGB_MATRIX_LED_COUNT][3];  // the start frame, perceptual
+static float    sysmon_xf_t[RGB_MATRIX_LED_COUNT][3];  // the bars, perceptual,
+static RGB      sysmon_xf_tc[RGB_MATRIX_LED_COUNT];    // as of these colors
+static uint8_t  sysmon_xf_tg;                          // at this current (0: none yet)
+static RGB      sysmon_xf_out[RGB_MATRIX_LED_COUNT];   // the frame's blend
+static uint8_t  sysmon_xf_g;                           // and its current
 
 static bool sysmon_xfading(void) {
     return sysmon_xf_from != DISP_EFFECT && timer_elapsed32(sysmon_xf_t0) < SYSMON_XFADE_MS;
@@ -2266,19 +2265,77 @@ static float sysmon_smooth(float u) {
     return u * u * (3 - 2 * u);
 }
 
-// The frame's current, x (0..1) of the way through the fade from current gf
-// to gb, the rainbow weighing wa (0..1) by then.
-static uint8_t sysmon_xf_gcc(float x, uint8_t gf, uint8_t gb, float wa) {
-    int g;
-    if (gb <= gf) {
-        g = (int)ceilf(wa * gf - 0.001f); // the least the rainbow still fits under
-    } else if (x < SYSMON_XF_LIFT) {
-        g = gf;
-    } else {
-        float u = sysmon_smooth((x - SYSMON_XF_LIFT) / (SYSMON_XF_CURRENT - SYSMON_XF_LIFT));
-        g       = (int)ceilf(gf * powf((float)gb / gf, u) - 0.001f); // even steps to the eye
+// Cube root: a first guess from the float's bits, then Newton. (newlib's
+// cbrtf works in soft doubles; this one runs up to 72 times a frame.)
+static float sysmon_cbrt(float x) {
+    if (x <= 0) return 0;
+    union {
+        float    f;
+        uint32_t i;
+    } u     = {.f = x};
+    u.i     = u.i / 3 + 709958130u;
+    float y = u.f;
+    for (uint8_t k = 0; k < 3; k++) y = (2 * y + x / (y * y)) * (1.0f / 3);
+    return y;
+}
+
+// c's light (PWM x current gcc) as a point in the perceptual space...
+static void sysmon_xf_to(RGB c, uint8_t gcc, float p[3]) {
+    float r = (float)c.r * gcc, g = (float)c.g * gcc, b = (float)c.b * gcc;
+    p[0]    = sysmon_cbrt(0.4122214708f * r + 0.5363325363f * g + 0.0514459929f * b);
+    p[1]    = sysmon_cbrt(0.2119034982f * r + 0.6806995451f * g + 0.1073969566f * b);
+    p[2]    = sysmon_cbrt(0.0883024619f * r + 0.2817188376f * g + 0.6299787005f * b);
+}
+
+// ...and a point back to light.
+static void sysmon_xf_light(const float p[3], float o[3]) {
+    float l = p[0] * p[0] * p[0], m = p[1] * p[1] * p[1], s = p[2] * p[2] * p[2];
+    o[0]    = MAX(4.0767416621f * l - 3.3077115913f * m + 0.2309699292f * s, 0.0f);
+    o[1]    = MAX(-1.2684380046f * l + 2.6097574011f * m - 0.3413193965f * s, 0.0f);
+    o[2]    = MAX(-0.0041960863f * l - 0.7034186147f * m + 1.7076147010f * s, 0.0f);
+}
+
+// The fade's frame (once per frame; the other calls send it again): every
+// key e of the way along its line, and the current it all goes out at.
+static void sysmon_xf_frame(uint8_t gb) {
+    uint8_t gf = sysmon_xf_from_gcc();
+    if (!sysmon_xf_ready) {
+        for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
+            RGB a = sysmon_xf_from == DISP_BOOT ? boot_own[i] : sysmon_warn_rgb(sysmon_warn_shown, i, sysmon_warn_el);
+            sysmon_xf_to(a, gf, sysmon_xf_s[i]);
+        }
+        sysmon_xf_ready = true;
     }
-    return (uint8_t)MAX(MIN(g, (int)MAX(gf, gb)), (int)MIN(gf, gb));
+    float e = sysmon_smooth((float)timer_elapsed32(sysmon_xf_t0) / SYSMON_XFADE_MS);
+    float light[RGB_MATRIX_LED_COUNT][3], top = 0;
+    for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
+        RGB b = sysmon_fb[i];
+        if (gb != sysmon_xf_tg || b.r != sysmon_xf_tc[i].r || b.g != sysmon_xf_tc[i].g || b.b != sysmon_xf_tc[i].b) {
+            sysmon_xf_to(b, gb, sysmon_xf_t[i]);
+            sysmon_xf_tc[i] = b;
+        }
+        float p[3];
+        for (uint8_t c = 0; c < 3; c++) p[c] = sysmon_xf_s[i][c] + (sysmon_xf_t[i][c] - sysmon_xf_s[i][c]) * e;
+        sysmon_xf_light(p, light[i]);
+        top = MAX(top, MAX(MAX(light[i][0], light[i][1]), light[i][2]));
+    }
+    sysmon_xf_tg = gb;
+    int g        = (int)ceilf(top / 255 - 0.001f); // the brightest key at full PWM
+    if (gb > gf) {
+        // at least what a full-PWM key going the same way would need, so it
+        // arrives at the bars' own however dim they are
+        float lo = (1 - e) * sysmon_cbrt(gf) + e * sysmon_cbrt(gb);
+        g        = MAX(g, (int)ceilf(lo * lo * lo - 0.001f));
+    } else {
+        g = MAX(g, gf);
+    }
+    g = MIN(MAX(g, 1), 255);
+    for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
+        uint8_t o[3];
+        for (uint8_t c = 0; c < 3; c++) o[c] = (uint8_t)MIN(light[i][c] / g + 0.5f, 255.0f);
+        sysmon_xf_out[i] = (RGB){.r = o[0], .g = o[1], .b = o[2]};
+    }
+    sysmon_xf_g = (uint8_t)g;
 }
 
 // Write the bars' frame, blended with the previous display while a fade
@@ -2286,9 +2343,8 @@ static uint8_t sysmon_xf_gcc(float x, uint8_t gf, uint8_t gb, float wa) {
 // bars are scaled down where the current is still above their own, never
 // up: below it they just show dimmer until the current has caught up.
 static void sysmon_flush(uint8_t gcc_bars) {
-    uint8_t g;
     if (!sysmon_xfading()) {
-        g = sysmon_xf_from == DISP_EFFECT ? gcc_bars : sysmon_gcc_toward(gcc_bars); // a cut jumps
+        uint8_t g = sysmon_xf_from == DISP_EFFECT ? gcc_bars : sysmon_gcc_toward(gcc_bars); // a cut jumps
         sysmon_write_gcc(g);
         for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
             RGB c = sysmon_gcc_scale(sysmon_fb[i], MIN(gcc_bars, g), g);
@@ -2296,35 +2352,10 @@ static void sysmon_flush(uint8_t gcc_bars) {
         }
         return;
     }
-    uint8_t gf     = sysmon_xf_from_gcc();
-    bool    rising = gcc_bars > gf;
-    float   x      = (float)timer_elapsed32(sysmon_xf_t0) / SYSMON_XFADE_MS;
-    // falling: a plain blend, the bars full only at the very end. rising:
-    // the rainbow dissolves, then the bars go on from their midpoint (p).
-    float wb = rising ? sysmon_smooth(x / SYSMON_XF_DISSOLVE) : sysmon_smooth(x);
-    float wa = 1 - wb;
-    float p  = x < SYSMON_XF_DISSOLVE ? 0 : sysmon_smooth((x - SYSMON_XF_DISSOLVE) / (1 - SYSMON_XF_DISSOLVE));
-    float gd = sysmon_xf_gcc(SYSMON_XF_DISSOLVE, gf, gcc_bars, 0); // the current once the rainbow is gone
-    g        = sysmon_xf_gcc(x, gf, gcc_bars, wa);
-    sysmon_write_gcc(g);
+    if (sysmon_new_frame || !sysmon_xf_ready) sysmon_xf_frame(gcc_bars);
+    sysmon_write_gcc(sysmon_xf_g);
     for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
-        RGB   a     = sysmon_xf_from == DISP_BOOT ? boot_own[i] : sysmon_warn_rgb(sysmon_warn_shown, i, sysmon_warn_el);
-        RGB   b     = sysmon_fb[i];
-        float la[3] = {(float)a.r * gf, (float)a.g * gf, (float)a.b * gf}; // light, PWM x current
-        float lb[3] = {(float)b.r * gcc_bars, (float)b.g * gcc_bars, (float)b.b * gcc_bars};
-        float mb    = MAX(MAX(lb[0], lb[1]), lb[2]);
-        float sb    = 1; // the bars' scale: 1 = their own light
-        if (rising && mb > 0) {
-            float ya = 0.3f * la[0] + 0.6f * la[1] + 0.1f * la[2]; // brightness, roughly as seen
-            float yb = 0.3f * lb[0] + 0.6f * lb[1] + 0.1f * lb[2];
-            float s0 = MIN(sqrtf(ya / yb), gd * 255.0f / mb); // the midpoint, as far as the current goes
-            sb       = s0 + (1 - s0) * p;
-        }
-        float m = wb * sb * mb;
-        float k = m > g * 255.0f ? g * 255.0f / m : 1.0f; // hold a too-bright key back evenly
-        uint8_t out[3];
-        for (uint8_t c = 0; c < 3; c++) out[c] = (uint8_t)MIN((wa * la[c] + k * wb * sb * lb[c]) / g + 0.5f, 255.0f);
-        rgb_matrix_set_color(i, out[0], out[1], out[2]);
+        rgb_matrix_set_color(i, sysmon_xf_out[i].r, sysmon_xf_out[i].g, sysmon_xf_out[i].b);
     }
 }
 
@@ -2471,9 +2502,10 @@ static bool sysmon_indicators(void) {
     }
 
     if (sysmon_disp != DISP_SYSMON) {
-        sysmon_xf_from = sysmon_disp; // blend in from whatever was showing
-        sysmon_xf_t0   = timer_read32();
-        sysmon_disp    = DISP_SYSMON;
+        sysmon_xf_from  = sysmon_disp; // blend in from whatever was showing
+        sysmon_xf_t0    = timer_read32();
+        sysmon_xf_ready = false;
+        sysmon_disp     = DISP_SYSMON;
     }
     uint8_t gcc_bars = sysmon_gcc_for(sysmon_slewed_val());
     sysmon_gcc_bars  = gcc_bars;
@@ -2491,8 +2523,8 @@ static bool sysmon_indicators(void) {
 }
 
 bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
-    (void)led_min;
-    bool effect = sysmon_indicators();
+    sysmon_new_frame = led_min == 0;
+    bool effect      = sysmon_indicators();
     if (led_max >= RGB_MATRIX_LED_COUNT) { // the frame is complete
         sysmon_gcc_commit();
         sysmon_trace_frame();
