@@ -14,8 +14,10 @@
   bootanim_preview.py reboot [N]   restart the macropad, like replugging it, and
                                    name the animation it picked; N times in a row,
                                    each after the previous animation has finished
-  bootanim_preview.py trace [N]    save what the LED chip was sent, frame by frame:
-                                   the last ~13 s, or (with N) animation N and
+  bootanim_preview.py trace [N [xR]]
+                                   save what the LED chip was sent, frame by frame:
+                                   the last ~13 s, or (with N) animation N (R
+                                   times; the recording keeps the last ~13 s) and
                                    the fade into the bars after it. Writes a CSV,
                                    a summary and a timeline PNG to host/traces/
   bootanim_preview.py text TEXT [TEXT ...] [options]
@@ -222,7 +224,8 @@ def trace_png(frames, path):
     red falling) and the global current as a bar; then a band per key, pad
     rows top to bottom (named on the left), keys left to right, colored by
     light (PWM x current) relative to the trace's brightest, gamma 2.2; a
-    ruler (ticks every 50 ms, tall and labeled every 250 ms) at the bottom."""
+    ruler (ticks every 50 ms, tall and labeled every 250 ms, or every 500 ms
+    or more where the labels would run together) at the bottom."""
     n = len(frames)
     fw = max(1, min(6, 1800 // max(n, 1)))
     left, sc = 38, 2  # label margin; font scale
@@ -279,10 +282,14 @@ def trace_png(frames, path):
                 for dx in range(fw):
                     put(left + i * fw + dx, y + dy, rgb)
         if kind == "ruler":
+            # labels every 250 ms, or less often where they would run together
+            span = max(frames[-1]["t"] - t0, 1)
+            wide = (len(str(span)) * 4 * sc + 8) * span / (n * fw)  # ms one label needs
+            every = next((e for e in (250, 500, 1000, 2000, 5000) if e >= wide), 10000)
             mark = 0
             for i, f in enumerate(frames):
                 while f["t"] - t0 >= mark:
-                    tall = mark % 250 == 0
+                    tall = mark % every == 0
                     for dy in range(bh if tall else 3):
                         put(left + i * fw, y + dy, (255, 255, 255) if tall else (130, 130, 130))
                     if tall:
@@ -439,12 +446,13 @@ def trace_main(dev, argv):
         return
     if argv:
         anim = int(argv[0])
+        rounds = int(argv[1].lstrip("x")) if len(argv) > 1 else 1
         label = f"anim{anim}"
         trace_cmd(dev, 3)  # start a fresh recording
-        replay(dev, [anim, 0, 1])
-        print(f"recording animation {anim} and the fade after it")
+        replay(dev, [anim, 0, rounds])
+        print(f"recording animation {anim}" + (f" x{rounds}" if rounds > 1 else "") + " and the fade after it")
         time.sleep(0.5)
-        wait_done(dev)
+        wait_done(dev, 70.0 * rounds)
         time.sleep(1.5)  # the fade into the bars, and a little after
     frames = trace_download(dev)
     trace_cmd(dev, 3)  # record again
