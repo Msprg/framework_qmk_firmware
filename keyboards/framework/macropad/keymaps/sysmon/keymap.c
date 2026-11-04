@@ -2124,6 +2124,20 @@ void housekeeping_task_user(void) {
     }
 }
 
+// Restarting (REBOOT, or a reset into the bootloader): go dark first. The LED
+// chip keeps its registers through the MCU's reset, and the restart switches
+// it back on at the stock current before the first frame is sent, so the
+// last frame (the rainbow's full PWM, meant for a current of 3) flashed up at
+// that current. The current goes to 0 at once, then the PWM is cleared, so
+// the restart finds nothing to show.
+void shutdown_user(void) {
+    IS31FL_unlock_register(DRIVER_ADDR_1, ISSI_PAGE_FUNCTION);
+    IS31FL_write_single_register(DRIVER_ADDR_1, ISSI_REG_GLOBALCURRENT, 0);
+    sysmon_gcc = sysmon_gcc_next = 0;
+    rgb_matrix_set_color_all(0, 0, 0);
+    rgb_matrix_driver.flush();
+}
+
 // A USB suspend (sleep) silences the host for an expected reason: don't greet
 // the wake-up with a disconnect warning. The next frame clears this.
 void suspend_power_down_user(void) {
