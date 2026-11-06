@@ -56,7 +56,7 @@ NAMES = ["Wipe", "Shine", "Spin", "Bloom", "Twinkle", "Rotate", "Twinkle, scatte
          "Fire", "Converge", "Flicker", "Lock-in", "Fireworks", "Lightning", "Stack",
          "Spotlight", "Glitch", "FW16 pop", "FW16 scroll", "FRAMEWORK scroll",
          "FRAMEWORK flash", "FRAMEWORK scroll, letter colours",
-         "FRAMEWORK 16 scroll, letter colours"]
+         "FRAMEWORK16 scroll, letter colours"]
 
 
 def raw_path():

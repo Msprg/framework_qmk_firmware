@@ -1917,10 +1917,11 @@ static void boot_anim_text_framework_letters(uint16_t t) {
     boot_text_scroll(t, "FRAMEWORK", 7, BOOT_TXT_LETTERS);
 }
 
-// 22 FRAMEWORK 16 ticker, each letter its own color
-#define BOOT_TEXT_FWK16_MS 9450
+// 22 FRAMEWORK16 ticker, each letter its own color (no space: the step from
+// letters to digits is clear enough, and a gap there looked like the end)
+#define BOOT_TEXT_FWK16_MS 9050
 static void boot_anim_text_framework16(uint16_t t) {
-    boot_text_scroll(t, "FRAMEWORK 16", 7, BOOT_TXT_LETTERS);
+    boot_text_scroll(t, "FRAMEWORK16", 7, BOOT_TXT_LETTERS);
 }
 
 // --- custom text (BOOT REPLAY 0xFB) ---
