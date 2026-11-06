@@ -43,7 +43,7 @@ power-up pool (`boot_pool[]` in `keymap.c`), currently all 22:
 | 19 | FRAMEWORK scroll | the same with "FRAMEWORK", at an easy reading pace (~7.5 s) |
 | 20 | FRAMEWORK flash | white letters flash one at a time like a sign spelling itself out, then the rainbow sputters on like neon |
 | 21 | FRAMEWORK scroll, letter colours | each letter keeps its own colour as it moves, F red through K violet |
-| 22 | FRAMEWORK 16 scroll, letter colours | the same with "FRAMEWORK 16" (~9.5 s) |
+| 22 | FRAMEWORK16 scroll, letter colours | the same with "FRAMEWORK16" (~9 s) |
 
 Each power-up picks one from a shuffle bag: every cycle of power-ups (one per
 pooled animation) plays each pooled animation once, in a fresh order, never
@@ -90,7 +90,7 @@ alongside the running service. From `host\`:
 .venv\Scripts\python.exe -I bootanim_preview.py reboot   # restart the macropad, like replugging it
 .venv\Scripts\python.exe -I bootanim_preview.py reboot 5 # five starts in a row, each after the last finished
 .venv\Scripts\python.exe -I bootanim_preview.py text FRAMEWORK FRAmEWORK -r 3   # A/B, three times
-.venv\Scripts\python.exe -I bootanim_preview.py text "FRAMEWORK 16" -s ticker -c letters
+.venv\Scripts\python.exe -I bootanim_preview.py text FRAMEWORK16 -s ticker -c letters
 .venv\Scripts\python.exe -I bootanim_preview.py trace    # what the LEDs were sent over the last ~13 s
 .venv\Scripts\python.exe -I bootanim_preview.py trace 1  # animation 1 and the fade into the bars after it (trace 1 x3: three times)
 ```
