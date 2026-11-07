@@ -219,9 +219,16 @@ def probe_device():
 def probe_firmware():
     """Does the attached module answer on the sysmon channel?
 
-    Sends one FRAME A with everything zeroed -- a legal, invisible frame -- and
-    reads VIA's echo back. Stock Framework firmware ignores an unknown custom
-    channel, so a silent device means 'not running sysmon', not 'broken'.
+    Sends a BOOT REPLAY status query (0xFD), which changes nothing on the pad,
+    and reads VIA's echo back. Not a frame: any FRAME A counts as the host
+    connecting -- it ends the pre-connect rainbow, and with no service behind
+    it the pad would go dark and then show the disconnect warning; with the
+    service running, the rows it carries would drop to empty for a tick.
+
+    Stock VIA firmware echoes a channel it doesn't know with id_unhandled in
+    data[0]; firmware without VIA doesn't answer at all. Either means 'not
+    running sysmon', not 'broken'. Any sysmon firmware echoes the query intact,
+    and current firmware adds its capability bits (CAPS_OFFSET).
     """
     try:
         import hid
@@ -241,28 +248,20 @@ def probe_firmware():
         dev = hid.device()
         dev.open_path(path)
         dev.set_nonblocking(True)
-        probe = bytearray(eng.REPORT_LEN)
-        probe[0] = eng.VIA_CMD_CUSTOM_SET_VALUE
-        probe[1] = eng.SYSMON_CHANNEL
-        probe[2] = eng.SYSMON_VALUE_FRAME_A
-        dev.write(b"\x00" + bytes(probe))
-        import time
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
-            reply = dev.read(eng.REPORT_LEN)
-            if reply:
-                if len(reply) > 1 and reply[1] == eng.SYSMON_CHANNEL:
-                    return _probe_ghost_support(dev, eng)
-                return Result(
-                    "firmware", "sysmon firmware", DEGRADED,
-                    "device answered VIA but not on the sysmon channel",
-                    "Flash the bundled firmware (--flash).")
-            time.sleep(0.02)
-        return Result(
-            "firmware", "sysmon firmware", MISSING,
-            "no reply on channel 0x42",
-            "The macropad is not running sysmon firmware. Flash the bundled "
-            "image (--flash), or tick the flashing option in the installer.")
+        reply = _query(dev, eng, eng.SYSMON_VALUE_BOOT_REPLAY,
+                       bytes([eng.BOOT_STATUS_QUERY]), eng.LIGHTING_OFFSET + 1)
+        if reply is None:
+            return Result(
+                "firmware", "sysmon firmware", MISSING,
+                "no reply on channel 0x42",
+                "The macropad is not running sysmon firmware. Flash the bundled "
+                "image (--flash), or tick the flashing option in the installer.")
+        if reply[0] != eng.VIA_CMD_CUSTOM_SET_VALUE:  # id_unhandled
+            return Result(
+                "firmware", "sysmon firmware", DEGRADED,
+                "device answered VIA but not on the sysmon channel",
+                "Flash the bundled firmware (--flash).")
+        return _firmware_result(eng, reply)
     except Exception as err:
         return Result("firmware", "sysmon firmware", MISSING, str(err),
                       "Could not talk to the macropad's raw-HID endpoint.")
@@ -274,78 +273,62 @@ def probe_firmware():
             pass
 
 
-def _probe_ack(dev, eng, value_id, offset, ack):
-    """Send an empty report of value_id; True if its echo carries ack at offset.
+def _query(dev, eng, value_id, payload=b"", min_len=3):
+    """Send one sysmon-channel report of value_id; return its echo, or None
+    if none comes within a second.
 
-    Older firmware echoes such a report unchanged. Other echoes can arrive
-    first (a running service gets them too), so only this value's echo counts.
+    A running service's echoes reach this handle too, so only the echo of
+    this value counts (matched on channel and value; data[0] is left for the
+    caller, as VIA marks a channel it doesn't know there). An I/O error is
+    raised, not taken for silence: a failing handle is a different diagnosis
+    from firmware that doesn't answer.
     """
     import time
     probe = bytearray(eng.REPORT_LEN)
     probe[0] = eng.VIA_CMD_CUSTOM_SET_VALUE
     probe[1] = eng.SYSMON_CHANNEL
     probe[2] = value_id
-    try:
-        dev.write(b"\x00" + bytes(probe))
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
-            reply = dev.read(eng.REPORT_LEN)
-            if (reply and len(reply) > offset
-                    and reply[1] == eng.SYSMON_CHANNEL and reply[2] == value_id):
-                return reply[offset] == ack
-            if not reply:
-                time.sleep(0.02)
-    except Exception:
-        pass
-    return False
+    probe[3:3 + len(payload)] = payload
+    dev.write(b"\x00" + bytes(probe))
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        reply = dev.read(eng.REPORT_LEN)
+        if not reply:
+            time.sleep(0.02)
+        elif (len(reply) >= max(min_len, 3) and reply[1] == eng.SYSMON_CHANNEL
+                and reply[2] == value_id):
+            return reply
+    return None
 
 
-def _probe_ghost_support(dev, eng):
-    """The module runs sysmon firmware; does it draw ghost bars and messages?
+def _firmware_result(eng, status):
+    """The module runs sysmon firmware; what can it do, and is it lit?
 
-    An all-zero FRAME C (legal: no ghosts) and an empty MESSAGE (a probe: it
-    shows nothing) each come back marked by firmware that has the feature.
-    Without that check, older firmware fails silently: the iGPU row just never
-    shows the NPU, and limits are never named.
+    status is the echo of the BOOT REPLAY status query. Current firmware
+    reports its features there, and whether its RGB lighting is on, without
+    anything being drawn. Firmware from before that byte predates this host
+    and is told to reflash.
     """
-    ghosts = _probe_ack(dev, eng, eng.SYSMON_VALUE_FRAME_C,
-                        eng.GHOST_ACK_OFFSET, eng.GHOST_ACK)
-    messages = _probe_ack(dev, eng, eng.SYSMON_VALUE_MESSAGE,
-                          eng.MSG_ACK_OFFSET, eng.MSG_ACK)
-    if ghosts and messages:
-        if _probe_ack(dev, eng, eng.SYSMON_VALUE_FRAME_C,
-                      eng.GHOST_FLAGS_ACK_OFFSET, eng.GHOST_FLAGS_ACK):
-            return Result("firmware", "sysmon firmware", OK,
-                          "device acknowledged channel 0x42; draws ghost bars, "
-                          "limit messages and the dGPU sleep marker")
-        detail = ("device acknowledged channel 0x42; draws ghost bars and limit "
-                  "messages, but predates the dGPU sleep marker")
-        if _dgpu_power() is None:
-            return Result("firmware", "sysmon firmware", OK,
-                          detail + " (only needed with a dGPU; none found here)")
-        return Result("firmware", "sysmon firmware", DEGRADED, detail,
-                      "The dGPU row can't show when the dGPU is powered off. "
-                      "Flash the bundled firmware (--flash).")
-    if not messages:
-        return Result("firmware", "sysmon firmware", DEGRADED,
-                      "device acknowledged channel 0x42; firmware predates "
-                      "limit messages" + ("" if ghosts else " and ghost bars"),
-                      "The CPU/dGPU rows still breathe on a limit, but the pad "
-                      "can't name it. Flash the bundled firmware (--flash).")
-    # Messages but no ghosts can't happen (ghosts are older); kept for safety.
-    # Only worth flagging where a ghost would actually be drawn.
-    detail = "device acknowledged channel 0x42; firmware predates ghost bars"
-    try:
-        has_npu = bool(eng.compute_only_adapter_luids())
-    except Exception:
-        has_npu = False
-    if not has_npu:
-        return Result("firmware", "sysmon firmware", OK,
-                      detail + " (only needed with an NPU; none here)")
-    return Result("firmware", "sysmon firmware", DEGRADED, detail,
-                  "This machine has an NPU, which the iGPU row shows as a "
-                  "ghost bar that this firmware cannot draw. Flash the bundled "
-                  "firmware (--flash).")
+    caps = status[eng.CAPS_OFFSET]
+    if not caps & eng.CAPS_VALID:
+        # Older sysmon firmware: whatever else it can draw, it predates this
+        # host's fixes (its replay key also sends Clear to the computer, it
+        # can't report the pad switched dark, ...), so it wants the bundled
+        # image. Not probed feature by feature: those probes send frames.
+        return Result(
+            "firmware", "sysmon firmware", DEGRADED,
+            "device runs older sysmon firmware, from before this version",
+            "Flash the bundled firmware (--flash) to match this host.")
+    # Firmware with the capability byte is this version's, which has every
+    # feature (SYSMON_CAPS), so the bits need no reading here.
+    if not status[eng.LIGHTING_OFFSET]:
+        return Result(
+            "firmware", "sysmon firmware", DEGRADED,
+            "device runs sysmon firmware, but its RGB lighting is switched off",
+            eng.LIGHTING_OFF_NOTE + ".")
+    return Result("firmware", "sysmon firmware", OK,
+                  "device acknowledged channel 0x42; draws ghost bars, limit "
+                  "messages and the dGPU sleep marker")
 
 
 def probe_ryzenadj():
@@ -437,21 +420,16 @@ def probe_ring0():
         f"{'on' if blocklist else 'off'} (WinRing0 loads on this machine)")
 
 
-def _dgpu_power():
-    """The dGPU's power state as the engine reads it, or None (no dGPU found)."""
-    try:
-        eng = paths.engine_module()
-        return eng.DgpuPower(eng.build_parser().get_default("dgpu_match")).state()
-    except Exception:
-        return None
-
-
 def probe_dgpu_power():
     """Is the dGPU powered off? (the dGPU row's last key shows D3cold)
 
     Runs before probe_nvml: NVML initialisation wakes a powered-off dGPU.
     """
-    state = _dgpu_power()
+    try:
+        eng = paths.engine_module()
+        state = eng.DgpuPower(eng.build_parser().get_default("dgpu_match")).state()
+    except Exception:
+        state = None
     if state is None:
         return Result("dgpu_power", "dGPU power state", NA,
                       "no dGPU found among the display adapters")
@@ -617,8 +595,9 @@ def probe_temperature():
     lhm = ryzen = None
     try:
         with _quiet():
+            wmi_src = eng.WmiSources()
             lhm = eng.LhmLibSource(enabled=True)
-            lhm_temp = lhm.snapshot()[0] if lhm.available else None
+            lhm_temp = eng.lhm_reading(lhm, wmi_src)[0]  # gather()'s own rule
         readings.append(("LibreHardwareMonitor", lhm_temp))
 
         # Same order gather() uses: EC before Tctl (see the note there).
@@ -632,7 +611,7 @@ def probe_temperature():
         readings.append(("ryzenadj Tctl", eng.RyzenAdjSource.temperature(snap)))
 
         with _quiet():
-            acpi = eng.WmiSources().acpi_temperature()
+            acpi = wmi_src.acpi_temperature()
         readings.append(("ACPI zone", acpi))
     finally:
         for src in (lhm, ryzen):
@@ -791,6 +770,7 @@ def probe_config():
     known = {s.name: s for s in config.SCHEMA}
     applied = 0
     bad = []
+    parsed = {}
     for section in ini.sections():
         for key, raw in ini.items(section):
             if section == "cli":
@@ -801,10 +781,20 @@ def probe_config():
                 bad.append(f"{key} (unknown)")
                 continue
             try:
-                config._parse(setting, raw)
+                parsed[key] = config._parse(setting, raw)
                 applied += 1
             except ValueError as err:
                 bad.append(f"{key} ({err})")
+    # config.apply's own rule: a pair the file leaves crossed reverts, both
+    # of it. (A pair the file doesn't touch is the built-in default's.)
+    for lo_name, hi_name, lo, hi in config.crossed_pairs(
+            lambda n: parsed.get(n, config.builtin_value(n))):
+        # one entry per setting of the file that is ignored, as above
+        for name in (lo_name, hi_name):
+            if name in parsed:
+                bad.append(f"{name} ({lo_name} {lo} is not below "
+                           f"{hi_name} {hi}; both keep their defaults)")
+                applied -= 1
     if bad:
         return Result("config", "Settings file", DEGRADED,
                       f"{applied} setting(s) OK, {len(bad)} ignored: "
@@ -879,6 +869,8 @@ def probe_service():
         return Result("service", "Service", DEGRADED, str(err))
     if state is None:
         return Result("service", "Service", NA, "not installed")
+    if state == "unknown":
+        return Result("service", "Service", DEGRADED, service.query_error())
     return Result("service", "Service", OK if state == "running" else DEGRADED,
                   f"{service.SERVICE_NAME} is {state}")
 

@@ -37,18 +37,23 @@ APU limit detection (CPU-row breathe, and the message naming the limit):
     2. LibreHardwareMonitor package-power plateau heuristic (fallback)
 The dGPU's come from NVML's throttle reasons. See LIMIT_KINDS, LimitTracker.
 
-Temperature sources, tried in order:
-    1. LibreHardwareMonitorLib in-process via pythonnet (run --fetch-lhm)
-    2. ryzenadj Tctl (in-process; free once libryzenadj is loaded for limits)
-    3. LibreHardwareMonitor WMI provider (only if its app is running)
-    4. Framework EC via framework_tool --thermal (throttled; temperature only)
-    5. ACPI thermal zone (MSAcpi_ThermalZoneTemperature; static on the FW16,
-       so only a last resort)
+Temperature sources, tried in order (gather(); --selftest's temperature probe
+walks the same chain):
+    1. LibreHardwareMonitor: the in-process LibreHardwareMonitorLib via
+       pythonnet (run --fetch-lhm), else its WMI provider (only while the LHM
+       app is running)
+    2. Framework EC via framework_tool --thermal (throttled, TTL_EC_THERMAL)
+    3. ryzenadj Tctl (in-process; free once libryzenadj is loaded for limits).
+       Deliberately after the EC: a wrong SMU-table decode returns a plausible
+       number instead of failing (see the note in gather())
+    4. ACPI thermal zone (MSAcpi_ThermalZoneTemperature, cached TTL_TEMP;
+       static on the FW16, so only a last resort)
 
 The ring0 sources (ryzenadj, LibreHardwareMonitorLib) need the script elevated.
 
-Run it in a console first to verify, then schedule with Task Scheduler
-(pythonw.exe) to have it start at login. No service needed.
+Installed, it runs as the FW16Sysmon boot-start service (service.py, set up by
+the installer or --install-service). Run it in an elevated console to try it
+out; stop the service first, as the macropad has a single raw-HID endpoint.
 """
 
 import argparse
@@ -102,9 +107,10 @@ REPORT_LEN = 32
 #   data[2] = value_id
 #   data[3..] = payload
 #
-# Two FRAME reports per tick:
+# Three FRAME reports per tick:
 #   value_id 0x01 = FRAME A : rows 0,1,2          (24-byte payload, 5 pad bytes)
 #   value_id 0x02 = FRAME B : rows 3,4,5 + globals (24-byte payload + globals)
+#   value_id 0x03 = FRAME C : ghost bars (optional; described below)
 #
 # Per-row descriptor = EXACTLY 8 bytes:
 #   +0 level         uint8 0..255 fraction of the 4-segment bar (0=empty,255=full)
@@ -138,20 +144,32 @@ REPORT_LEN = 32
 #             last key; level 63 = the last key alone), bits1-7 reserved (0)
 #   Firmware without ghost support ignores value_id 0x03; firmware with it
 #   fades the ghosts out if FRAME C stops arriving within the timeout, and sets
-#   data[27] = 0x01 in its FRAME C echo (older firmware echoes it unchanged),
-#   which is how --selftest tells whether a reflash is needed. Firmware that
-#   reads the flags also sets data[28] = 0x01; a right-anchored ghost is only
-#   sent once that has been seen (without it, it would show at the left end).
+#   data[27] = 0x01 in its FRAME C echo (older firmware echoes it unchanged).
+#   Firmware that reads the flags also sets data[28] = 0x01; a right-anchored
+#   ghost is only sent once that has been seen (without it, it would show at
+#   the left end). --selftest reads features from the BOOT REPLAY capability
+#   byte instead, and sends no frames.
 #
 # MESSAGE (value_id 0x05, sent only when there is something to say): a line
 #   of text the firmware scrolls over the bars -- the bars dim out, the text
 #   scrolls through on dark, the bars fade back in:
 #   data[3] style (0 = ticker), data[4] hue, data[5] saturation (0 = white),
-#   data[6] speed in columns/s (0 = firmware default), data[7] reserved,
+#   data[6] speed in columns/s (0 = firmware default), data[7] sequence
+#   number (1..255, 0 = none; reported back in the FRAME B echo),
 #   data[8..30] text, NUL-terminated (up to 23 chars). Empty text is a probe:
-#   message-capable firmware sets data[31] = 0x01 in the echo.
+#   message-capable firmware sets data[31] = 0x01 in the echo (exactly: older
+#   hosts compare it for equality), and firmware that reports message outcomes
+#   by sequence number also data[9] = 0x02 in the probe's echo.
 #   The FRAME B echo's data[31] reports bit0 = a message is waiting or
-#   playing, bit1 = the replay key was pressed (answer with a MESSAGE).
+#   playing, bit1 = the replay key was pressed (answer with a MESSAGE),
+#   bit2 = the pad's RGB lighting is switched off (nothing sent shows),
+#   bit4 = the pad is suspended (lid closed): nothing shows. data[30] is the
+#   sequence number (MESSAGE data[7]) of the last message played to its end,
+#   data[29] that of the last one dropped unplayed (0 = none).
+#
+# BOOT REPLAY (value_id 0x10) with data[3] = 0xFD is a status query that
+# changes nothing; its echo carries data[23] = capability bits (bit7 set on
+# firmware that has them) and data[24] = 1 while the RGB lighting is on.
 # ---------------------------------------------------------------------------
 
 VIA_CMD_CUSTOM_SET_VALUE = 0x07
@@ -161,12 +179,12 @@ SYSMON_VALUE_FRAME_B = 0x02  # rows 3,4,5 + globals
 SYSMON_VALUE_FRAME_C = 0x03  # ghost bars, rows 0..5
 SYSMON_VALUE_GOODBYE = 0x04  # host stopping on purpose: no disconnect warning
 SYSMON_VALUE_MESSAGE = 0x05  # a line of text scrolled over the bars
+SYSMON_VALUE_BOOT_REPLAY = 0x10  # boot animation replay / status (not sent by the loop)
+BOOT_STATUS_QUERY = 0xFD     # BOOT REPLAY data[3]: report status, change nothing
 
 ROW_DESC_LEN = 8
 GHOST_DESC_LEN = 4
-GHOST_ACK_OFFSET = 27   # FRAME C echo byte the firmware marks when it draws ghosts
-GHOST_ACK = 0x01
-GHOST_FLAGS_ACK_OFFSET = 28  # ...and this one when it reads the ghost flags
+GHOST_FLAGS_ACK_OFFSET = 28  # FRAME C echo byte the firmware marks when it reads the ghost flags
 GHOST_FLAGS_ACK = 0x01
 GHOST_FLAG_RIGHT = 0x01      # ghost flags bit0: anchored at the row's right end
 GHOST_LEVEL_ONE_KEY = 63     # a ghost covering exactly one segment (64 would
@@ -174,10 +192,29 @@ GHOST_LEVEL_ONE_KEY = 63     # a ghost covering exactly one segment (64 would
                              # firmware's visibility lift can make glow)
 MSG_ACK_OFFSET = 31     # MESSAGE echo byte the firmware marks when it can show one
 MSG_ACK = 0x01
+MSG_SEQ_ACK = 0x02      # the probe's echo at MSG_SEQ_PROBE_OFFSET: FRAME B
+MSG_SEQ_PROBE_OFFSET = 9  # reports message outcomes (inside the empty text)
+MSG_SEQ_OFFSET = 7      #   MESSAGE data[7]: the sequence number (echoed back)
+MSG_TEXT_OFFSET = 8     #   MESSAGE data[8..30]: the text (empty: the probe)
+MSG_DROPPED_OFFSET = 29 #   FRAME B echo: the last message dropped unplayed
+MSG_PLAYED_OFFSET = 30  #   ...and the last one played to its end (sequence numbers)
 STATUS_OFFSET = 31      # FRAME B echo: the firmware's status bits
 STATUS_MSG = 0x01       #   a message is waiting or playing
 STATUS_ASK = 0x02       #   the replay key was pressed
+STATUS_DARK = 0x04      #   the pad's RGB lighting is off (RGB_TOG, or VIA's All Off)
+STATUS_SUSPENDED = 0x10 #   the pad is suspended (lid closed): nothing shows
+# The BOOT REPLAY status echo (a 0xFD query) says what the firmware can do, so a
+# self-test needn't send frames, which would show on the pad.
+CAPS_OFFSET = 23        # capability bits; bit7 = the byte is set (older: 0)
+CAPS_VALID = 0x80       # (its feature bits: keymap.c SYSMON_CAPS; firmware with
+                        # the byte is this version's and sets them all, so the
+                        # self-test needs only this one)
+LIGHTING_OFFSET = 24    # 1 while the pad's RGB lighting is on (with CAPS_VALID)
 MSG_TEXT_MAX = 23
+# The pad's RGB toggle is its lights-off switch, and it hides the bars too.
+LIGHTING_OFF_NOTE = ("The macropad's RGB lighting is switched off (its RGB "
+                     "toggle, or VIA's All Off), so the bars don't show: with "
+                     "NumLock off, press its top-left key to switch it back on")
 
 # Fixed row order (matches sysmon_row_leds; do NOT change).
 ROW_BATTERY = 0
@@ -351,7 +388,7 @@ RATE_SEG_W3 = 75
 TTL_BRIGHTNESS = 0.5
 TTL_BATTERY = 1.0
 TTL_RYZENADJ = 1.0       # one ryzenadj SMU refresh feeding APU limits + Tctl
-TTL_TEMP = 2.0
+TTL_TEMP = 2.0           # the last-resort ACPI thermal-zone read (a WMI query)
 TTL_LHM_SNAPSHOT = 1.0   # one LHM enumeration feeding both temp and cpu power
 TTL_EC_THERMAL = 2.5     # throttled framework_tool --thermal fallback
 
@@ -378,6 +415,17 @@ LHM_DEP_NUGETS = (
     "System.Numerics.Vectors",
     "System.Threading.Tasks.Extensions",
 )
+
+
+def lhm_reading(lhmlib, sources):
+    """(temp, pkg_w, load) from LibreHardwareMonitor: the in-process library
+    (no app, no WMI), else -- unavailable, or reading nothing -- the LHM app's
+    WMI provider. gather() and --selftest's temperature probe both use this."""
+    if lhmlib.available:
+        snap = lhmlib.snapshot()
+        if snap != (None, None, None):
+            return snap
+    return sources.lhm_snapshot()
 
 
 def clamp(value, lo, hi):
@@ -599,6 +647,7 @@ class GpuMonitor:
 
     def _open_query(self):
         self._next_open = time.monotonic() + self.RETRY_S
+        query = None
         try:
             query = win32pdh.OpenQuery()
             self.counter = win32pdh.AddEnglishCounter(
@@ -611,6 +660,14 @@ class GpuMonitor:
                 print("GPU counters now available", file=sys.stderr)
         except Exception as err:
             self.query = None
+            # A query opened but whose counter failed to add (the GPU Engine
+            # set isn't registered yet at boot) must be closed, or every retry
+            # leaks one PDH query handle until the counters appear.
+            if query is not None:
+                try:
+                    win32pdh.CloseQuery(query)
+                except Exception:
+                    pass
             if not self._open_failed:
                 print(f"GPU counters unavailable (will retry): {err}", file=sys.stderr)
                 self._open_failed = True
@@ -1378,7 +1435,9 @@ class WmiSources:
                 discharging = (any(bool(s.Discharging) for s in statuses)
                                or discharge_mw > 0)
                 rate_mw = discharge_mw if discharging else charge_mw
-                return charging, discharging, clamp(rate_mw / 1000, 0, 255)
+                # watts as a float: rounded to whole watts, the sub-watt cap
+                # drift DRIFT_MIN_W (0.1 W) is there to catch read as 0
+                return charging, discharging, max(0.0, min(255.0, rate_mw / 1000))
         except Exception:
             pass
         return None
@@ -1683,7 +1742,8 @@ class RyzenAdjSource:
         self._tctl_moved = False  # two different Tctl readings seen
         self._tctl_last = None
         self._tctl_repeats = 0
-        self._tctl_dead = False
+        self._tctl_since = 0.0    # when Tctl last changed (monotonic)
+        self._tctl_stuck_logged = False
         if not enabled:
             return
         d = find_ryzenadj_dir(dll_dir)
@@ -1754,21 +1814,34 @@ class RyzenAdjSource:
         """Best-effort: place WinRing0x64.sys next to the host executable.
 
         WinRing0 loads its kernel driver from a path relative to the process
-        image; when libryzenadj is hosted by python that's the interpreter dir.
-        Copy the .sys there if it's missing (if the copy can't happen, init
-        just fails and the caller falls back).
+        image. Copy the .sys there if it's missing (if the copy can't happen,
+        init just fails and the caller falls back).
 
-        The target is the *process image* directory in both layouts -- the venv
-        interpreter's directory in a source run, the bundle's exe directory when
-        frozen. In the installed layout that makes this a no-op by design:
-        paths.vendor_dir() already is the exe's directory, so src == dst, the
-        installer's copy is in the right place, and the service never writes
-        into Program Files.
+        Frozen only. The target is the *process image* directory, the
+        bundle's exe directory: in the installed layout that makes this a
+        no-op by design -- paths.vendor_dir() already is the exe's directory,
+        so src == dst, the installer's copy is in the right place, and the
+        service never writes into Program Files -- and in a dev build's dist\\
+        it puts the driver where the exe will look.
+
+        A source run's process image is the base Python interpreter (a venv's
+        python.exe is only a launcher; see paths.process_image_dir), whose
+        directory is a shared Python installation: no place to leave a kernel
+        driver that nothing would update or remove. ryzenadj doesn't open from
+        a source run past that point anyway, so test it with the frozen build.
         """
+        dst = os.path.join(paths.process_image_dir(), RYZENADJ_DRIVER)
+        if not paths.is_frozen():
+            if not os.path.isfile(dst) and not RyzenAdjSource._driver_noted:
+                RyzenAdjSource._driver_noted = True  # once, not per resume
+                print(f"Source run: ryzenadj would need {dst} (beside the base "
+                      f"interpreter), and a driver is not copied into a Python "
+                      f"installation; test the SMU path with the frozen build.",
+                      file=sys.stderr)
+            return
         try:
             import shutil
             src = os.path.join(dll_dir, RYZENADJ_DRIVER)
-            dst = os.path.join(paths.process_image_dir(), RYZENADJ_DRIVER)
             if os.path.isfile(src) and not os.path.isfile(dst):
                 shutil.copyfile(src, dst)
         except OSError:
@@ -1818,20 +1891,42 @@ class RyzenAdjSource:
     # Left undetected this is the worst possible failure: 100.0 is above
     # TEMP_CRITICAL_C, so a dead field renders as a permanent maximum-severity
     # thermal alarm. A live sensor jitters (Tctl has 0.125 C granularity and a
-    # control loop behind it), so bit-identical readings this many times running
-    # mean the slot is not being written at all.
+    # control loop behind it), so a bit-identical reading means the slot is not
+    # being written at all -- but how long counts depends on what is known:
+    #
+    #   * never seen to move: STUCK_READS repeats (about 6 s at TTL_RYZENADJ
+    #     1 s). A dead field never moves, and this keeps its false alarm short,
+    #     at start and after every resume (which opens a fresh source).
+    #   * seen to move: also STUCK_S of the same value. A live idle die can hold
+    #     one 0.125 C step for several seconds; six reads would call it dead,
+    #     and the temperature would flip to the frozen ACPI zone and back.
+    #   * at or above TEMP_CRITICAL_C: STUCK_READS again, moved or not: a
+    #     frozen value there is the full, blinking alarm, the case not to
+    #     leave up for a minute. The cost: a die the SMU holds at
+    #     its THM limit on one exact value for that long is taken for dead too
+    #     (temperature falls back, the THM limit isn't named) -- rarely, as a
+    #     die that hot is under load and its reading moves.
+    #
+    # A live sensor that happens to sit still right at start can read as dead
+    # until its first move; that falls back for those seconds, nothing worse.
     STUCK_READS = 5
+    STUCK_S = 60.0
+
+    _driver_noted = False  # the source-run driver note was printed
 
     @staticmethod
     def temperature(snap):
         """Tctl die temperature from a snapshot, or None."""
         return snap.get("tctl") if snap else None
 
-    def _check_stuck(self, tctl):
+    def _check_stuck(self, tctl, now=None):
         """Return tctl, or None once it has proven to be a dead constant."""
+        if now is None:
+            now = time.monotonic()
         if tctl is None:
-            self._tctl_repeats = 0
-            self._tctl_last = None
+            # A missing read (the pair dropped as NaN, say) is no evidence
+            # either way: keep what is known, or a dead constant would come
+            # back as live after it.
             return None
         if tctl == self._tctl_last:
             self._tctl_repeats += 1
@@ -1839,14 +1934,18 @@ class RyzenAdjSource:
             self._tctl_moved |= self._tctl_last is not None
             self._tctl_repeats = 0
             self._tctl_last = tctl
-            self._tctl_dead = False
-        if self._tctl_repeats < self.STUCK_READS:
+            self._tctl_since = now
+        patient = self._tctl_moved and tctl < TEMP_CRITICAL_C
+        if (self._tctl_repeats < self.STUCK_READS
+                or (patient and now - self._tctl_since < self.STUCK_S)):
             return tctl
-        if not self._tctl_dead:
-            self._tctl_dead = True
-            log(f"ryzenadj Tctl is stuck at {tctl:.1f} C across "
-                f"{self.STUCK_READS + 1} reads; treating it as an unpopulated "
-                f"field and ignoring it for temperature")
+        # Once per source: a sensor flipping between stuck and moving would
+        # otherwise log on every flip.
+        if not self._tctl_stuck_logged:
+            self._tctl_stuck_logged = True
+            log(f"ryzenadj Tctl is stuck at {tctl:.1f} C for "
+                f"{now - self._tctl_since:.0f} s; ignoring it for "
+                f"temperature while it stays so")
         return None
 
     def close(self):
@@ -1926,6 +2025,9 @@ class LimitTracker:
         self.clear_at = 0.0   # when it stopped
         self.announced = None # key named last in this episode
         self.last_msg = None  # when a message last named this component
+        self.pending = 0      # messages about it queued or playing, not yet shown
+        self.episode = 0      # counts the episodes that ended
+        self.ended = False    # ...and this one has (until the next limit)
 
     @property
     def reason(self):
@@ -1950,9 +2052,13 @@ class LimitTracker:
             self.since = now
         elif was and not self.limited:
             self.clear_at = now
-        if (not self.limited and self.announced is not None
+        if (not self.limited and not self.ended
                 and now - self.clear_at >= MSG_REARM_S):
             self.announced = None  # the episode is over
+            self.episode += 1      # (a message of it still pending names nothing)
+            self.ended = True
+        if self.limited:
+            self.ended = False
 
     def due(self, now):
         """True when the pad should name the limit now.
@@ -1960,17 +2066,47 @@ class LimitTracker:
         The limit must bind on this very tick too: the release hold keeps one
         stray read "limited" for LIMIT_RELEASE_S, which must not be enough to
         scroll a message MSG_ONSET_S later. Kinds outside MSG_KINDS (the
-        charger, by default) only breathe.
+        charger, by default) only breathe. Not while a message about this
+        component waits to be sent or plays.
         """
-        return (self.live and self.reason.kind in MSG_KINDS
+        return (not self.pending and self.live
+                and self.reason.kind in MSG_KINDS
                 and now - self.since >= MSG_ONSET_S
                 and self.current != self.announced
                 and (self.last_msg is None
                      or now - self.last_msg >= MSG_MIN_GAP_S))
 
-    def mark(self, now):
-        self.announced = self.current
+    # A message counts as naming its limit only once the pad has played it.
+    # Until then it is pending: due() holds off another, and one that never
+    # plays (dropped as the pad went dark, lost with the pad's power) has
+    # named nothing, so its limit is named again.
+    def queued(self):
+        """A message naming the current limit is queued; returns what shown()
+        needs: the limit's key, and the episode it belongs to."""
+        self.pending += 1
+        return self.current, self.episode
+
+    def shown(self, key, now):
+        """The pad played the message `key` (from queued()) names. One from
+        an episode that has ended since doesn't count against the next."""
+        self.pending = max(self.pending - 1, 0)
         self.last_msg = now
+        limit, episode = key
+        if episode == self.episode:
+            self.announced = limit
+
+    def lost(self, sent_at=None):
+        """A queued message will never play: it named nothing. One that was
+        sent still counts toward MSG_MIN_GAP_S, so a limit whose messages keep
+        being replaced (another client's text) isn't re-sent in a tight loop."""
+        self.pending = max(self.pending - 1, 0)
+        if sent_at is not None:
+            self.last_msg = sent_at
+
+    def still(self, key):
+        """Does the limit `key` (from queued()) still hold, in its episode?"""
+        limit, episode = key
+        return episode == self.episode and self.limited and self.current == limit
 
     def message(self):
         """(text, hue, saturation) naming the limit, e.g. "CPU STAPM 28W"."""
@@ -1982,26 +2118,70 @@ class LimitTracker:
         return text[:MSG_TEXT_MAX], hue, 255
 
 
+class _Inflight:
+    """The message sent last, until the pad says what became of it."""
+    __slots__ = ("tracker", "key", "seq", "sent_at", "armed")
+
+    def __init__(self, tracker, key, seq, sent_at):
+        self.tracker = tracker
+        self.key = key
+        self.seq = seq
+        self.sent_at = sent_at
+        self.armed = False  # its own echo is back: echoes after it count
+
+
 class Messenger:
     """Sends limit messages to the pad, one at a time.
 
     Learns from a probe whether the firmware can show them at all, and from
-    each FRAME B echo whether one is still waiting or playing and whether the
-    replay key was pressed. Echoes reach every open handle, so the preview
-    tool's own messages hold this one back too.
+    each FRAME B echo whether one is still waiting or playing, whether the
+    replay key was pressed, and whether the pad is dark. Echoes reach every
+    open handle, so the preview tool's own messages hold this one back too.
+
+    A limit counts as named once the pad has played its message
+    (LimitTracker.shown). Each message carries a sequence number, and the
+    FRAME B echo reports the last one the pad played to its end and the last
+    one it dropped unplayed (replaced, dropped as it went dark or the host
+    went away): the message in flight is settled by what the pad says, not
+    guessed from timing. The next is sent only once it is settled.
+
+    Only an echo that came after the message's own echo counts (echoes come
+    in order): one sent before it carries the pad's state before it, where a
+    number can still be reported from an earlier message -- a restarted host
+    numbers from 1 again. Once armed, an echo with the pad idle that reports
+    neither outcome means the pad holds no such message: it lost power.
+
+    Firmware without the numbers (its probe echo lacks MSG_SEQ_ACK) keeps the
+    old rule: a limit is named as its message is sent.
     """
 
-    SETTLE_S = 1.2  # after sending, until the echoes surely tell its state
+    SETTLE_S = 1.2    # after sending, until the echoes surely tell its state
+    RESOLVE_S = 90.0  # a message the pad never reports on, and isn't busy
+                      # with, is taken as lost after this long (its echo
+                      # went missing); longer than any message takes to play
 
     def __init__(self, verbose=False):
         self.verbose = verbose
+        self.queue = []       # ((text, hue, sat), tracker or None, key, replay)
+        self.inflight = None  # _Inflight: the message sent last
+        self.seq = 0          # the last sequence number used
+        self.lights_off = False  # the lighting switched off; kept across
+                                 # reconnects, so a still-dark pad isn't re-logged
         self.reset()
 
     def reset(self):
+        # A (re)connect: what waited to be sent never will. The message in
+        # flight stays, armed -- every echo on the new handle comes after the
+        # pad got it (or after it lost power with it, which reads as lost): a
+        # pad that kept its power still reports what became of it.
+        self._drop_queue()
+        if self.inflight is not None:
+            self.inflight.armed = True
         self.capable = False
+        self.seq_capable = False  # the pad reports message outcomes
         self.busy = False
         self.asked = False
-        self.queue = []
+        self.dark = False         # nothing shows: lighting off, or suspended
         self.sent_at = -1e9
 
     def probe(self, dev):
@@ -2015,38 +2195,113 @@ class Messenger:
             if not self.capable and self.verbose:
                 print("firmware shows limit messages")
             self.capable = True
+            if not rep[MSG_TEXT_OFFSET]:  # the probe's echo (empty text)
+                self.seq_capable = rep[MSG_SEQ_PROBE_OFFSET] == MSG_SEQ_ACK
+                if not self.seq_capable and self.inflight is not None:
+                    # reconnected to firmware that can't report on it
+                    self._settle(played=False)
+            if self.inflight is not None and rep[MSG_SEQ_OFFSET] == self.inflight.seq:
+                self.inflight.armed = True  # its own echo: what follows is after it
         elif rep[2] == SYSMON_VALUE_FRAME_B:
             self.busy = bool(rep[STATUS_OFFSET] & STATUS_MSG)
+            lights_off = bool(rep[STATUS_OFFSET] & STATUS_DARK)
+            if lights_off != self.lights_off:
+                log(LIGHTING_OFF_NOTE if lights_off else
+                    "The macropad's RGB lighting is back on")
+            self.lights_off = lights_off
+            self.dark = bool(rep[STATUS_OFFSET] & (STATUS_DARK | STATUS_SUSPENDED))
+            if self.seq_capable and self.inflight is not None and self.inflight.armed:
+                seq = self.inflight.seq
+                if rep[MSG_PLAYED_OFFSET] == seq:
+                    self._settle(played=True)
+                elif rep[MSG_DROPPED_OFFSET] == seq or not self.busy:
+                    # dropped -- or the pad, idle, holds nothing and reports
+                    # nothing of it: it lost power (replugged, rebooted)
+                    self._settle(played=False)
             if rep[STATUS_OFFSET] & STATUS_ASK:
                 self.asked = True
 
     def tick(self, dev, now, trackers):
         if not self.capable:
             return
+        if (self.inflight is not None and not self.busy
+                and now - self.inflight.sent_at >= self.RESOLVE_S):
+            # never reported on, and the pad holds no message (one waiting
+            # there long -- behind a preview playlist, say -- may yet play)
+            self._settle(played=False)
+        if self.dark:
+            # Nothing can show while the pad is dark (it drops, and reports,
+            # what it held). Queueing anyway would replay a backlog of stale
+            # limits once it is lit again: what waits is dropped, and named
+            # afresh then if it still binds.
+            self._drop_queue()
+            self.asked = False
+            return
         if self.asked:
             # the replay key: what binds now, or that nothing does
             self.asked = False
-            self.queue = []
+            self._drop_queue()
             for t in trackers:
                 if t.limited:
-                    self.queue.append(t.message())
-                    t.mark(now)
+                    self.queue.append((t.message(), t, t.queued(), True))
             if not self.queue:
-                self.queue.append((MSG_NO_LIMIT, 0, 0))
+                self.queue.append(((MSG_NO_LIMIT, 0, 0), None, None, True))
         elif MSG_ENABLE:
             for t in trackers:
                 if t.due(now):
-                    self.queue.append(t.message())
-                    t.mark(now)
-        if self.queue and not self.busy and now - self.sent_at >= self.SETTLE_S:
-            text, hue, sat = self.queue.pop(0)
-            self._write(dev, text, hue, sat)
+                    self.queue.append((t.message(), t, t.queued(), False))
+        while (self.queue and self.inflight is None and not self.busy
+                and now - self.sent_at >= self.SETTLE_S):
+            msg, tracker, key, replay = self.queue.pop(0)
+            if tracker is not None and not tracker.still(key):
+                tracker.lost()
+                if not (replay and tracker.limited):
+                    continue  # its limit cleared while it waited: stale
+                # the replay key asked what binds: say what binds now
+                msg, key = tracker.message(), tracker.queued()
+            text, hue, sat = msg
+            seq = 0
+            if self.seq_capable:
+                self.seq = self.seq % 255 + 1  # 1..255; 0 means none
+                seq = self.seq
+            try:
+                self._write(dev, text, hue, sat, seq)
+            except Exception:
+                # it never reached the pad (the run loop reconnects): it
+                # named nothing, or the tracker would wait on it for good
+                if tracker is not None:
+                    tracker.lost()
+                raise
             self.sent_at = now
+            if tracker is not None:
+                if self.seq_capable:
+                    self.inflight = _Inflight(tracker, key, seq, now)
+                else:
+                    tracker.shown(key, now)  # older firmware: named as sent
             if self.verbose:
                 print(f"message: {text!r}")
+            break  # one per tick
+
+    def _drop_queue(self):
+        """Drop what waits to be sent: none of it will name anything."""
+        for entry in self.queue:
+            if entry[1] is not None:
+                entry[1].lost()
+        self.queue = []
+
+    def _settle(self, played):
+        """The message in flight has played (as of when it was sent: the gap
+        between messages counts from their starts), or never will."""
+        if self.inflight is not None:
+            m = self.inflight
+            if played:
+                m.tracker.shown(m.key, m.sent_at)
+            else:
+                m.tracker.lost(m.sent_at)
+            self.inflight = None
 
     @staticmethod
-    def _write(dev, text, hue, sat):
+    def _write(dev, text, hue, sat, seq=0):
         rep = bytearray(REPORT_LEN)
         rep[0] = VIA_CMD_CUSTOM_SET_VALUE
         rep[1] = SYSMON_CHANNEL
@@ -2055,8 +2310,9 @@ class Messenger:
         rep[4] = clamp8(hue)
         rep[5] = clamp8(sat)
         rep[6] = clamp(MSG_SPEED, 0, 255)
+        rep[MSG_SEQ_OFFSET] = seq  # the pad reports it back as played or dropped
         raw = text.encode("ascii", "replace")[:MSG_TEXT_MAX]
-        rep[8:8 + len(raw)] = raw
+        rep[MSG_TEXT_OFFSET:MSG_TEXT_OFFSET + len(raw)] = raw
         dev.write(b"\x00" + bytes(rep))
 
 
@@ -2294,6 +2550,8 @@ def build_temp_row(m):
     if not m["has_temp"]:
         return RowDesc(level=0)
     t = m["temp_c"]
+    # TEMP_MIN_C < TEMP_MAX_C holds: config.py reverts a pair that isn't
+    # (config.ORDERED_PAIRS), so the division is safe.
     tc = max(TEMP_MIN_C, min(TEMP_MAX_C, t))
     level = clamp((tc - TEMP_MIN_C) * 255 // (TEMP_MAX_C - TEMP_MIN_C), 0, 255)
     desc = RowDesc(level=level, hue0=HUE_TEMP_LO, hue1=HUE_TEMP_HI, gradient=True)
@@ -2440,7 +2698,7 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
     if temp_c is None:
         temp_c, temp_src = RyzenAdjSource.temperature(rj), "ryzenadj"
     if temp_c is None:
-        temp_c, temp_src = sources.acpi_temperature(), "acpi"
+        temp_c, temp_src = cache["acpi_temp"](), "acpi"
     has_temp = temp_c is not None
     if not has_temp:
         temp_src = None
@@ -2636,6 +2894,14 @@ def bootloader_jump(dev):
 
 
 def main(argv=None, stop_event=None, resume_check=None):
+    # Redirected (Setup's [Run] steps, a pipe), stdout is in the ANSI code
+    # page: a path or name outside it would raise mid-command -- after the
+    # work is done, failing the exit code callers check. Replace instead.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
     # --service is dispatched before anything else: the SCM expects the process
     # to hand itself to the control dispatcher promptly, and the engine run it
     # subsequently starts loads the config itself.
@@ -2791,23 +3057,16 @@ def run(args, stop_event=None, resume_check=None):
     ryzen = RyzenAdjSource(enabled=not args.no_ryzenadj,
                            dll_dir=args.ryzenadj_dir)
 
-    def lhm_snapshot():
-        # Prefer the in-process LibreHardwareMonitorLib (no app, no WMI); fall
-        # back to the LHM WMI provider when the lib is unavailable or silent.
-        if lhmlib.available:
-            snap = lhmlib.snapshot()
-            if snap != (None, None, None):
-                return snap
-        return sources.lhm_snapshot()
-
     # Slow sources behind TTL caches so most ~0.4s ticks stay light. The LHM
     # snapshot is shared between temperature and CPU power (one read).
     cache = {
         "brightness": Cached(sources.screen_brightness, TTL_BRIGHTNESS),
         "battery": Cached(sources.battery_state, TTL_BATTERY),
-        "lhm": Cached(lhm_snapshot, TTL_LHM_SNAPSHOT),
+        "lhm": Cached(lambda: lhm_reading(lhmlib, sources), TTL_LHM_SNAPSHOT),
         "ryzenadj": Cached(ryzen.snapshot, TTL_RYZENADJ),
         "ec_temp": Cached(ec.temperature, TTL_EC_THERMAL),
+        # the last-resort ACPI zone: a WMI query, so not every tick
+        "acpi_temp": Cached(sources.acpi_temperature, TTL_TEMP),
         # every tick: two devnode property lookups, microseconds
         "dgpu_power": Cached(dpower.state, 0.0),
     }
@@ -2938,4 +3197,6 @@ def run(args, stop_event=None, resume_check=None):
 
 
 if __name__ == "__main__":
-    main()
+    # main()'s return is the process exit code: the CLI actions return one
+    # (--install-service's is what the installer checks), the loop None = 0.
+    sys.exit(main())

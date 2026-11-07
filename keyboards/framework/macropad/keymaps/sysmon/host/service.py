@@ -65,13 +65,37 @@ def _state_names():
     return _STATE_NAMES
 
 
+ERROR_SERVICE_DOES_NOT_EXIST = 1060
+
+
+_last_query_error = None  # why query_state() last said "unknown"
+
+
+def _sentence(text):
+    return text[:1].upper() + text[1:]
+
+
+def query_error():
+    """Why query_state() last said "unknown", in a sentence."""
+    return (f"could not ask the Service Control Manager about "
+            f"'{SERVICE_NAME}' ({_last_query_error})")
+
+
 def query_state():
-    """Return the service state as a lowercase word, or None if not installed."""
+    """Return the service state as a lowercase word, None if not installed,
+    or "unknown" if the SCM couldn't be asked (that is not the service being
+    gone: see _last_query_error)."""
+    global _last_query_error
     try:
         import win32serviceutil
         status = win32serviceutil.QueryServiceStatus(SERVICE_NAME)
-    except Exception:
-        return None
+    except ImportError:
+        return None  # no pywin32 (a source checkout): no service to speak of
+    except Exception as err:
+        if getattr(err, "winerror", None) == ERROR_SERVICE_DOES_NOT_EXIST:
+            return None
+        _last_query_error = err
+        return "unknown"
     return _state_names().get(status[1], "unknown")
 
 
@@ -214,34 +238,85 @@ def _bin_path():
     return f'"{sys.executable}" "{script}" --service'
 
 
+ERROR_SERVICE_MARKED_FOR_DELETE = 1072
+
+
 def install():
+    """Register the service, or bring an existing registration up to date.
+
+    An existing service is reconfigured in place (ChangeServiceConfig), not
+    deleted and created again: DeleteService only *marks* a service for
+    deletion while anything holds a handle to it -- services.msc or Task
+    Manager's Services tab left open is enough -- and CreateService then fails
+    with ERROR_SERVICE_MARKED_FOR_DELETE, which on an upgrade left the machine
+    with no service at all.
+    """
     win32service, win32serviceutil = _svc_modules()
     existing = query_state()
+    if existing == "unknown":
+        print(_sentence(query_error()) + "; nothing changed.", file=sys.stderr)
+        return 1
     if existing is not None:
         log(f"Service already installed ({existing}); reconfiguring")
-        uninstall()
+        # Its binary is about to be re-pointed. One that won't stop keeps the
+        # old binary and config running, and a later --start-service would
+        # just call it "already running": say so instead of "Installed".
+        if stop(quiet=True) != 0:
+            print("The running service could not be stopped, so it was not "
+                  "reconfigured. Restart Windows, then run --install-service "
+                  "again.", file=sys.stderr)
+            return 1
+        # One marked for deletion is deleted by that stop: create it afresh.
+        existing = query_state()
 
     scm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_ALL_ACCESS)
+    handle = None
     try:
-        handle = win32service.CreateService(
-            scm,
-            SERVICE_NAME,
-            SERVICE_DISPLAY,
-            win32service.SERVICE_ALL_ACCESS,
-            win32service.SERVICE_WIN32_OWN_PROCESS,
-            win32service.SERVICE_AUTO_START,
-            win32service.SERVICE_ERROR_NORMAL,
-            _bin_path(),
-            None,     # no load-order group
-            0,        # no tag id
-            None,     # no dependencies: the loop already retries the HID device
-                      # and the GPU counters, so starting before the USB and
-                      # graphics stacks are up is handled rather than avoided
-            None,     # LocalSystem
-            None,
-        )
+        if existing is None:
+            handle = win32service.CreateService(
+                scm,
+                SERVICE_NAME,
+                SERVICE_DISPLAY,
+                win32service.SERVICE_ALL_ACCESS,
+                win32service.SERVICE_WIN32_OWN_PROCESS,
+                win32service.SERVICE_AUTO_START,
+                win32service.SERVICE_ERROR_NORMAL,
+                _bin_path(),
+                None,     # no load-order group
+                0,        # no tag id
+                None,     # no dependencies: the loop already retries the HID
+                          # device and the GPU counters, so starting before the
+                          # USB and graphics stacks are up is handled rather
+                          # than avoided
+                None,     # LocalSystem
+                None,
+            )
+        else:
+            handle = win32service.OpenService(
+                scm, SERVICE_NAME, win32service.SERVICE_ALL_ACCESS)
+            win32service.ChangeServiceConfig(
+                handle,
+                win32service.SERVICE_WIN32_OWN_PROCESS,
+                win32service.SERVICE_AUTO_START,
+                win32service.SERVICE_ERROR_NORMAL,
+                _bin_path(),
+                None,     # load-order group: unchanged (none)
+                0,        # no tag id
+                None,     # dependencies: unchanged (none)
+                "LocalSystem",  # account: back to LocalSystem, as created
+                "",       # (LocalSystem takes no password)
+                SERVICE_DISPLAY,
+            )
     except Exception as err:
-        print(f"Could not create the service: {err}", file=sys.stderr)
+        if handle is not None:
+            win32service.CloseServiceHandle(handle)
+        win32service.CloseServiceHandle(scm)
+        verb = "create" if existing is None else "reconfigure"
+        print(f"Could not {verb} the service: {err}", file=sys.stderr)
+        if getattr(err, "winerror", None) == ERROR_SERVICE_MARKED_FOR_DELETE:
+            print("An earlier uninstall is still pending: close the Services "
+                  "console (and Task Manager), or restart Windows, then run "
+                  "--install-service again.", file=sys.stderr)
         return 1
     try:
         win32service.ChangeServiceConfig2(
@@ -320,12 +395,32 @@ def stop(quiet=False):
             print(f"Service '{SERVICE_NAME}' is already stopped")
         return 0
     try:
-        win32serviceutil.StopService(SERVICE_NAME)
-        win32serviceutil.WaitForServiceStatus(
-            SERVICE_NAME, win32service.SERVICE_STOPPED, waitSecs=30)
+        # A service between states won't take a stop control (it raises
+        # ERROR_SERVICE_CANNOT_ACCEPT_CTRL): one still starting is let finish
+        # -- into running, or into stopped if it died on the way, which is
+        # just as good -- and one already stopping (Setup's `net stop` gives
+        # up on it after a while) is waited for.
+        import time
+        deadline = time.monotonic() + 30
+        unknown_until = time.monotonic() + 3  # a transient failure, not 30 s of one
+        while (state == "starting" and time.monotonic() < deadline
+               or state == "unknown" and time.monotonic() < unknown_until):
+            time.sleep(0.25)
+            state = query_state()
+        if state == "unknown":
+            print(_sentence(query_error()), file=sys.stderr)
+            return 1
+        if state not in (None, "stopped"):
+            if state != "stopping":
+                win32serviceutil.StopService(SERVICE_NAME)
+            win32serviceutil.WaitForServiceStatus(
+                SERVICE_NAME, win32service.SERVICE_STOPPED, waitSecs=30)
     except Exception as err:
-        print(f"Could not stop the service: {err}", file=sys.stderr)
-        return 1
+        # One marked for deletion is deleted the moment it stops: gone is
+        # stopped (install() then creates it afresh).
+        if getattr(err, "winerror", None) != ERROR_SERVICE_DOES_NOT_EXIST:
+            print(f"Could not stop the service: {err}", file=sys.stderr)
+            return 1
     if not quiet:
         print(f"Service '{SERVICE_NAME}' stopped")
     return 0

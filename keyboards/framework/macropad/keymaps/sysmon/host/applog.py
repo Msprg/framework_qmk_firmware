@@ -140,47 +140,107 @@ def pause_if_own_console():
     silently bring back the vanishing-window bug on most Win11 machines.
     """
     try:
-        if not sys.stdout.isatty():
+        if not can_prompt():
             return
         import ctypes
-        from ctypes import wintypes
 
         buf = (ctypes.c_uint * 8)()
         if ctypes.windll.kernel32.GetConsoleProcessList(buf, 8) != 1:
-            return
-
-        class STARTUPINFOW(ctypes.Structure):
-            _fields_ = [
-                ("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR),
-                ("lpDesktop", wintypes.LPWSTR), ("lpTitle", wintypes.LPWSTR),
-                ("dwX", wintypes.DWORD), ("dwY", wintypes.DWORD),
-                ("dwXSize", wintypes.DWORD), ("dwYSize", wintypes.DWORD),
-                ("dwXCountChars", wintypes.DWORD),
-                ("dwYCountChars", wintypes.DWORD),
-                ("dwFillAttribute", wintypes.DWORD),
-                ("dwFlags", wintypes.DWORD), ("wShowWindow", wintypes.WORD),
-                ("cbReserved2", wintypes.WORD),
-                ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
-                ("hStdInput", wintypes.HANDLE),
-                ("hStdOutput", wintypes.HANDLE),
-                ("hStdError", wintypes.HANDLE),
-            ]
-
-        STARTF_USESHOWWINDOW = 0x0001
-        SW_HIDE = 0
-        info = STARTUPINFOW()
-        info.cb = ctypes.sizeof(STARTUPINFOW)
-        ctypes.windll.kernel32.GetStartupInfoW(ctypes.byref(info))
-        if (info.dwFlags & STARTF_USESHOWWINDOW) and info.wShowWindow == SW_HIDE:
             return
     except Exception:
         return
     try:
         print()
+        # (No timeout: a report left to read later must still be there. A
+        # silent Setup runs --flash hidden, which never gets here.)
         print("Press Enter to close this window...", end="", flush=True)
         input()
     except (EOFError, KeyboardInterrupt, OSError):
         pass
+
+
+def launched_hidden():
+    """True when the creator started this process with its window hidden
+    (SW_HIDE, as Setup's runhidden steps do): a console exists, but nobody
+    can see it or type into it. Read from the creator's STARTUPINFO, for the
+    ConPTY reason given in pause_if_own_console."""
+    import ctypes
+    from ctypes import wintypes
+
+    class STARTUPINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR),
+            ("lpDesktop", wintypes.LPWSTR), ("lpTitle", wintypes.LPWSTR),
+            ("dwX", wintypes.DWORD), ("dwY", wintypes.DWORD),
+            ("dwXSize", wintypes.DWORD), ("dwYSize", wintypes.DWORD),
+            ("dwXCountChars", wintypes.DWORD),
+            ("dwYCountChars", wintypes.DWORD),
+            ("dwFillAttribute", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD), ("wShowWindow", wintypes.WORD),
+            ("cbReserved2", wintypes.WORD),
+            ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
+            ("hStdInput", wintypes.HANDLE),
+            ("hStdOutput", wintypes.HANDLE),
+            ("hStdError", wintypes.HANDLE),
+        ]
+
+    STARTF_USESHOWWINDOW = 0x0001
+    SW_HIDE = 0
+    info = STARTUPINFOW()
+    info.cb = ctypes.sizeof(STARTUPINFOW)
+    ctypes.windll.kernel32.GetStartupInfoW(ctypes.byref(info))
+    return bool(info.dwFlags & STARTF_USESHOWWINDOW) and info.wShowWindow == SW_HIDE
+
+
+def ask_yes(question, timeout_s=60):
+    """Ask a yes/no question at the console; True only for a yes typed within
+    timeout_s. Nobody answering is a no, not a hang. Callers check
+    can_prompt() first."""
+    import time
+    try:
+        import msvcrt
+    except ImportError:
+        return False
+    while msvcrt.kbhit():  # a key typed before the question isn't an answer
+        msvcrt.getwch()
+    print(f"{question} [y/N] (no, in {timeout_s} s) ", end="", flush=True)
+    typed = ""
+    deadline = time.monotonic() + timeout_s
+    try:
+        while time.monotonic() < deadline:
+            while msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\x00", "\xe0"):  # an arrow/function key: two codes
+                    msvcrt.getwch()
+                    continue
+                if ch in ("\r", "\n"):
+                    print()
+                    return typed.strip().lower() in ("y", "yes")
+                if ch == "\b":
+                    if typed:
+                        typed = typed[:-1]
+                        print("\b \b", end="", flush=True)
+                    continue
+                if ch.isprintable():
+                    typed += ch
+                    print(ch, end="", flush=True)
+            time.sleep(0.05)
+    except KeyboardInterrupt:  # Ctrl+C: a no, not a traceback
+        pass
+    print()
+    return False
+
+
+def can_prompt():
+    """Can a question be put to a person? A console they can see and type in:
+    stdin AND stdout on it (a question printed into a pipe -- `| Tee-Object` --
+    may never reach the screen while input() waits)."""
+    try:
+        return (bool(sys.stdin and sys.stdin.isatty())
+                and bool(sys.stdout and sys.stdout.isatty())
+                and not launched_hidden())
+    except Exception:
+        return False
 
 
 def is_service_mode():

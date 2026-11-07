@@ -53,11 +53,21 @@ def process_image_dir():
     """Directory of the running process image (what GetModuleFileName(NULL) sees).
 
     Frozen: the bundle's exe directory, same as app_dir(). Source run: the
-    *interpreter's* directory, which is NOT app_dir(). WinRing0 resolves its
-    kernel driver relative to this, so it is the correct target for
-    WinRing0x64.sys in both layouts.
+    *interpreter's* directory, which is NOT app_dir() -- and from a venv, not
+    sys.executable's either: a Windows venv's python.exe is a small launcher
+    that starts the base interpreter (sys._base_executable) as the real
+    process, so that is the image WinRing0 resolves its kernel driver against.
+
+    This is where WinRing0x64.sys has to go. The host copies it there only
+    when frozen (RyzenAdjSource._ensure_driver): from source this is a shared
+    Python installation, and ryzenadj fails to open there past the driver
+    anyway (inpoutx64 reported "Unable to get memory access"), so the SMU path
+    is tested with the frozen build.
     """
-    return os.path.dirname(os.path.abspath(sys.executable))
+    exe = sys.executable
+    if not is_frozen():
+        exe = getattr(sys, "_base_executable", None) or exe
+    return os.path.dirname(os.path.abspath(exe))
 
 
 def data_dir():

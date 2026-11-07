@@ -52,7 +52,8 @@ import hid
 
 VID, PID = 0x32AC, 0x0013
 RAW_USAGE_PAGE, RAW_USAGE = 0xFF60, 0x61
-MODES = {0: "rgb-effect", 1: "boot-rainbow", 2: "sysmon", 3: "warning"}
+MODES = {0: "rgb-effect", 1: "boot-rainbow", 2: "sysmon", 3: "warning",
+         4: "nothing (lighting off, or suspended)"}
 STYLES = {"flash": 0, "ticker": 1, "pop": 2}
 COLORS = {"rainbow": 0, "letters": 1, "white": 2}
 TEXT_MAX = 23

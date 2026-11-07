@@ -27,6 +27,7 @@ come up.
 """
 
 import configparser
+import math
 import os
 
 import paths
@@ -154,7 +155,8 @@ SCHEMA = [
                     "temperature row's own alert; a CPU or dGPU slowed down by a\n"
                     "thermal limit breathes its row instead (LIMIT_KINDS)."),
     Setting("TEMP_MIN_C", "thresholds", FLOAT, lo=0, hi=150,
-            comment="Temperature mapped to an empty bar."),
+            comment="Temperature mapped to an empty bar. Must be below\n"
+                    "TEMP_MAX_C (if not, both keep their defaults)."),
     Setting("TEMP_MAX_C", "thresholds", FLOAT, lo=0, hi=150,
             comment="Temperature mapped to a full bar."),
 
@@ -290,7 +292,9 @@ SCHEMA = [
             comment="One ryzenadj SMU refresh feeds both the APU limit verdict\n"
                     "and the Tctl temperature."),
     Setting("TTL_TEMP", "polling", FLOAT, lo=0, hi=3600,
-            comment="General temperature cache lifetime."),
+            comment="ACPI thermal-zone cache lifetime: the last-resort\n"
+                    "temperature source, a WMI query, used only when nothing\n"
+                    "better reads."),
     Setting("TTL_LHM_SNAPSHOT", "polling", FLOAT, lo=0, hi=3600,
             comment="One LibreHardwareMonitor walk feeds temperature, package\n"
                     "power and CPU load together."),
@@ -325,6 +329,34 @@ _CLI_SKIP = {
 }
 
 
+# Pairs that only make sense in order, (low, high). Each value is range-checked
+# on its own; a pair that ends up crossed or equal (which, for the temperature
+# range, would divide by zero on every tick) reverts to its defaults as a whole.
+ORDERED_PAIRS = (("TEMP_MIN_C", "TEMP_MAX_C"),)
+
+
+_BUILTIN = {}  # ORDERED_PAIRS names -> built-in value, from before any INI
+
+
+def builtin_value(name):
+    """A pair member's built-in value (not whatever an INI made it); recorded
+    by apply(), which runs at start-up before anything asks."""
+    return _BUILTIN.get(name)
+
+
+def crossed_pairs(get):
+    """The ORDERED_PAIRS that `get(name)` -> value leaves crossed or equal, as
+    (lo_name, hi_name, lo, hi). One rule for config.apply (which reverts them)
+    and --selftest (which reports them); a value get returns None for is
+    skipped."""
+    out = []
+    for lo_name, hi_name in ORDERED_PAIRS:
+        lo, hi = get(lo_name), get(hi_name)
+        if lo is not None and hi is not None and not lo < hi:  # nan too
+            out.append((lo_name, hi_name, lo, hi))
+    return out
+
+
 def _by_name():
     return {s.name: s for s in SCHEMA}
 
@@ -356,6 +388,10 @@ def _parse(setting, raw):
             return ()
         return items
     value = int(raw, 0) if setting.kind == INT else float(raw)
+    if setting.kind == FLOAT and not math.isfinite(value):
+        # nan and inf parse as floats, and every range check is False for
+        # nan: one would reach the row builders and fail on every tick
+        raise ValueError(f"{raw!r} is not a finite number")
     if setting.lo is not None and value < setting.lo:
         raise ValueError(f"{value} is below the minimum {setting.lo}")
     if setting.hi is not None and value > setting.hi:
@@ -393,6 +429,9 @@ def apply(arg_parser, argv, module):
     it by name here would create a *second* copy of the module whose constants
     nobody reads.
     """
+    for pair in ORDERED_PAIRS:
+        for n in pair:
+            _BUILTIN.setdefault(n, getattr(module, n))  # the first call sees the built-ins
     path = default_path(_peek_config_arg(argv))
     if not path or not os.path.isfile(path):
         return None
@@ -425,6 +464,13 @@ def apply(arg_parser, argv, module):
             except ValueError as err:
                 log(f"Config {path} [{section}] {key}: {err}; "
                     f"keeping default {getattr(module, setting.name)!r}")
+
+    for lo_name, hi_name, lo, hi in crossed_pairs(lambda n: getattr(module, n)):
+        log(f"Config {path}: {lo_name} ({lo}) must be below {hi_name} "
+            f"({hi}); keeping the defaults {_BUILTIN[lo_name]!r} and "
+            f"{_BUILTIN[hi_name]!r}")
+        setattr(module, lo_name, _BUILTIN[lo_name])
+        setattr(module, hi_name, _BUILTIN[hi_name])
 
     if cli_defaults:
         _apply_cli_defaults(arg_parser, cli_defaults, path)
