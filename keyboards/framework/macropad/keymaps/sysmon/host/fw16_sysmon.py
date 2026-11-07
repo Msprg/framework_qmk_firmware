@@ -1436,7 +1436,7 @@ class RyzenAdjSource:
             lib.refresh_table.restype = c_int
             for name in ("get_stapm_limit", "get_stapm_value", "get_fast_limit",
                          "get_fast_value", "get_slow_limit", "get_slow_value",
-                         "get_tctl_temp"):
+                         "get_tctl_temp_value"):
                 fn = getattr(lib, name)
                 fn.restype = c_float
                 fn.argtypes = [c_void_p]
@@ -1511,7 +1511,7 @@ class RyzenAdjSource:
                 "fast": (g.get_fast_value(ry), g.get_fast_limit(ry)),
                 "slow": (g.get_slow_value(ry), g.get_slow_limit(ry)),
             }
-            tctl = g.get_tctl_temp(ry)
+            tctl = g.get_tctl_temp_value(ry)  # not get_tctl_temp: the limit
         except Exception:
             return None
         out = {}
@@ -1539,12 +1539,13 @@ class RyzenAdjSource:
                 return True
         return False
 
-    # A Tctl slot that never changes is not a temperature. On a Ryzen AI 9
-    # HX 370 this reads a flat 100.0 while the die genuinely swings 42->59 C
-    # (confirmed against the EC and the fans spinning up), because libryzenadj
-    # has no valid offset for the THM value on that SMU table version and
-    # returns the Tjmax constant instead. Every other field in the same table
-    # is live and correct, so the table itself is fine -- only this slot is dead.
+    # A Tctl that never changes is not a temperature. The temperature used to
+    # be read with get_tctl_temp, which is libryzenadj's THM *limit* getter
+    # (the "THM LIMIT CORE" line of `ryzenadj -i`): on a Ryzen AI 9 HX 370 it
+    # read a flat 100.0 while the die swung 42->59 C, which looked like a dead
+    # table field. The value getter (get_tctl_temp_value, "THM VALUE CORE") is
+    # live and what is read now; this check stays as a guard for a table
+    # layout libryzenadj gets wrong on some other CPU.
     #
     # Left undetected this is the worst possible failure: 100.0 is above
     # TEMP_CRITICAL_C, so a dead field renders as a permanent maximum-severity
@@ -1933,12 +1934,12 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
     # The EC outranks Tctl on purpose. Tctl is decoded from the AMD SMU power
     # table, whose layout depends on the CPU model, and a wrong decode does not
     # fail -- it returns a plausible-looking number. Observed on a clean Windows
-    # install on this very machine: Tctl pinned at exactly 100.0 C (an
-    # unpopulated field) while the EC read 41 C, which drove the temperature row
-    # to full and blinking. The same table reported implausible power limits on
-    # that install too, so when the decode is wrong it is wrong across the
-    # board. The EC sensor is the Framework firmware's own, and is the source
-    # this hardware is actually specified around.
+    # install on this very machine: Tctl pinned at exactly 100.0 C while the EC
+    # read 41 C, which drove the temperature row to full and blinking. (That
+    # was this host reading libryzenadj's THM *limit* getter instead of the
+    # value -- fixed, see RyzenAdjSource.snapshot -- but a different CPU's table
+    # can still decode wrong.) The EC sensor is the Framework firmware's own,
+    # and is the source this hardware is actually specified around.
     #
     # The cost is a throttled subprocess (TTL_EC_THERMAL) instead of a free
     # in-process read, and it is only paid when LHM is unavailable -- which is

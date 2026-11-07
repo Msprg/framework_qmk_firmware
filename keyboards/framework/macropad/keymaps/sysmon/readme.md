@@ -425,8 +425,11 @@ confirm which source is driving the CPU row.
   ranked **above** ryzenadj Tctl: Tctl is decoded from the AMD SMU power table,
   whose layout depends on the CPU model, and a wrong decode does not fail — it
   returns a plausible-looking number. On a clean Windows install on the same
-  FW16, Tctl sat at exactly 100 °C (an unpopulated field) while the EC read
-  41 °C, pinning the temperature row full and blinking. Needs elevation.
+  FW16, Tctl sat at exactly 100 °C while the EC read 41 °C, pinning the
+  temperature row full and blinking. (That one turned out to be the host
+  reading libryzenadj's THM *limit* getter, `get_tctl_temp`, instead of the
+  value, `get_tctl_temp_value`; fixed, and a Tctl that never moves is still
+  ignored.) Needs elevation.
 - **ryzenadj Tctl** — when `ryzenadj` is installed for the power-limit breathe,
   its die temperature is read from the same in-process SMU handle for free, so
   ryzenadj alone is enough to light the temperature row on a machine with
