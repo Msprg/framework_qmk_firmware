@@ -169,7 +169,7 @@ SCHEMA = [
                     "animates, so a trickle still reads as movement."),
 
     Setting("LIMIT_KINDS", "power_limits", CSV,
-            choices=("power", "current", "thermal", "charger", "none"),
+            choices=("power", "current", "thermal", "clock", "charger", "none"),
             comment="Which kinds of limit make the CPU or dGPU row breathe\n"
                     "(MSG_KINDS says which of them the pad also names):\n"
                     "  power   - APU STAPM/PPT (APU_LIMIT_SIGNALS), dGPU power cap\n"
@@ -177,6 +177,8 @@ SCHEMA = [
                     "            limits drop by design; the battery row says so)\n"
                     "  current - APU TDC/EDC, core and SoC\n"
                     "  thermal - APU Tctl at its THM limit, dGPU thermal slowdown\n"
+                    "  clock   - the CPU held at its base clock under load (boost\n"
+                    "            off) with no SMU limit near; on AC only\n"
                     "  charger - a component held back while the battery assists\n"
                     "            an overloaded charger: breathes slowly\n"
                     "            (PERIOD_BREATHE_SLOW), next to the battery row's\n"
@@ -204,6 +206,16 @@ SCHEMA = [
                     "A capped value hovers around the threshold (STAPM crossed it\n"
                     "every 1-3 s under an all-core load), which flickered the\n"
                     "breathe on and off."),
+    Setting("CLOCK_BUSY_PCT", "power_limits", FLOAT, lo=1, hi=100,
+            comment="The clock limit (clock in LIMIT_KINDS): a core whose two\n"
+                    "threads together are this busy (%) wants to boost..."),
+    Setting("CLOCK_BASE_MARGIN", "power_limits", FLOAT, lo=0.5, hi=2.0,
+            comment="... so the CPU counts as held at its base clock when no busy\n"
+                    "logical CPU runs faster than this times base (Windows'\n"
+                    "Processor Performance counter; a boosting core reads 1.5-2.5x)."),
+    Setting("CLOCK_DEBOUNCE_READS", "power_limits", INT, lo=1, hi=100,
+            comment="Consecutive reads that must find the CPU held at base before\n"
+                    "it counts (one read per --interval)."),
     Setting("CPU_LOAD_HIGH", "power_limits", FLOAT, lo=0, hi=100,
             comment="Fallback heuristic only (no ryzenadj): CPU load % above\n"
                     "which APU power limits are even evaluated."),
@@ -230,7 +242,7 @@ SCHEMA = [
                     "keypad 5 with NumLock off always says what binds right now\n"
                     "(or NO LIMIT). Needs the firmware from this version."),
     Setting("MSG_KINDS", "messages", CSV,
-            choices=("power", "current", "thermal", "charger", "none"),
+            choices=("power", "current", "thermal", "clock", "charger", "none"),
             comment="Which kinds of limit (see LIMIT_KINDS) the pad names on its\n"
                     "own. The others only breathe: the slow charger breathe next\n"
                     "to the amber battery row says enough by itself. The replay\n"
@@ -277,6 +289,9 @@ SCHEMA = [
             comment="dGPU hardware power brake."),
     Setting("MSG_WORD_THERMAL", "messages", TEXT, hi=12,
             comment="dGPU thermal slowdown."),
+    Setting("MSG_WORD_CLOCK", "messages", TEXT, hi=12,
+            comment="CPU held at its base clock (boost off), e.g.\n"
+                    "'CPU CLK LIMITED 2GHZ'."),
     Setting("MSG_WORD_CHARGER", "messages", TEXT, hi=12,
             comment="Held back by an overloaded charger (the replay key's word for\n"
                     "the slow breathe; named on its own only with charger in\n"

@@ -206,14 +206,28 @@ off, since off is the critical blinks' language. The cadence says which kind:
   the same situation (the battery row says the charger is overloaded; the
   component breathe says which component it's choking).
 
-Which limits count is `LIMIT_KINDS` in `sysmon.ini` (all four by default):
+Which limits count is `LIMIT_KINDS` in `sysmon.ini` (all five by default):
 
 | Kind | APU (CPU row) | dGPU | When |
 |------|---------------|------|------|
 | `power` | STAPM, slow PPT (`APU_LIMIT_SIGNALS`; fast PPT is left out, as its short boost window would flicker) | the driver's power cap, the hardware power brake | on AC only: on battery the limits drop by design, and the battery row already shows that |
 | `current` | TDC and EDC, core and SoC | — | always |
 | `thermal` | Tctl at its THM limit (within `APU_THM_MARGIN_C`) | the driver's or the hardware's thermal slowdown | always |
-| `charger` | a STAPM/PPT limit binding while the battery assists an overloaded charger (the EC lowered it): the slow breathe | a loaded dGPU capped while the battery assists: the slow breathe | on AC |
+| `clock` | held at its base clock under load (boost off) with no SMU limit near (see below) | — | on AC only |
+| `charger` | a STAPM/PPT limit binding (the EC lowered it), or the clock held at base, while the battery assists an overloaded charger: the slow breathe | a loaded dGPU capped while the battery assists: the slow breathe | on AC |
+
+The clock limit covers a CPU held back with none of the SMU limits near: boost
+switched off. On this FW16, running from a 29 W USB-C source (a monitor's
+port) with the battery making up the rest, every core stayed at 2.0 GHz under
+an all-core load, at 27 W and 90% of the slow PPT, and even a single busy
+thread never passed 2.02 GHz, in every Windows power mode. Nothing in the SMU
+table bound, so the CPU row showed nothing. On the 240 W charger the same
+loads ran at 2.4 GHz all-core and 4 GHz on one core. Windows reports each
+logical CPU's clock relative to base and how busy it is: the CPU counts as held
+when a core is at least `CLOCK_BUSY_PCT` (80%) busy, both its threads together,
+yet no busy logical CPU runs faster than `CLOCK_BASE_MARGIN` (1.05) times base,
+for `CLOCK_DEBOUNCE_READS` (3) reads in a row. While the battery assists, the
+charger is the likely cause, and it breathes slowly as `charger`.
 
 A capped value hovers around its threshold: under an all-core load STAPM
 crossed 95% of its limit every 1-3 s. So a limit counts until it has been
@@ -231,6 +245,7 @@ CPU STAPM 28W     APU sustained power budget, now 28 W (it falls as the chassis 
 CPU PPT 30W       slow PPT          CPU FAST PPT 45W   fast PPT (only with fast in APU_LIMIT_SIGNALS)
 CPU TDC 54A       core current      CPU SOC TDC 30A    SoC current     CPU EDC 54A / CPU SOC EDC 30A
 CPU HOT 100C      Tctl at its THM limit
+CPU CLK LIMITED 2GHZ   held at the base clock (the busy cores' fastest clock; 2.6GHZ when not round)
 GPU POWER 100W    the dGPU's power cap (its enforced limit)
 GPU BRAKE         the hardware power brake
 GPU HOT 87C       thermal slowdown (the GPU's temperature)
@@ -241,8 +256,8 @@ That takes about 8 s. It plays once per episode: again only when the limit
 changes (STAPM → TDC, say; at most every 30 s), and a new episode starts once
 the component has been free of limits for 2 minutes. When several limits bind
 at once the closest to its limit is named, and it stays named while it holds.
-Which kinds get named is `MSG_KINDS` (`power, current, thermal`): the slow
-charger breathe is clear enough without text, so it isn't.
+Which kinds get named is `MSG_KINDS` (`power, current, thermal, clock`): the
+slow charger breathe is clear enough without text, so it isn't.
 
 **Keypad 5 with NumLock off** replays it on demand: the pad names what makes
 each row breathe right now, the charger included (`CPU CHARGER`, in amber), or
@@ -277,7 +292,9 @@ Detection sources (per component, degrades gracefully if absent):
     when, under sustained high load on AC, package power plateaus at the
     ceiling (auto-calibrated; pass `--cpu-power-cap <watts>` to pin it). It
     can't tell which limit it is, so it is named POWER. With neither ryzenadj
-    nor LHM the CPU row never breathes.
+    nor LHM only the clock limit can make the CPU row breathe.
+- **CPU clock** — Windows' per-CPU performance counters (`% Processor
+  Performance`, `% Processor Time`), no extra install: the clock limit above.
 
 LED brightness follows the laptop screen brightness (scaled, capped well
 below full brightness). If no stats arrive for 5 seconds (script stopped,
@@ -490,8 +507,10 @@ table; authoritative) with the LibreHardwareMonitor package-power heuristic as
 fallback — see [Limit indication](#limit-indication) above. With `--verbose`,
 the `limits …` line shows either `cpu ryzenadj[stapm=…/…W slow=…/…W tdc=…/…A
 … thm=…/…C]` (a `*` marks a limit binding this tick) or `cpu heuristic(pkg_w=…
-load=…)`, then `->` and the limit the row breathes for, so you can confirm which
-source is driving the CPU row. `message: '…'` lines show what the pad is told.
+load=…)`, then `clock[…GHz busy=…%]` (the busy CPUs' fastest clock and the
+busiest core; `HELD` when held at base), then `->` and the limit the row
+breathes for, so you can confirm which source is driving the CPU row.
+`message: '…'` lines show what the pad is told.
 
 **Temperature** comes from one of (tried in this order):
 
@@ -566,10 +585,11 @@ either works during development. What is available:
 
 - **thresholds**: `BATT_CRITICAL_PCT`, `MEM_CRITICAL_PCT`, `TEMP_CRITICAL_C`,
   `TEMP_MIN_C` / `TEMP_MAX_C`, `ASSIST_MIN_W`, `DRIFT_MIN_W`
-- **limits**: `LIMIT_KINDS` (which kinds — `power`/`current`/`thermal`/`charger`
-  — breathe), `APU_LIMIT_NEAR` (how close to a limit counts as binding),
-  `APU_LIMIT_SIGNALS` (which SMU power limits — `stapm`/`slow`/`fast` — count),
-  `APU_THM_MARGIN_C`, `LIMIT_RELEASE_S`
+- **limits**: `LIMIT_KINDS` (which kinds — `power`/`current`/`thermal`/`clock`/
+  `charger` — breathe), `APU_LIMIT_NEAR` (how close to a limit counts as
+  binding), `APU_LIMIT_SIGNALS` (which SMU power limits — `stapm`/`slow`/`fast` —
+  count), `APU_THM_MARGIN_C`, `LIMIT_RELEASE_S`, `CLOCK_BUSY_PCT` /
+  `CLOCK_BASE_MARGIN` / `CLOCK_DEBOUNCE_READS` (the clock limit)
 - **messages**: `MSG_ENABLE`, `MSG_KINDS` (which kinds the pad names on its
   own), `MSG_ONSET_S` / `MSG_MIN_GAP_S` / `MSG_REARM_S`,
   `MSG_SPEED`, `MSG_SHOW_VALUE`, and every word (`MSG_NAME_*`, `MSG_WORD_*`,

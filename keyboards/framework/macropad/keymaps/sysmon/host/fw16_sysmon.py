@@ -35,6 +35,8 @@ APU limit detection (CPU-row breathe, and the message naming the limit):
     1. ryzenadj / libryzenadj SMU table: STAPM/PPT/TDC/EDC/THM value-vs-limit
        (authoritative)
     2. LibreHardwareMonitor package-power plateau heuristic (fallback)
+    3. Windows' per-CPU clock counters (CpuClock): held at the base clock under
+       load while neither of the above sees a limit -- boost switched off
 The dGPU's come from NVML's throttle reasons. See LIMIT_KINDS, LimitTracker.
 
 Temperature sources, tried in order (gather(); --selftest's temperature probe
@@ -321,18 +323,25 @@ APU_LIMIT_SIGNALS = ("stapm", "slow")  # which SMU *power* limits count (when
 #   current -- APU TDC / EDC, core and SoC
 #   thermal -- APU Tctl at its THM limit (APU_THM_MARGIN_C), dGPU thermal
 #              slowdown
+#   clock   -- the CPU held at its base clock under load (boost off) with no
+#              SMU limit near; on AC only (see CpuClock)
 #   charger -- a component held back while the battery assists an overloaded
 #              charger: breathes slowly (PERIOD_BREATHE_SLOW) -- the cadence
 #              itself says "the charger", next to the battery row's amber
-LIMIT_KINDS = ("power", "current", "thermal", "charger")
+LIMIT_KINDS = ("power", "current", "thermal", "clock", "charger")
 # ...and which of them the pad also names on its own, in a message. The replay
 # key names whatever makes a row breathe, these or not.
-MSG_KINDS = ("power", "current", "thermal")
+MSG_KINDS = ("power", "current", "thermal", "clock")
 APU_THM_MARGIN_C = 3.0  # Tctl within this many degrees of the THM limit binds
 LIMIT_RELEASE_S = 8.0   # a limit stays "binding" until it has been clear this
                         # long: a capped value hovers around the threshold
                         # (STAPM crossed 95% every 1-3 s under an all-core load
                         # here), which flickered the breathe on and off
+CLOCK_BUSY_PCT = 80     # a core (both its threads together) this busy wants to
+                        # boost...
+CLOCK_BASE_MARGIN = 1.05  # ...so its CPU is held back when no busy logical CPU
+                        # runs faster than this times the base clock
+CLOCK_DEBOUNCE_READS = 3  # consecutive reads that must agree before it counts
 
 # Limit messages: when a limit (of MSG_KINDS) has held for MSG_ONSET_S, the pad
 # scrolls the component, the limit and its current value ("CPU STAPM 28W") over
@@ -360,6 +369,7 @@ MSG_WORD_THM = "HOT"
 MSG_WORD_POWER = "POWER"    # dGPU power cap; APU package-power heuristic
 MSG_WORD_BRAKE = "BRAKE"    # dGPU hardware power brake
 MSG_WORD_THERMAL = "HOT"    # dGPU thermal slowdown
+MSG_WORD_CLOCK = "CLK LIMITED"  # CPU held at its base clock (boost off)
 MSG_WORD_CHARGER = "CHARGER"
 
 # Inference thresholds (the LHM package-power fallback used only when ryzenadj
@@ -943,7 +953,8 @@ REASON_WORDS = {
     "tdc": "MSG_WORD_TDC", "tdc_soc": "MSG_WORD_TDC_SOC",
     "edc": "MSG_WORD_EDC", "edc_soc": "MSG_WORD_EDC_SOC",
     "thm": "MSG_WORD_THM", "power": "MSG_WORD_POWER", "brake": "MSG_WORD_BRAKE",
-    "thermal": "MSG_WORD_THERMAL", "charger": "MSG_WORD_CHARGER",
+    "thermal": "MSG_WORD_THERMAL", "clock": "MSG_WORD_CLOCK",
+    "charger": "MSG_WORD_CHARGER",
 }
 
 
@@ -1973,16 +1984,12 @@ APU_SIGNALS = {
 }
 
 
-def apu_reasons(snap, on_ac, weak_charger):
-    """{key: Reason} for the SMU limits that bind in a ryzenadj snapshot.
-
-    A power or current limit binds when its value reaches APU_LIMIT_NEAR of
-    the limit, THM when Tctl is within APU_THM_MARGIN_C of it. Power limits
-    count on AC only, and only those in APU_LIMIT_SIGNALS. The message shows
-    the limit (STAPM's moves: the SMU lowers it as the chassis warms). While
-    the battery assists an overloaded charger, a binding power limit is the
-    charger's doing (the EC lowered it): "charger", as it always was.
-    """
+def apu_binding(snap):
+    """{key: Reason} for every SMU limit at its threshold in a ryzenadj
+    snapshot, whatever LIMIT_KINDS says: a power or current limit when its
+    value reaches APU_LIMIT_NEAR of the limit, THM when Tctl is within
+    APU_THM_MARGIN_C of it. The message shows the limit (STAPM's moves: the
+    SMU lowers it as the chassis warms)."""
     binding = {}
     for key, (kind, unit) in APU_SIGNALS.items():
         pair = snap.get(key)
@@ -1995,12 +2002,137 @@ def apu_reasons(snap, on_ac, weak_charger):
             hit = val >= APU_LIMIT_NEAR * lim
         if hit:
             binding[key] = Reason(key, kind, val / lim, lim, unit)
+    return binding
+
+
+def apu_reasons(snap, on_ac, weak_charger):
+    """{key: Reason} for the SMU limits that bind in a ryzenadj snapshot and
+    count: those of apu_binding(), power limits on AC only and only those in
+    APU_LIMIT_SIGNALS. While the battery assists an overloaded charger, a
+    binding power limit is the charger's doing (the EC lowered it):
+    "charger", as it always was.
+    """
+    binding = apu_binding(snap)
     capped = any(k in APU_LIMIT_SIGNALS for k in binding)
     if weak_charger and capped and "charger" in LIMIT_KINDS:
         return {"charger": Reason("charger", "charger")}
     return {k: r for k, r in binding.items()
             if r.kind in LIMIT_KINDS
             and (r.kind != "power" or (on_ac and k in APU_LIMIT_SIGNALS))}
+
+
+class CpuClock:
+    """Is the CPU held at its base clock while it has work?
+
+    The SMU limits cover power, current and temperature, but a CPU can also be
+    held at (or under) its base clock with none of them near: boost switched
+    off. Measured on this FW16 running from a 29 W USB-C source (a monitor's
+    port), with the battery making up the rest: every core of the Ryzen AI 9
+    HX 370 stayed at 2.0 GHz under an all-core load -- 27 W, the slow PPT at
+    90% -- and even a single busy thread never passed 2.02 GHz, in every
+    Windows power mode. Nothing in the SMU table binds, so without this the
+    CPU row showed nothing at all.
+
+    Windows reports each logical CPU's clock relative to base (% Processor
+    Performance, measured while it runs) and how busy it is (% Processor
+    Time). A core with work and boost available runs well above base, so the
+    CPU counts as held back when a core is busy (its threads' time summed: a
+    single thread hops between a core's two threads) yet no busy logical CPU
+    runs faster than CLOCK_BASE_MARGIN times base, CLOCK_DEBOUNCE_READS reads
+    in a row.
+    """
+
+    RETRY_S = 30.0       # while the counters can't be opened
+    ACTIVE_PCT = 20      # a logical CPU this busy shows how fast it can run
+
+    def __init__(self):
+        self.query = None
+        self._next_open = 0.0
+        self._failed = False
+        self._reads = 0  # consecutive reads that found the CPU held back
+        logical = psutil.cpu_count(logical=True) or 0
+        physical = psutil.cpu_count(logical=False) or 0
+        self._smt = bool(physical) and logical == 2 * physical
+        if win32pdh is not None:
+            self._open()
+
+    def _open(self):
+        self._next_open = time.monotonic() + self.RETRY_S
+        query = None
+        try:
+            query = win32pdh.OpenQuery()
+            self._time = win32pdh.AddEnglishCounter(
+                query, r"\Processor Information(*)\% Processor Time")
+            self._perf = win32pdh.AddEnglishCounter(
+                query, r"\Processor Information(*)\% Processor Performance")
+            self._base = win32pdh.AddEnglishCounter(
+                query, r"\Processor Information(_Total)\Processor Frequency")
+            win32pdh.CollectQueryData(query)  # prime: rates need two samples
+            self.query = query
+        except Exception as err:
+            if query is not None:
+                try:
+                    win32pdh.CloseQuery(query)
+                except Exception:
+                    pass
+            if not self._failed:
+                log(f"CPU clock counters unavailable (will retry): {err}")
+                self._failed = True
+
+    def read(self):
+        """(held, ghz, busy): held once CLOCK_DEBOUNCE_READS reads in a row
+        found the CPU held back; ghz the busy CPUs' fastest clock (None:
+        unknown), busy the busiest core's %. None when the counters can't be
+        read."""
+        if self.query is None:
+            if win32pdh is not None and time.monotonic() >= self._next_open:
+                self._open()
+            return None
+        try:
+            win32pdh.CollectQueryData(self.query)
+            busy_t = win32pdh.GetFormattedCounterArray(self._time,
+                                                       win32pdh.PDH_FMT_DOUBLE)
+            perf = win32pdh.GetFormattedCounterArray(self._perf,
+                                                     win32pdh.PDH_FMT_DOUBLE)
+            base = win32pdh.GetFormattedCounterValue(self._base,
+                                                     win32pdh.PDH_FMT_DOUBLE)[1]
+        except Exception:
+            self._reads = 0
+            return None
+        cores = {}
+        fastest = None
+        for name, t in busy_t.items():
+            m = re.fullmatch(r"(\d+),(\d+)", name)  # not "_Total", "0,_Total"
+            if not m:
+                continue
+            group, num = int(m.group(1)), int(m.group(2))
+            core = (group, num // 2 if self._smt else num)
+            cores[core] = cores.get(core, 0.0) + t
+            p = perf.get(name)
+            if t >= self.ACTIVE_PCT and p is not None:
+                fastest = p if fastest is None else max(fastest, p)
+        busiest = min(100.0, max(cores.values(), default=0.0))
+        held = (busiest >= CLOCK_BUSY_PCT and fastest is not None
+                and fastest <= 100.0 * CLOCK_BASE_MARGIN)
+        self._reads = self._reads + 1 if held else 0
+        ghz = base * fastest / 100000.0 if (fastest and base > 0) else None
+        return self._reads >= CLOCK_DEBOUNCE_READS, ghz, busiest
+
+
+def clock_reasons(clock, on_ac, weak_charger):
+    """{key: Reason} for a CPU held at its base clock (CpuClock.read()), for
+    when nothing else explains it: the caller asks only when no SMU limit is
+    at its threshold and no other limit binds. On AC only (on battery a low
+    clock is the power plan's choice). While the battery assists an
+    overloaded charger, the charger is the likely cause (boost was off on the
+    29 W source above): "charger", the slow breathe."""
+    if not (clock and clock[0] and on_ac):
+        return {}
+    if weak_charger and "charger" in LIMIT_KINDS:
+        return {"charger": Reason("charger", "charger")}
+    if "clock" in LIMIT_KINDS:
+        return {"clock": Reason("clock", "clock", 1.0, clock[1], "GHZ")}
+    return {}
 
 
 class LimitTracker:
@@ -2113,7 +2245,11 @@ class LimitTracker:
         r = self.reason
         text = f"{globals()[self.name_const]} {r.word()}"
         if MSG_SHOW_VALUE and r.value is not None:
-            text += f" {int(r.value + 0.5)}{r.unit}"
+            if r.unit == "GHZ":  # 2.0 GHz -> "2GHZ", 2.6 GHz -> "2.6GHZ"
+                num = f"{r.value:.1f}".rstrip("0").rstrip(".")
+            else:
+                num = str(int(r.value + 0.5))
+            text += f" {num}{r.unit}"
         hue = HUE_AMBER if r.key == "charger" else globals()[self.hue_const]
         return text[:MSG_TEXT_MAX], hue, 255
 
@@ -2722,12 +2858,19 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
     # The limits binding this tick (LimitTracker holds them steady): the APU's
     # from the ryzenadj SMU table when it reads, else from the LHM
     # package-power plateau heuristic; the dGPU's from NVML.
+    smu_binding = apu_binding(rj) if rj is not None else {}
     if rj is not None:
         cpu_binding = apu_reasons(rj, on_ac, weak_charger)
     else:
         cpu_binding = apu.reasons(
             (cpu_pkg_w, cpu_load) if (cpu_pkg_w is not None or cpu_load is not None)
             else None, on_ac, weak_charger)
+    # Held at the base clock with nothing else to explain it: boost is off. A
+    # limit at its threshold (even one LIMIT_KINDS leaves out) slows the clock
+    # itself, and is the reason then.
+    cpu_clock = cache["clock"]()
+    if not cpu_binding and not smu_binding:
+        cpu_binding = clock_reasons(cpu_clock, on_ac, weak_charger)
     dgpu_binding = nv.evaluate(on_ac, weak_charger)
     if not dgpu_present:
         dgpu_binding = {}
@@ -2748,6 +2891,7 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
         "cpu_pkg_w": cpu_pkg_w,
         "cpu_load": cpu_load,
         "cpu_limits": rj,  # ryzenadj SMU snapshot (value, limit pairs) or None
+        "cpu_clock": cpu_clock,  # CpuClock.read(): (held, ghz, busy) or None
         "weak_charger": weak_charger,
 
         "raw_mem": raw_mem,
@@ -3052,6 +3196,7 @@ def run(args, stop_event=None, resume_check=None):
     gpu = GpuMonitor(args.igpu_match, args.dgpu_match)
     dpower = DgpuPower(args.dgpu_match, announce=True)
     apu = ApuLimits(cap_watts=args.cpu_power_cap)
+    clock = CpuClock()
     nv = NvGpuLimits(enabled=not args.no_nvml)
     lhmlib = LhmLibSource(enabled=not args.no_lhm_lib)
     ryzen = RyzenAdjSource(enabled=not args.no_ryzenadj,
@@ -3069,6 +3214,8 @@ def run(args, stop_event=None, resume_check=None):
         "acpi_temp": Cached(sources.acpi_temperature, TTL_TEMP),
         # every tick: two devnode property lookups, microseconds
         "dgpu_power": Cached(dpower.state, 0.0),
+        # every tick (it debounces by reads): one PDH collect, about a ms
+        "clock": Cached(clock.read, 0.0),
     }
 
     if args.verbose:
@@ -3138,8 +3285,10 @@ def run(args, stop_event=None, resume_check=None):
                 # verdict. With ryzenadj it prints the SMU value/limit pairs
                 # (the * marks one binding this tick); otherwise it shows the
                 # LHM heuristic inputs (pkg_w/load = None means LHM isn't
-                # running -> no APU breathe). The dGPU's need pynvml. -> names
-                # the limit the row breathes for (held LIMIT_RELEASE_S).
+                # running -> no APU breathe). clock[] is CpuClock: the busy
+                # CPUs' fastest clock, the busiest core, HELD = at base under
+                # load. The dGPU's need pynvml. -> names the limit the row
+                # breathes for (held LIMIT_RELEASE_S).
                 rj = m["cpu_limits"]
                 if rj:
                     units = {k: u for k, (_, u) in APU_SIGNALS.items()}
@@ -3150,6 +3299,11 @@ def run(args, stop_event=None, resume_check=None):
                     cpu_src = f"ryzenadj[{pairs}]"
                 else:
                     cpu_src = f"heuristic(pkg_w={m['cpu_pkg_w']} load={m['cpu_load']})"
+                clk = m["cpu_clock"]
+                if clk:
+                    ghz = "?" if clk[1] is None else f"{clk[1]:.2f}GHz"
+                    cpu_src += (f" clock[{ghz} busy={clk[2]:.0f}%"
+                                f"{' HELD' if clk[0] else ''}]")
                 dgpu_now = " ".join(map(repr, m["dgpu_binding"].values())) or "-"
                 print(f"  limits ac={m['ac']} weak={m['weak_charger']} "
                       f"cpu {cpu_src} -> {m['cpu_limit']!r} "
