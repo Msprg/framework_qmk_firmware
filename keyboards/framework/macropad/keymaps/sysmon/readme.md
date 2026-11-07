@@ -54,8 +54,10 @@ every boot, and on every round of a replay.
 
 Once the host connects, the bars fade in over the rainbow, every key going
 straight from its rainbow colour to its bar colour, and the rainbow is done
-until the next power-up. Pressing any RGB key (Fn layer) also
-dismisses it, so the regular effect stays reachable without a host.
+until the next power-up. Pressing any key also dismisses it (cutting the
+animation short if it is still playing): without a host, the pad switches to
+the regular RGB effect at the first touch and stays there until the host
+connects.
 
 If the host later goes away:
 
