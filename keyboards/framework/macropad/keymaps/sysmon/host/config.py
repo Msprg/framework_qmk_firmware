@@ -34,8 +34,11 @@ from applog import log
 
 # kind: how the raw string is parsed and what a legal value looks like.
 #   int   / float : optional lo/hi bounds, inclusive
-#   csv           : comma-separated list, validated against `choices`
-INT, FLOAT, CSV = "int", "float", "csv"
+#   csv           : comma-separated list, validated against `choices`; when
+#                   "none" is one of them, it stands for an empty list
+#   text          : text for the macropad's font (TEXT_CHARS), up to hi chars
+INT, FLOAT, CSV, TEXT = "int", "float", "csv", "text"
+TEXT_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 -!.")
 
 
 class Setting:
@@ -69,11 +72,12 @@ SCHEMA = [
                     "temperature > TEMP_CRITICAL_C, battery below\n"
                     "BATT_CRITICAL_PCT). 32 ms units, so 32 = ~1 Hz."),
     Setting("PERIOD_BREATHE_FAST", "cadence", INT, lo=1, hi=255,
-            comment="Brisk breathe: the chip is at its own power/TDP ceiling\n"
-                    "on AC. 32 ms units, so 48 = ~1.5 s."),
+            comment="Brisk breathe: a limit (LIMIT_KINDS) holds the CPU or\n"
+                    "dGPU back. 32 ms units, so 48 = ~1.5 s."),
     Setting("PERIOD_BREATHE_SLOW", "cadence", INT, lo=1, hi=255,
             comment="Slow breathe: the power *source* is the bottleneck (the\n"
-                    "battery is assisting an overloaded charger). 128 = ~4 s."),
+                    "battery is assisting an overloaded charger), with 'charger'\n"
+                    "in LIMIT_KINDS. 128 = ~4 s."),
     Setting("PERIOD_PULSE", "cadence", INT, lo=1, hi=255,
             comment="Battery charge/discharge trapezoid pulse. 128 = ~4 s."),
     Setting("PERIOD_SINE", "cadence", INT, lo=1, hi=255,
@@ -137,8 +141,8 @@ SCHEMA = [
             comment="Memory usage % at or above which the whole row blinks."),
     Setting("TEMP_CRITICAL_C", "thresholds", FLOAT, lo=0, hi=150,
             comment="Temperature above which the whole row blinks. This is the\n"
-                    "thermal alert; power-limit breathing deliberately does not\n"
-                    "cover thermals."),
+                    "temperature row's own alert; a CPU or dGPU slowed down by a\n"
+                    "thermal limit breathes its row instead (LIMIT_KINDS)."),
     Setting("TEMP_MIN_C", "thresholds", FLOAT, lo=0, hi=150,
             comment="Temperature mapped to an empty bar."),
     Setting("TEMP_MAX_C", "thresholds", FLOAT, lo=0, hi=150,
@@ -152,17 +156,42 @@ SCHEMA = [
             comment="... all 4 segments. Below RATE_SEG_W1 a single segment\n"
                     "animates, so a trickle still reads as movement."),
 
+    Setting("LIMIT_KINDS", "power_limits", CSV,
+            choices=("power", "current", "thermal", "charger", "none"),
+            comment="Which kinds of limit make the CPU or dGPU row breathe\n"
+                    "(MSG_KINDS says which of them the pad also names):\n"
+                    "  power   - APU STAPM/PPT (APU_LIMIT_SIGNALS), dGPU power cap\n"
+                    "            and power brake; on AC only (on battery the\n"
+                    "            limits drop by design; the battery row says so)\n"
+                    "  current - APU TDC/EDC, core and SoC\n"
+                    "  thermal - APU Tctl at its THM limit, dGPU thermal slowdown\n"
+                    "  charger - a component held back while the battery assists\n"
+                    "            an overloaded charger: breathes slowly\n"
+                    "            (PERIOD_BREATHE_SLOW), next to the battery row's\n"
+                    "            amber; leave it out to breathe for the limit the\n"
+                    "            EC lowered instead\n"
+                    "  none    - no limit indication at all"),
     Setting("APU_LIMIT_NEAR", "power_limits", FLOAT, lo=0.1, hi=1.0,
-            comment="How close to an SMU limit counts as *binding*: the live\n"
-                    "value must reach this fraction of the limit. The value sits\n"
-                    "right at the limit when the chip is genuinely capped."),
+            comment="How close to an SMU power or current limit counts as\n"
+                    "*binding*: the live value must reach this fraction of the\n"
+                    "limit. The value sits right at the limit when the chip is\n"
+                    "genuinely capped."),
     Setting("APU_LIMIT_SIGNALS", "power_limits", CSV,
             choices=("stapm", "fast", "slow"),
-            comment="Which SMU limits trigger the CPU-row breathe. stapm (the\n"
-                    "skin-temperature-aware sustained budget HWiNFO shows as\n"
-                    "'APU STAPM Limit') and slow are sustained, so they give a\n"
-                    "steady signal. fast is the short boost window: adding it\n"
-                    "makes the row flicker under bursty load."),
+            comment="Which SMU *power* limits count (with power in\n"
+                    "LIMIT_KINDS). stapm (the skin-temperature-aware sustained\n"
+                    "budget HWiNFO shows as 'APU STAPM Limit') and slow are\n"
+                    "sustained, so they give a steady signal. fast is the short\n"
+                    "boost window: adding it makes the row flicker under bursty\n"
+                    "load."),
+    Setting("APU_THM_MARGIN_C", "power_limits", FLOAT, lo=0, hi=50,
+            comment="Tctl within this many degrees of the APU's THM limit (100 C\n"
+                    "on the HX 370) counts as a binding thermal limit."),
+    Setting("LIMIT_RELEASE_S", "power_limits", FLOAT, lo=0, hi=600,
+            comment="Seconds a limit must stay clear before it stops counting.\n"
+                    "A capped value hovers around the threshold (STAPM crossed it\n"
+                    "every 1-3 s under an all-core load), which flickered the\n"
+                    "breathe on and off."),
     Setting("CPU_LOAD_HIGH", "power_limits", FLOAT, lo=0, hi=100,
             comment="Fallback heuristic only (no ryzenadj): CPU load % above\n"
                     "which APU power limits are even evaluated."),
@@ -180,9 +209,66 @@ SCHEMA = [
                     "eagerly -- even near idle -- and without this filter the\n"
                     "dGPU row breathes on and off every few seconds."),
     Setting("NV_DEBOUNCE_READS", "power_limits", INT, lo=1, hi=100,
-            comment="Consecutive reads a changed dGPU limit flag must hold\n"
-                    "before it is adopted, so one NVML blip cannot flash the\n"
-                    "breathe."),
+            comment="Consecutive reads a dGPU limit flag must hold before it\n"
+                    "counts, so one NVML blip cannot flash the breathe."),
+
+    Setting("MSG_ENABLE", "messages", INT, lo=0, hi=1,
+            comment="1: when a limit holds the CPU or dGPU back, scroll which one\n"
+                    "across the pad, e.g. 'CPU STAPM 28W'. 0: only on demand --\n"
+                    "keypad 5 with NumLock off always says what binds right now\n"
+                    "(or NO LIMIT). Needs the firmware from this version."),
+    Setting("MSG_KINDS", "messages", CSV,
+            choices=("power", "current", "thermal", "charger", "none"),
+            comment="Which kinds of limit (see LIMIT_KINDS) the pad names on its\n"
+                    "own. The others only breathe: the slow charger breathe next\n"
+                    "to the amber battery row says enough by itself. The replay\n"
+                    "key names whatever makes a row breathe."),
+    Setting("MSG_ONSET_S", "messages", FLOAT, lo=0, hi=600,
+            comment="How long a limit must have held before it is named."),
+    Setting("MSG_MIN_GAP_S", "messages", FLOAT, lo=0, hi=3600,
+            comment="Shortest time between two messages about one component\n"
+                    "(when the limit holding it back changes)."),
+    Setting("MSG_REARM_S", "messages", FLOAT, lo=0, hi=36000,
+            comment="A limit is named once per episode; an episode ends when the\n"
+                    "component has been free of limits this many seconds."),
+    Setting("MSG_SPEED", "messages", INT, lo=2, hi=40,
+            comment="Ticker speed, columns per second (a letter is about 5)."),
+    Setting("MSG_SHOW_VALUE", "messages", INT, lo=0, hi=1,
+            comment="1: end with the limit's value right now ('28W'; for a dGPU\n"
+                    "thermal slowdown its temperature). 0: just the names."),
+    Setting("MSG_NAME_CPU", "messages", TEXT, hi=8,
+            comment="The words on the pad. A-Z, 0-9, space, - ! . only; uppercase\n"
+                    "W and M are the tall letter forms, w and m the short ones.\n"
+                    "The CPU row stands for the whole APU."),
+    Setting("MSG_NAME_GPU", "messages", TEXT, hi=8, comment="The dGPU."),
+    Setting("MSG_NO_LIMIT", "messages", TEXT, hi=23,
+            comment="The replay key's answer when nothing binds."),
+    Setting("MSG_WORD_STAPM", "messages", TEXT, hi=12,
+            comment="APU sustained power budget (skin temperature)."),
+    Setting("MSG_WORD_SLOW", "messages", TEXT, hi=12, comment="APU slow PPT."),
+    Setting("MSG_WORD_FAST", "messages", TEXT, hi=12,
+            comment="APU fast PPT (only with fast in APU_LIMIT_SIGNALS)."),
+    Setting("MSG_WORD_TDC", "messages", TEXT, hi=12,
+            comment="APU core current, sustained."),
+    Setting("MSG_WORD_TDC_SOC", "messages", TEXT, hi=12,
+            comment="APU SoC current, sustained."),
+    Setting("MSG_WORD_EDC", "messages", TEXT, hi=12,
+            comment="APU core current, peak."),
+    Setting("MSG_WORD_EDC_SOC", "messages", TEXT, hi=12,
+            comment="APU SoC current, peak."),
+    Setting("MSG_WORD_THM", "messages", TEXT, hi=12,
+            comment="APU at its temperature limit."),
+    Setting("MSG_WORD_POWER", "messages", TEXT, hi=12,
+            comment="dGPU power cap (and the APU's, when only the package-power\n"
+                    "heuristic is available)."),
+    Setting("MSG_WORD_BRAKE", "messages", TEXT, hi=12,
+            comment="dGPU hardware power brake."),
+    Setting("MSG_WORD_THERMAL", "messages", TEXT, hi=12,
+            comment="dGPU thermal slowdown."),
+    Setting("MSG_WORD_CHARGER", "messages", TEXT, hi=12,
+            comment="Held back by an overloaded charger (the replay key's word for\n"
+                    "the slow breathe; named on its own only with charger in\n"
+                    "MSG_KINDS)."),
 
     Setting("TTL_BRIGHTNESS", "polling", FLOAT, lo=0, hi=3600,
             comment="Screen-brightness cache lifetime, seconds. Keep this short:\n"
@@ -210,7 +296,8 @@ SECTION_HELP = {
     "levels": "Row brightness levels and animation floors, 0-255.",
     "thresholds": "When a row switches into its alert state.",
     "battery": "Charge/discharge power -> how many bar segments animate.",
-    "power_limits": "Power-limit detection: when the CPU and dGPU rows breathe.",
+    "power_limits": "Limit detection: when the CPU and dGPU rows breathe.",
+    "messages": "Limit messages: the pad names the limit a row breathes for.",
     "polling": "Per-source cache lifetimes. Most ticks reuse cached readings so\n"
                "the poll loop stays cheap; raise these to cut CPU use further,\n"
                "lower them for a more responsive display.",
@@ -235,6 +322,16 @@ def _by_name():
 def _parse(setting, raw):
     """Parse and range-check one raw string. Raises ValueError when invalid."""
     raw = raw.strip()
+    if setting.kind == TEXT:
+        if not raw:
+            raise ValueError("empty text")
+        bad = sorted(set(raw) - TEXT_CHARS)
+        if bad:
+            raise ValueError(f"the macropad can't show {''.join(bad)!r}; "
+                             f"use A-Z, 0-9, space, - ! .")
+        if len(raw) > setting.hi:
+            raise ValueError(f"longer than {setting.hi} characters")
+        return raw
     if setting.kind == CSV:
         items = tuple(p.strip().lower() for p in raw.split(",") if p.strip())
         if not items:
@@ -243,6 +340,10 @@ def _parse(setting, raw):
         if bad:
             raise ValueError(f"unknown value(s) {', '.join(bad)}; "
                              f"allowed: {', '.join(setting.choices)}")
+        if "none" in items:
+            if len(items) > 1:
+                raise ValueError("'none' can't be combined with other values")
+            return ()
         return items
     value = int(raw, 0) if setting.kind == INT else float(raw)
     if setting.lo is not None and value < setting.lo:
@@ -402,7 +503,7 @@ def render_default(module=None):
             out.append(f"; {line}")
         value = getattr(module, setting.name)
         if setting.kind == CSV:
-            value = ", ".join(value)
+            value = ", ".join(value) or "none"
         out.append(f"{setting.name} = {value}")
         out.append("")
 

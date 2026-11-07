@@ -27,6 +27,10 @@
   bootanim_preview.py text TEXT [TEXT ...] [options]
                                    show text; several texts play one after another
                                    (A/B testing). See `text --help`.
+  bootanim_preview.py msg TEXT [TEXT ...] [options]
+                                   scroll a limit message over the live bars, as
+                                   the host does ("CPU STAPM 28W"); needs the
+                                   service running. See `msg --help`.
 
 Letter case picks the letter form: uppercase W and M are tall (they reach into
 the small top row), lowercase w and m are short. Every other letter has a
@@ -97,12 +101,12 @@ def describe(rep):
             f"display={MODES.get(rep[20], rep[20])}")
 
 
-def wait_done(dev, timeout=70.0):
-    """Block until the macropad's playback has finished."""
+def wait_done(dev, timeout=70.0, byte=21):
+    """Block until the macropad's playback (byte 22: message) has finished."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         rep = replay(dev, [0xFD])
-        if rep is not None and not rep[21]:
+        if rep is not None and not rep[byte]:
             return
         time.sleep(0.2)
 
@@ -516,6 +520,53 @@ def text_main(dev, argv):
         print("stopped")
 
 
+MSG_COLORS = {"red": (0, 255), "green": (85, 255), "amber": (28, 255), "white": (0, 0)}
+
+
+def msg_main(dev, argv):
+    ap = argparse.ArgumentParser(
+        prog="bootanim_preview.py msg",
+        description="Scroll a limit message over the live bars, exactly as the "
+                    "host sends one: the bars dim out, the text scrolls through, "
+                    "the bars fade back in. Only plays while the bars show (the "
+                    "service running). Several texts play one after another.")
+    ap.add_argument("texts", nargs="+", metavar="TEXT")
+    ap.add_argument("-c", "--color", default="red",
+                    help="red (the CPU row's, default), green (the dGPU's), "
+                         "amber, white, or a QMK hue 0-255")
+    ap.add_argument("-v", "--speed", type=int, default=0,
+                    help="columns per second (default: the firmware's, 8)")
+    ap.add_argument("-r", "--repeat", type=int, default=1,
+                    help="play the whole list this many times")
+    a = ap.parse_args(argv)
+    hue, sat = MSG_COLORS.get(a.color, (None, 255))
+    if hue is None:
+        try:
+            hue = int(a.color)
+        except ValueError:
+            sys.exit(f"--color: {a.color!r} is not one of {', '.join(MSG_COLORS)} or a hue")
+    for t in a.texts:
+        if len(t) > TEXT_MAX:
+            sys.exit(f"{t!r} is longer than {TEXT_MAX} characters")
+    status = replay(dev, [0xFD])
+    if status is not None and status[20] != 2:
+        print(f"note: the pad shows {MODES.get(status[20], status[20])}, not the bars; "
+              "a message only plays over the bars")
+    try:
+        for _ in range(a.repeat):
+            for t in a.texts:
+                print(f"scrolling {t!r}")
+                raw = t.encode("ascii", "replace")
+                dev.write(b"\x00" + bytes([0x07, 0x42, 0x05, 0, hue & 0xFF, sat,
+                                           max(0, min(a.speed, 255)), 0])
+                          + raw + bytes(24 - len(raw)))
+                time.sleep(0.3)
+                wait_done(dev, 60.0, byte=22)
+                time.sleep(0.8)  # the bars fading back in
+    except KeyboardInterrupt:
+        print("stopped (the message plays out)")
+
+
 def parse(argv):
     arg = argv[0] if argv else "0"
     if arg == "status":
@@ -551,7 +602,7 @@ def take_speed(argv):
 
 def main():
     argv, speed = sys.argv[1:], None
-    if argv[:1] != ["text"]:  # text's own -v/--speed is ms per letter
+    if argv[:1] not in (["text"], ["msg"]):  # their own -v/--speed is letters / columns
         argv, speed = take_speed(argv)
     if speed is not None and argv and not (argv[0] == "trace" or argv[0][0].isdigit()):
         sys.exit("--speed works with replays of animations (N, N-M, all) and trace N")
@@ -562,6 +613,9 @@ def main():
     try:
         if argv[:1] == ["text"]:
             text_main(dev, argv[1:])
+            return
+        if argv[:1] == ["msg"]:
+            msg_main(dev, argv[1:])
             return
         if argv[:1] == ["trace"]:
             trace_main(dev, argv[1:], speed)

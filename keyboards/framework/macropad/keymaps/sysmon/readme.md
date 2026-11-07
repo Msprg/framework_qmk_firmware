@@ -7,10 +7,10 @@ normally — the stats ride on a private custom-value channel, `0x42`):
 | Row | Indicator | Colors |
 |-----|-----------|--------|
 | 1 (top, small keys) | Battery | charging: level bar (red→green by level), segments from the filling one upward pulse in sync; discharging: level bar (red unplugged, amber when the battery is assisting an overloaded charger on AC), segments from the boundary downward flare and fade in sync, blinks below 15%; the charge/discharge power decides how many segments animate (1 segment for a trickle up to all 4 at ≥75 W); idle on AC: whole row steady dim green — a sub-10 W drain counts as idle, and if the EC is measurably drifting off the cap the boundary segment breathes faintly as a tell (a 0 W "discharging" report, which is what the EC says while it floats a pack it is done charging, is plain idle: no tell); the bar is rescaled against the max-charge cap, so charged-to-cap shows completely full |
-| 2 | CPU usage | red bar; breathes when the APU is power-limited (see below) |
+| 2 | CPU usage | red bar; breathes when a limit holds the APU back, and the pad names it (see below) |
 | 3 | Memory usage | gold bar; whole row blinks at ~1 Hz when usage is critically high (≥90%) |
 | 4 | iGPU + NPU usage | red bar for the iGPU; NPU usage as a dim cyan *ghost* bar behind it, visible where the NPU is busier than the iGPU (see below) |
-| 5 | dGPU usage | green bar (dark if no dGPU); breathes when the dGPU is power-limited (see below) |
+| 5 | dGPU usage | green bar (dark if no dGPU); breathes when a limit holds the dGPU back, and the pad names it (see below) |
 | 6 | System temperature | fixed green→deep-red gradient across the row; bar length scales 30–90 °C; whole row blinks at ~1 Hz above 90 °C |
 
 ## Boot rainbow
@@ -91,6 +91,7 @@ alongside the running service. From `host\`:
 .venv\Scripts\python.exe -I bootanim_preview.py reboot 5 # five starts in a row, each after the last finished
 .venv\Scripts\python.exe -I bootanim_preview.py text FRAMEWORK FRAmEWORK -r 3   # A/B, three times
 .venv\Scripts\python.exe -I bootanim_preview.py text FRAMEWORK16 -s ticker -c letters
+.venv\Scripts\python.exe -I bootanim_preview.py msg "CPU STAPM 28W" "GPU HOT 87C" -c green  # limit messages, over the live bars
 .venv\Scripts\python.exe -I bootanim_preview.py trace    # what the LEDs were sent over the last ~13 s
 .venv\Scripts\python.exe -I bootanim_preview.py trace 1  # animation 1 and the fade into the bars after it (trace 1 x3: three times)
 ```
@@ -157,45 +158,89 @@ machine without an NPU the row is just the iGPU bar. Drawing the ghost needs the
 firmware from this version (protocol FRAME C, below); older firmware ignores it
 and shows the plain iGPU bar.
 
-## Power-limit indication
+## Limit indication
 
-The CPU (row 2, whole APU) and dGPU (row 5) rows **breathe** when the component
-is running at reduced capacity because of a *power* limit. The bar stays
-visible (it dips to a dim floor, not off — that's reserved for the critical
-blinks), and the cadence says which kind of limit:
+The CPU (row 2, whole APU) and dGPU (row 5) rows **breathe** when a limit is
+holding the component back. The bar stays visible: it dips to a dim floor, not
+off, since off is the critical blinks' language. The cadence says which kind:
 
-- **Brisk breathe (~1.5 s)** — the chip is at its own power/TDP ceiling on AC
-  (chip-bound).
+- **Brisk breathe (~1.5 s)** — the chip is at one of its own limits (below).
 - **Slow breathe (~4 s)** — the *power source* is the bottleneck: the battery
   is assisting an overloaded/undersized charger on AC, so a loaded component is
   being throttled to fit. This pairs with the battery row turning **amber** in
   the same situation (the battery row says the charger is overloaded; the
-  component breathe says which component it's choking). Plain battery operation
-  is *not* shown here — the battery row's discharging colour already conveys it.
+  component breathe says which component it's choking).
 
-Thermal throttling is intentionally not shown here — the temperature row's
->90 °C blink already covers it.
+Which limits count is `LIMIT_KINDS` in `sysmon.ini` (all four by default):
+
+| Kind | APU (CPU row) | dGPU | When |
+|------|---------------|------|------|
+| `power` | STAPM, slow PPT (`APU_LIMIT_SIGNALS`; fast PPT is left out, as its short boost window would flicker) | the driver's power cap, the hardware power brake | on AC only: on battery the limits drop by design, and the battery row already shows that |
+| `current` | TDC and EDC, core and SoC | — | always |
+| `thermal` | Tctl at its THM limit (within `APU_THM_MARGIN_C`) | the driver's or the hardware's thermal slowdown | always |
+| `charger` | a STAPM/PPT limit binding while the battery assists an overloaded charger (the EC lowered it): the slow breathe | a loaded dGPU capped while the battery assists: the slow breathe | on AC |
+
+A capped value hovers around its threshold: under an all-core load STAPM
+crossed 95% of its limit every 1-3 s. So a limit counts until it has been
+clear for `LIMIT_RELEASE_S` (8 s), and the breathe doesn't flicker.
+
+### The pad names the limit
+
+For the brisk breathe the cadence alone can't say which limit it is, so the pad
+says it. When a limit has held for 3 s and still binds, the bars dim out, the
+pad scrolls which component, which limit and its current value across, in the
+row's colour, and the bars fade back in:
+
+```text
+CPU STAPM 28W     APU sustained power budget, now 28 W (it falls as the chassis warms)
+CPU PPT 30W       slow PPT          CPU FAST PPT 45W   fast PPT (only with fast in APU_LIMIT_SIGNALS)
+CPU TDC 54A       core current      CPU SOC TDC 30A    SoC current     CPU EDC 54A / CPU SOC EDC 30A
+CPU HOT 100C      Tctl at its THM limit
+GPU POWER 100W    the dGPU's power cap (its enforced limit)
+GPU BRAKE         the hardware power brake
+GPU HOT 87C       thermal slowdown (the GPU's temperature)
+CPU POWER 54W     the package-power heuristic, without ryzenadj (package power)
+```
+
+That takes about 8 s. It plays once per episode: again only when the limit
+changes (STAPM → TDC, say; at most every 30 s), and a new episode starts once
+the component has been free of limits for 2 minutes. When several limits bind
+at once the closest to its limit is named, and it stays named while it holds.
+Which kinds get named is `MSG_KINDS` (`power, current, thermal`): the slow
+charger breathe is clear enough without text, so it isn't.
+
+**Keypad 5 with NumLock off** (where it does nothing) replays it on demand:
+the pad names what makes each row breathe right now, the charger included
+(`CPU CHARGER`, in amber), or says NO LIMIT.
+
+The words, the timings (`MSG_ONSET_S`, `MSG_MIN_GAP_S`, `MSG_REARM_S`), the
+speed and whether the value is shown are all in the `[messages]` section of
+`sysmon.ini`; `MSG_ENABLE = 0` keeps only the replay key. A message needs the
+firmware from this version (`--selftest` says whether the module has it);
+older firmware just breathes. `bootanim_preview.py msg TEXT` scrolls any text
+the same way, over the live bars, for trying wording out.
 
 Detection sources (per component, degrades gracefully if absent):
 
 - **dGPU** — NVIDIA only, via **NVML** (`pip install pynvml`): authoritative
-  throttle reasons (`SwPowerCap`, `HwPowerBrakeSlowdown`) plus the enforced
-  power limit. No NVIDIA card / no pynvml → no dGPU limit indication.
+  throttle reasons (`SwPowerCap`, `HwPowerBrakeSlowdown`, the thermal
+  slowdowns) plus the enforced power limit. Each must hold for
+  `NV_DEBOUNCE_READS` reads before it counts. No NVIDIA card / no pynvml → no
+  dGPU limit indication.
 - **APU (CPU/iGPU)** — read **authoritatively** from the AMD SMU power-metrics
   table via **`ryzenadj`** (its `libryzenadj.dll`, loaded in-process). This is
-  the same source HWiNFO reads for *APU STAPM Limit* etc.: the CPU row breathes
-  when a power limit is *binding* — its live value has reached the limit. STAPM
-  (the skin-temperature-aware sustained budget) and the slow PPT are checked
-  (the short fast-PPT boost window is read for diagnostics but not used to
-  trigger, so brief boosts don't flicker — see `APU_LIMIT_SIGNALS`). Install
-  the tool (`scoop install ryzenadj`); the DLL is auto-discovered, or point
+  the same source HWiNFO reads for *APU STAPM Limit* etc., and the same table
+  `ryzenadj -i` prints: a power or current limit is *binding* once its live
+  value reaches `APU_LIMIT_NEAR` (95%) of the limit. Install the tool
+  (`scoop install ryzenadj`); the DLL is auto-discovered, or point
   `--ryzenadj-dir` at it. It loads a ring0 driver, so the script must be
   **elevated**.
   - *Fallback (no ryzenadj):* AMD exposes no throttle flags, so the cap is
     *inferred* from **LibreHardwareMonitor** package power + CPU load — flagged
     when, under sustained high load on AC, package power plateaus at the
-    ceiling (auto-calibrated; pass `--cpu-power-cap <watts>` to pin it). With
-    neither ryzenadj nor LHM the CPU row never breathes.
+    ceiling (auto-calibrated; pass `--cpu-power-cap <watts>` to pin it). It
+    can't tell which limit it is, so it is named POWER. With neither ryzenadj
+    nor LHM the CPU row never breathes.
 
 LED brightness follows the laptop screen brightness (scaled, capped well
 below full brightness). If no stats arrive for 5 seconds (script stopped,
@@ -403,12 +448,13 @@ Deployment flags (also used by the installer):
 - `--write-default-config` — write the fully commented default INI (never
   overwrites an existing one)
 
-The **AMD APU power-limit breathe** comes from `ryzenadj`/`libryzenadj` (the SMU
+The **AMD APU limit breathe** comes from `ryzenadj`/`libryzenadj` (the SMU
 table; authoritative) with the LibreHardwareMonitor package-power heuristic as
-fallback — see [Power-limit indication](#power-limit-indication) above. With
-`--verbose`, the `limits …` line shows either `cpu ryzenadj[stapm=…/…W slow=…/…W
-…]` (a `*` marks a binding limit) or `cpu heuristic(pkg_w=… load=…)`, so you can
-confirm which source is driving the CPU row.
+fallback — see [Limit indication](#limit-indication) above. With `--verbose`,
+the `limits …` line shows either `cpu ryzenadj[stapm=…/…W slow=…/…W tdc=…/…A
+… thm=…/…C]` (a `*` marks a limit binding this tick) or `cpu heuristic(pkg_w=…
+load=…)`, then `->` and the limit the row breathes for, so you can confirm which
+source is driving the CPU row. `message: '…'` lines show what the pad is told.
 
 **Temperature** comes from one of (tried in this order):
 
@@ -483,9 +529,14 @@ either works during development. What is available:
 
 - **thresholds**: `BATT_CRITICAL_PCT`, `MEM_CRITICAL_PCT`, `TEMP_CRITICAL_C`,
   `TEMP_MIN_C` / `TEMP_MAX_C`, `ASSIST_MIN_W`, `DRIFT_MIN_W`
-- **APU power limit**: `APU_LIMIT_NEAR` (how close to a limit counts as
-  binding) and `APU_LIMIT_SIGNALS` (which SMU limits — `stapm`/`slow`/`fast` —
-  trigger the breathe)
+- **limits**: `LIMIT_KINDS` (which kinds — `power`/`current`/`thermal`/`charger`
+  — breathe), `APU_LIMIT_NEAR` (how close to a limit counts as binding),
+  `APU_LIMIT_SIGNALS` (which SMU power limits — `stapm`/`slow`/`fast` — count),
+  `APU_THM_MARGIN_C`, `LIMIT_RELEASE_S`
+- **messages**: `MSG_ENABLE`, `MSG_KINDS` (which kinds the pad names on its
+  own), `MSG_ONSET_S` / `MSG_MIN_GAP_S` / `MSG_REARM_S`,
+  `MSG_SPEED`, `MSG_SHOW_VALUE`, and every word (`MSG_NAME_*`, `MSG_WORD_*`,
+  `MSG_NO_LIMIT`)
 - **colours**: the `HUE_*` constants (including `HUE_NPU`, the ghost bar) and
   the temperature gradient endpoints
 - **mappings**: `RATE_SEG_W1/2/3` (watts → animated segments),
@@ -511,9 +562,11 @@ Three 32-byte VIA "custom set value" reports are sent per interval on channel
                0x02 = FRAME B (rows 3,4,5 + globals)
                0x03 = FRAME C (ghost bars, rows 0..5; optional)
                0x04 = GOODBYE (no payload; sent once on a clean exit)
+               0x05 = MESSAGE (a line of text over the bars; when there is one)
                0x10 = BOOT REPLAY, 0x11 = REBOOT, 0x12 = TRACE (testing only, see below)
 [3..] payload: FRAME A/B: three back-to-back 8-byte row descriptors
                FRAME C:   six back-to-back 4-byte ghost descriptors
+               MESSAGE:   see below
 
 row descriptor (8 bytes):
   +0 level         0-255  fraction of the 4-segment bar (0=empty, 255=full)
@@ -532,6 +585,9 @@ FRAME B appends three globals after its three row descriptors:
   [27] brightness  0-255           overall brightness (drives the LED global current)
   [28] glide       units of 4 ms   per-row level glide   (default 300 ms => 75)
   [29] timeout     units of 100 ms no-data fallback       (default 5000 ms => 50)
+FRAME B echo:
+  [31] status      bit0 a MESSAGE is waiting or playing,
+                   bit1 the replay key was pressed (reported once; older firmware: 0)
 
 ghost descriptor (4 bytes, FRAME C):
   +0 level   0-255  fraction of the 4-segment bar (0 = no ghost)
@@ -561,6 +617,31 @@ never leave a stale ghost behind. Ghost-capable firmware also sets byte `[27]`
 of its FRAME C echo to `0x01` (older firmware echoes the frame unchanged), which
 is how `--selftest` reports that the module needs a reflash to draw the NPU.
 
+MESSAGE (`0x05`) is how the host names a limit (see [The pad names the
+limit](#the-pad-names-the-limit)). The bars dim out over 0.3 s, the text
+scrolls through on dark at a steady pace, in the boot text's font, and once
+its last column is gone the bars fade back in the way they do after the boot
+rainbow. The bars keep running underneath, so they return as they are by then.
+A message waits until the bars show and have settled (not mid-fade), is dropped
+if the host goes away first, and never plays over the boot rainbow or the
+disconnect warning. A new one replaces one waiting or playing; the host waits
+for the FRAME B echo's bit0 to clear before it sends the next.
+
+```text
+[3]      style: 0 = ticker (others reserved; played as the ticker)
+[4] [5]  hue, saturation of the text (saturation 0 = white)
+[6]      speed, columns per second (0 = 8; 2..40)
+[7]      reserved (0)
+[8..30]  text, NUL-terminated, up to 23 characters (A-Z, 0-9, space, - ! .;
+         uppercase W and M are the tall forms). Empty: nothing happens -- a probe
+echo [31] 0x01: the firmware shows messages (older firmware echoes it unchanged)
+```
+
+The replay key is keypad 5 while NumLock is off. The firmware catches it by
+keycode rather than through the keymap (VIA keeps the keymap in EEPROM, where a
+new default would never reach a pad that already has one), and only while the
+bars show; the host answers through the FRAME B echo's bit1.
+
 Value `0x10` (BOOT REPLAY) isn't sent by the host; it replays boot animations
 for previewing (`host/bootanim_preview.py`) and never counts as host data, so
 it doesn't end the pre-connect rainbow:
@@ -578,6 +659,7 @@ echo [11..14] boot counter in RAM (u32 LE)   [15] this power-up's pick (1-based)
      [16..19] boot counter in EEPROM (u32 LE; lags by one until the boot animation ends)
      [20]     display: 0 = regular RGB effect, 1 = boot rainbow, 2 = bars, 3 = warning
      [21]     1 while an animation is playing (the power-up one too)
+     [22]     1 while a MESSAGE waits or plays
 
 custom text (0xFB): [4] style 0 flash / 1 ticker / 2 pop, [5] colour 0 rainbow /
 1 per letter / 2 white, [6..7] speed (u16 LE; 0 = default), [8..] text, NUL-terminated
@@ -602,6 +684,6 @@ others: echo [8..9] frames held (u16 LE), [10] frame size (76), [11] frozen,
 frame (76 bytes): [0..1] ms (the timer's low 16 bits), [2] global current,
         [3] bits 0-1 display (as data[20] of BOOT REPLAY), bits 2-3 current
         change (1 rising: PWM sent first, 2 falling: current first), bit 4
-        fading into the bars; [4..75] PWM, pad rows top to bottom, keys left
-        to right, R G B
+        fading into the bars, bit 5 a message showing; [4..75] PWM, pad rows
+        top to bottom, keys left to right, R G B
 ```

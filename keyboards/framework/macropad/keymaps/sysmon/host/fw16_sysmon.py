@@ -31,9 +31,11 @@ Dependencies (Windows):
       pythonnet -- in-process LibreHardwareMonitorLib for AMD APU package power
                    + temperature (run --fetch-lhm once)
 
-APU power-limit detection (CPU-row breathe), in order:
-    1. ryzenadj / libryzenadj SMU table: STAPM/PPT value-vs-limit (authoritative)
+APU limit detection (CPU-row breathe, and the message naming the limit):
+    1. ryzenadj / libryzenadj SMU table: STAPM/PPT/TDC/EDC/THM value-vs-limit
+       (authoritative)
     2. LibreHardwareMonitor package-power plateau heuristic (fallback)
+The dGPU's come from NVML's throttle reasons. See LIMIT_KINDS, LimitTracker.
 
 Temperature sources, tried in order:
     1. LibreHardwareMonitorLib in-process via pythonnet (run --fetch-lhm)
@@ -137,6 +139,16 @@ REPORT_LEN = 32
 #   fades the ghosts out if FRAME C stops arriving within the timeout, and sets
 #   data[27] = 0x01 in its FRAME C echo (older firmware echoes it unchanged),
 #   which is how --selftest tells whether a reflash is needed.
+#
+# MESSAGE (value_id 0x05, sent only when there is something to say): a line
+#   of text the firmware scrolls over the bars -- the bars dim out, the text
+#   scrolls through on dark, the bars fade back in:
+#   data[3] style (0 = ticker), data[4] hue, data[5] saturation (0 = white),
+#   data[6] speed in columns/s (0 = firmware default), data[7] reserved,
+#   data[8..30] text, NUL-terminated (up to 23 chars). Empty text is a probe:
+#   message-capable firmware sets data[31] = 0x01 in the echo.
+#   The FRAME B echo's data[31] reports bit0 = a message is waiting or
+#   playing, bit1 = the replay key was pressed (answer with a MESSAGE).
 # ---------------------------------------------------------------------------
 
 VIA_CMD_CUSTOM_SET_VALUE = 0x07
@@ -145,11 +157,18 @@ SYSMON_VALUE_FRAME_A = 0x01  # rows 0,1,2
 SYSMON_VALUE_FRAME_B = 0x02  # rows 3,4,5 + globals
 SYSMON_VALUE_FRAME_C = 0x03  # ghost bars, rows 0..5
 SYSMON_VALUE_GOODBYE = 0x04  # host stopping on purpose: no disconnect warning
+SYSMON_VALUE_MESSAGE = 0x05  # a line of text scrolled over the bars
 
 ROW_DESC_LEN = 8
 GHOST_DESC_LEN = 4
 GHOST_ACK_OFFSET = 27   # FRAME C echo byte the firmware marks when it draws ghosts
 GHOST_ACK = 0x01
+MSG_ACK_OFFSET = 31     # MESSAGE echo byte the firmware marks when it can show one
+MSG_ACK = 0x01
+STATUS_OFFSET = 31      # FRAME B echo: the firmware's status bits
+STATUS_MSG = 0x01       #   a message is waiting or playing
+STATUS_ASK = 0x02       #   the replay key was pressed
+MSG_TEXT_MAX = 23
 
 # Fixed row order (matches sysmon_row_leds; do NOT change).
 ROW_BATTERY = 0
@@ -238,13 +257,61 @@ LIMIT_FLOOR = 110
 APU_LIMIT_NEAR = 0.95   # a STAPM/PPT limit counts as binding when its live
                         # value reaches this fraction of the limit (the value
                         # sits right at the limit when the chip is power-capped)
-APU_LIMIT_SIGNALS = ("stapm", "slow")  # which SMU limits trigger the CPU-row
-                        # breathe. STAPM (skin-temp-aware sustained budget --
-                        # the "APU STAPM Limit" HWiNFO shows) and the slow PPT
-                        # are sustained, so they give a steady signal; the fast
-                        # PPT is the short boost window and would flicker, so it
-                        # is read for diagnostics but not used to trigger. Add
-                        # "fast" here to include it.
+APU_LIMIT_SIGNALS = ("stapm", "slow")  # which SMU *power* limits count (when
+                        # LIMIT_KINDS has "power"). STAPM (skin-temp-aware
+                        # sustained budget -- the "APU STAPM Limit" HWiNFO shows)
+                        # and the slow PPT are sustained, so they give a steady
+                        # signal; the fast PPT is the short boost window and
+                        # would flicker, so it is read for diagnostics but not
+                        # used to trigger. Add "fast" here to include it.
+
+# Which kinds of limit make the CPU / dGPU row breathe:
+#   power   -- APU STAPM / PPT (APU_LIMIT_SIGNALS), dGPU power cap and power
+#              brake; on AC only (on battery the limits drop by design and the
+#              battery row already says so)
+#   current -- APU TDC / EDC, core and SoC
+#   thermal -- APU Tctl at its THM limit (APU_THM_MARGIN_C), dGPU thermal
+#              slowdown
+#   charger -- a component held back while the battery assists an overloaded
+#              charger: breathes slowly (PERIOD_BREATHE_SLOW) -- the cadence
+#              itself says "the charger", next to the battery row's amber
+LIMIT_KINDS = ("power", "current", "thermal", "charger")
+# ...and which of them the pad also names on its own, in a message. The replay
+# key names whatever makes a row breathe, these or not.
+MSG_KINDS = ("power", "current", "thermal")
+APU_THM_MARGIN_C = 3.0  # Tctl within this many degrees of the THM limit binds
+LIMIT_RELEASE_S = 8.0   # a limit stays "binding" until it has been clear this
+                        # long: a capped value hovers around the threshold
+                        # (STAPM crossed 95% every 1-3 s under an all-core load
+                        # here), which flickered the breathe on and off
+
+# Limit messages: when a limit (of MSG_KINDS) has held for MSG_ONSET_S, the pad
+# scrolls the component, the limit and its current value ("CPU STAPM 28W") over
+# the bars, once per episode -- again only when the reason changes (at most
+# every MSG_MIN_GAP_S), or after the limit has been clear for MSG_REARM_S.
+# Keypad 5 with NumLock off names what makes each row breathe, on demand.
+MSG_ENABLE = 1          # 0: no automatic messages (the replay key still works)
+MSG_ONSET_S = 3.0
+MSG_MIN_GAP_S = 30.0
+MSG_REARM_S = 120.0
+MSG_SPEED = 8           # ticker speed, columns per second
+MSG_SHOW_VALUE = 1      # 0: leave out the limit's value
+MSG_NAME_CPU = "CPU"    # the component names (the CPU row is the whole APU)
+MSG_NAME_GPU = "GPU"
+MSG_NO_LIMIT = "NO LIMIT"  # the replay key's answer when nothing binds
+# The word for each limit. Uppercase W and M are the tall letter forms.
+MSG_WORD_STAPM = "STAPM"
+MSG_WORD_SLOW = "PPT"
+MSG_WORD_FAST = "FAST PPT"
+MSG_WORD_TDC = "TDC"
+MSG_WORD_TDC_SOC = "SOC TDC"
+MSG_WORD_EDC = "EDC"
+MSG_WORD_EDC_SOC = "SOC EDC"
+MSG_WORD_THM = "HOT"
+MSG_WORD_POWER = "POWER"    # dGPU power cap; APU package-power heuristic
+MSG_WORD_BRAKE = "BRAKE"    # dGPU hardware power brake
+MSG_WORD_THERMAL = "HOT"    # dGPU thermal slowdown
+MSG_WORD_CHARGER = "CHARGER"
 
 # Inference thresholds (the LHM package-power fallback used only when ryzenadj
 # is unavailable; all heuristic; tune as needed).
@@ -635,6 +702,42 @@ class GpuMonitor:
         return min(100, igpu), min(100, dgpu), self.dgpu_present, npu
 
 
+class Reason:
+    """One limit that binds right now: what it is and how far in.
+
+    key names the limit (it picks the message's word, see REASON_WORDS), kind
+    is its LIMIT_KINDS group, ratio how close the live value is to the limit
+    (it ranks limits binding at once), and value + unit what the message shows
+    (the limit itself, or for the dGPU's thermal slowdown its temperature).
+    """
+    __slots__ = ("key", "kind", "ratio", "value", "unit")
+
+    def __init__(self, key, kind, ratio=1.0, value=None, unit=""):
+        self.key = key
+        self.kind = kind
+        self.ratio = ratio
+        self.value = value
+        self.unit = unit
+
+    def word(self):
+        return globals()[REASON_WORDS[self.key]]  # read now: the INI rebinds them
+
+    def __repr__(self):
+        v = "" if self.value is None else f" {self.value:.1f}{self.unit}"
+        return f"{self.key}({self.ratio:.2f}{v})"
+
+
+# Message word for each reason key: the *name* of the constant, looked up when
+# the message is built, so sysmon.ini can change it.
+REASON_WORDS = {
+    "stapm": "MSG_WORD_STAPM", "slow": "MSG_WORD_SLOW", "fast": "MSG_WORD_FAST",
+    "tdc": "MSG_WORD_TDC", "tdc_soc": "MSG_WORD_TDC_SOC",
+    "edc": "MSG_WORD_EDC", "edc_soc": "MSG_WORD_EDC_SOC",
+    "thm": "MSG_WORD_THM", "power": "MSG_WORD_POWER", "brake": "MSG_WORD_BRAKE",
+    "thermal": "MSG_WORD_THERMAL", "charger": "MSG_WORD_CHARGER",
+}
+
+
 class NvGpuLimits:
     """dGPU power & throttle state for NVIDIA cards via NVML.
 
@@ -651,7 +754,7 @@ class NvGpuLimits:
     def __init__(self, enabled=True):
         self.available = False
         self.handle = None
-        self._deb = [(False, 0), (False, 0)]  # debounce state for (power, psrc)
+        self._streak = {}  # reason key -> consecutive reads it has been seen
         self._retryable = False
         self._init_failed = False
         self._next_init = 0.0
@@ -679,6 +782,11 @@ class NvGpuLimits:
             self._hw_brake = getattr(
                 pynvml, "nvmlClocksThrottleReasonHwPowerBrakeSlowdown",
                 getattr(pynvml, "nvmlClocksEventReasonHwPowerBrakeSlowdown", 0))
+            self._thermal = (
+                getattr(pynvml, "nvmlClocksThrottleReasonSwThermalSlowdown",
+                        getattr(pynvml, "nvmlClocksEventReasonSwThermalSlowdown", 0x20))
+                | getattr(pynvml, "nvmlClocksThrottleReasonHwThermalSlowdown",
+                          getattr(pynvml, "nvmlClocksEventReasonHwThermalSlowdown", 0x40)))
             self._reasons_fn = (
                 getattr(pynvml, "nvmlDeviceGetCurrentClocksThrottleReasons", None)
                 or getattr(pynvml, "nvmlDeviceGetCurrentClocksEventReasons", None))
@@ -713,16 +821,21 @@ class NvGpuLimits:
             return None
 
     def evaluate(self, on_ac, weak_charger):
-        """Return (power_limited, psrc_limited) for the dGPU.
+        """Return {key: Reason} for the dGPU limits that bind right now.
 
-        Only the weak-charger (battery-assisting-on-AC) case is surfaced as a
-        power-source limit; plain battery operation is left to the battery row.
+        power (the driver's power cap, believed only near the enforced limit)
+        and brake (the hardware power brake) count on AC only; thermal (the
+        driver's or the hardware's thermal slowdown) anywhere. With "charger"
+        in LIMIT_KINDS, a loaded GPU held back while the battery assists an
+        overloaded charger is the charger instead. Each must hold for
+        NV_DEBOUNCE_READS reads in a row before it counts, so one NVML blip
+        can't start the breathe; LimitTracker holds it on the way out.
         """
         if not self.available:
             if self._retryable and time.monotonic() >= self._next_init:
                 self._try_init()
             if not self.available:
-                return self._stabilize(False, False)
+                return self._debounce({})
         try:
             reasons = self._reasons_fn(self.handle)
             draw = pynvml.nvmlDeviceGetPowerUsage(self.handle) / 1000.0
@@ -733,45 +846,43 @@ class NvGpuLimits:
             except Exception:
                 default = enforced
         except Exception:
-            return self._stabilize(False, False)
+            return self._debounce({})
 
         sw_cap = bool(reasons & self._sw_power)
         hw_brake = bool(reasons & self._hw_brake)
+        thermal = bool(reasons & self._thermal)
         capped_below_stock = default > 0 and enforced < 0.9 * default
         # NVIDIA sets SwPowerCap eagerly -- it can be set even near idle, when the
         # GPU is nowhere near its limit, which made the breathe flicker. Only
         # honour it as a real power cap when the GPU is actually drawing near its
         # enforced limit. HwPowerBrake is a genuine hardware brake; keep it as-is.
         near_cap = enforced > 0 and draw >= NV_NEAR_CAP * enforced
-        if weak_charger:
+        found = {}
+        if (weak_charger and "charger" in LIMIT_KINDS and draw >= NV_ACTIVE_MIN_W
+                and (hw_brake or (sw_cap and near_cap) or capped_below_stock)):
             # supply-bound: a loaded GPU capped while the charger can't keep up
-            active = draw >= NV_ACTIVE_MIN_W
-            return self._stabilize(
-                False,
-                active and (hw_brake or (sw_cap and near_cap) or capped_below_stock))
-        if on_ac:
-            # chip-bound: the driver/board is actively capping power on AC
-            return self._stabilize(hw_brake or (sw_cap and near_cap), False)
-        # plain battery: not surfaced here (the battery row covers it)
-        return self._stabilize(False, False)
+            found["charger"] = Reason("charger", "charger")
+        else:
+            if on_ac and "power" in LIMIT_KINDS:
+                if sw_cap and near_cap:
+                    found["power"] = Reason("power", "power", draw / enforced,
+                                            enforced, "W")
+                if hw_brake:
+                    found["brake"] = Reason("brake", "power")
+            if thermal and "thermal" in LIMIT_KINDS:
+                try:
+                    temp = float(pynvml.nvmlDeviceGetTemperature(
+                        self.handle, pynvml.NVML_TEMPERATURE_GPU))
+                except Exception:
+                    temp = None
+                found["thermal"] = Reason("thermal", "thermal", 1.0, temp, "C")
+        return self._debounce(found)
 
-    def _stabilize(self, power, psrc):
-        """Debounce the (power, psrc) flags: a changed value must repeat for
-        NV_DEBOUNCE_READS consecutive evaluations before it is adopted, so an
-        isolated single-tick NVML blip can't flash the breathe on and off.
-        """
-        out = []
-        for i, raw in enumerate((power, psrc)):
-            cur, cnt = self._deb[i]
-            if raw == cur:
-                cnt = 0
-            else:
-                cnt += 1
-                if cnt >= NV_DEBOUNCE_READS:
-                    cur, cnt = raw, 0
-            self._deb[i] = (cur, cnt)
-            out.append(cur)
-        return out[0], out[1]
+    def _debounce(self, found):
+        """Keep only reasons seen NV_DEBOUNCE_READS evaluations in a row."""
+        self._streak = {k: self._streak.get(k, 0) + 1 for k in found}
+        return {k: r for k, r in found.items()
+                if self._streak[k] >= NV_DEBOUNCE_READS}
 
 
 class ApuLimits:
@@ -790,28 +901,24 @@ class ApuLimits:
         self.ceiling = 0.0
         self.prev = 0.0
 
-    def evaluate(self, reading, on_ac, weak_charger, limited=None):
-        """Return (power_limited, psrc_limited) for the APU.
+    def reasons(self, reading, on_ac, weak_charger):
+        """The heuristic's verdict as {key: Reason}: "power" (with the package
+        power) or, with "charger" in LIMIT_KINDS, "charger"."""
+        power, psrc = self.evaluate(reading, on_ac, weak_charger)
+        if psrc and "charger" in LIMIT_KINDS:
+            return {"charger": Reason("charger", "charger")}
+        if power and "power" in LIMIT_KINDS:
+            return {"power": Reason("power", "power", 1.0, reading[0], "W")}
+        return {}
 
-        `limited`, when not None, is an authoritative chip-power-cap boolean
-        (ryzenadj reporting a STAPM/PPT limit binding); the package-power
-        plateau heuristic below is then bypassed entirely. When None (no
-        ryzenadj), fall back to inferring the cap from LHM `reading` =
-        (package_watts, load_pct). Either way, only the weak-charger
-        (battery-assisting-on-AC) case is surfaced as a power-source limit;
-        plain battery operation is left to the battery row.
+    def evaluate(self, reading, on_ac, weak_charger):
+        """Return (power_limited, psrc_limited) for the APU, inferred.
+
+        The fallback when ryzenadj can't read the SMU table: the cap is
+        inferred from LHM `reading` = (package_watts, load_pct). Only the
+        weak-charger (battery-assisting-on-AC) case is surfaced as a
+        power-source limit; plain battery operation is left to the battery row.
         """
-        if limited is not None:
-            # Authoritative path: route the SMU verdict the same way the
-            # heuristic result is routed -- weak charger -> power-source (slow)
-            # breathe; else on AC -> chip (fast) breathe; plain battery is the
-            # battery row's job.
-            if weak_charger:
-                return False, bool(limited)
-            if on_ac:
-                return bool(limited), False
-            return False, False
-        # ---- fallback heuristic (no ryzenadj): LHM package-power plateau ----
         if reading is None:
             return False, False
         pkg_w, load = reading
@@ -1402,10 +1509,26 @@ class RyzenAdjSource:
     refreshes the table, so it is cheap enough to sit behind a TTL cache.
     """
 
+    # (value getter, limit getter) per SMU limit; HWiNFO / `ryzenadj -i` names:
+    # STAPM, PPT FAST/SLOW, TDC/EDC VDD and SOC, THM CORE. Note get_tctl_temp
+    # is the THM *limit*; the temperature is get_tctl_temp_value.
+    PAIRS = {
+        "stapm": ("get_stapm_value", "get_stapm_limit"),
+        "fast": ("get_fast_value", "get_fast_limit"),
+        "slow": ("get_slow_value", "get_slow_limit"),
+        "tdc": ("get_vrm_current_value", "get_vrm_current"),
+        "tdc_soc": ("get_vrmsoc_current_value", "get_vrmsoc_current"),
+        "edc": ("get_vrmmax_current_value", "get_vrmmax_current"),
+        "edc_soc": ("get_vrmsocmax_current_value", "get_vrmsocmax_current"),
+        "thm": ("get_tctl_temp_value", "get_tctl_temp"),
+    }
+
     def __init__(self, enabled=True, dll_dir=None):
         self.available = False
         self._lib = None
         self._ry = None
+        self._pairs = {}
+        self._tctl_moved = False  # two different Tctl readings seen
         self._tctl_last = None
         self._tctl_repeats = 0
         self._tctl_dead = False
@@ -1434,12 +1557,19 @@ class RyzenAdjSource:
             lib.init_table.restype = c_int
             lib.refresh_table.argtypes = [c_void_p]
             lib.refresh_table.restype = c_int
-            for name in ("get_stapm_limit", "get_stapm_value", "get_fast_limit",
-                         "get_fast_value", "get_slow_limit", "get_slow_value",
-                         "get_tctl_temp_value"):
-                fn = getattr(lib, name)
-                fn.restype = c_float
-                fn.argtypes = [c_void_p]
+            # STAPM/PPT are required; the rest are read when this libryzenadj
+            # has them (a pair whose getters are missing is simply not read).
+            self._pairs = {}
+            for key, (vname, lname) in self.PAIRS.items():
+                fns = [getattr(lib, n, None) for n in (vname, lname)]
+                if None in fns:
+                    if key in ("stapm", "fast", "slow"):
+                        raise AttributeError(f"{vname}/{lname} missing")
+                    continue
+                for fn in fns:
+                    fn.restype = c_float
+                    fn.argtypes = [c_void_p]
+                self._pairs[key] = fns
 
             ry = lib.init_ryzenadj()
             if not ry:
@@ -1493,25 +1623,22 @@ class RyzenAdjSource:
             pass
 
     def snapshot(self):
-        """Return {'stapm':(val,lim), 'fast':.., 'slow':.., 'tctl':temp_or_None}.
+        """Return {'stapm': (value, limit), 'fast': .., ..., 'tctl': C or None}.
 
-        Each (value, limit) pair is in watts; pairs whose limit is non-positive
-        or NaN (unsupported on this CPU) are dropped so they can't read as a
-        binding limit. Returns None on a refresh failure (caller falls back).
-        One SMU refresh, so it sits behind the snapshot TTL cache.
+        One (value, limit) pair per PAIRS key this libryzenadj can read: watts
+        for STAPM/PPT, amps for TDC/EDC, degrees C for THM. Pairs whose limit
+        is non-positive or NaN (unsupported on this CPU) are dropped so they
+        can't read as a binding limit. Returns None on a refresh failure
+        (caller falls back). One SMU refresh, so it sits behind the snapshot
+        TTL cache.
         """
         if not self.available:
             return None
-        g, ry = self._lib, self._ry
+        ry = self._ry
         try:
-            if g.refresh_table(ry) != 0:
+            if self._lib.refresh_table(ry) != 0:
                 return None
-            raw = {
-                "stapm": (g.get_stapm_value(ry), g.get_stapm_limit(ry)),
-                "fast": (g.get_fast_value(ry), g.get_fast_limit(ry)),
-                "slow": (g.get_slow_value(ry), g.get_slow_limit(ry)),
-            }
-            tctl = g.get_tctl_temp_value(ry)  # not get_tctl_temp: the limit
+            raw = {key: (fv(ry), fl(ry)) for key, (fv, fl) in self._pairs.items()}
         except Exception:
             return None
         out = {}
@@ -1520,24 +1647,13 @@ class RyzenAdjSource:
             # limit means "not reported" and must not count as binding.
             if lim == lim and val == val and lim > 0:
                 out[key] = (float(val), float(lim))
-        out["tctl"] = self._check_stuck(
-            float(tctl) if (tctl == tctl and tctl > 0) else None)
+        tctl = out["thm"][0] if "thm" in out else None
+        out["tctl"] = self._check_stuck(tctl if tctl and tctl > 0 else None)
+        if out["tctl"] is None or not self._tctl_moved:
+            # a dead temperature must not read as at its limit; nor one not
+            # yet seen to move (a dead one reads as live for STUCK_READS)
+            out.pop("thm", None)
         return out
-
-    @staticmethod
-    def power_limited(snap):
-        """True if any APU_LIMIT_SIGNALS limit is binding (value >= near*limit).
-
-        Returns None when there's no snapshot (source unavailable or a transient
-        refresh failure) so the caller can fall back to the heuristic that tick.
-        """
-        if snap is None:
-            return None
-        for key in APU_LIMIT_SIGNALS:
-            pair = snap.get(key)
-            if pair and pair[1] > 0 and pair[0] >= APU_LIMIT_NEAR * pair[1]:
-                return True
-        return False
 
     # A Tctl that never changes is not a temperature. The temperature used to
     # be read with get_tctl_temp, which is libryzenadj's THM *limit* getter
@@ -1568,6 +1684,7 @@ class RyzenAdjSource:
         if tctl == self._tctl_last:
             self._tctl_repeats += 1
         else:
+            self._tctl_moved |= self._tctl_last is not None
             self._tctl_repeats = 0
             self._tctl_last = tctl
             self._tctl_dead = False
@@ -1589,6 +1706,206 @@ class RyzenAdjSource:
         self._lib = None
         self._ry = None
         self.available = False
+
+
+# ---------------------------------------------------------------------------
+# Limit reasons: which limit holds a component back, held steady, and when to
+# say so on the pad
+# ---------------------------------------------------------------------------
+
+# SMU table key -> (LIMIT_KINDS group, unit of its value and limit)
+APU_SIGNALS = {
+    "stapm": ("power", "W"), "slow": ("power", "W"), "fast": ("power", "W"),
+    "tdc": ("current", "A"), "edc": ("current", "A"),
+    "tdc_soc": ("current", "A"), "edc_soc": ("current", "A"),
+    "thm": ("thermal", "C"),
+}
+
+
+def apu_reasons(snap, on_ac, weak_charger):
+    """{key: Reason} for the SMU limits that bind in a ryzenadj snapshot.
+
+    A power or current limit binds when its value reaches APU_LIMIT_NEAR of
+    the limit, THM when Tctl is within APU_THM_MARGIN_C of it. Power limits
+    count on AC only, and only those in APU_LIMIT_SIGNALS. The message shows
+    the limit (STAPM's moves: the SMU lowers it as the chassis warms). While
+    the battery assists an overloaded charger, a binding power limit is the
+    charger's doing (the EC lowered it): "charger", as it always was.
+    """
+    binding = {}
+    for key, (kind, unit) in APU_SIGNALS.items():
+        pair = snap.get(key)
+        if not pair:
+            continue
+        val, lim = pair
+        if kind == "thermal":
+            hit = val >= lim - APU_THM_MARGIN_C
+        else:
+            hit = val >= APU_LIMIT_NEAR * lim
+        if hit:
+            binding[key] = Reason(key, kind, val / lim, lim, unit)
+    capped = any(k in APU_LIMIT_SIGNALS for k in binding)
+    if weak_charger and capped and "charger" in LIMIT_KINDS:
+        return {"charger": Reason("charger", "charger")}
+    return {k: r for k, r in binding.items()
+            if r.kind in LIMIT_KINDS
+            and (r.kind != "power" or (on_ac and k in APU_LIMIT_SIGNALS))}
+
+
+class LimitTracker:
+    """One component's limit: which one binds, held through flicker, and when
+    the pad should name it.
+
+    A capped value hovers around the threshold, so a limit counts as binding
+    until it has been clear for LIMIT_RELEASE_S. Of several, the one named
+    stays named while it holds; when it lets go the closest of the rest takes
+    over. Messages follow episodes: one once the limit has held for
+    MSG_ONSET_S, another only when the reason changes (and MSG_MIN_GAP_S has
+    passed since the last), and a new episode only after MSG_REARM_S clear.
+    """
+
+    def __init__(self, name_const, hue_const):
+        self.name_const = name_const  # constant names: the INI rebinds them
+        self.hue_const = hue_const
+        self.seen = {}        # key -> (time last binding, Reason)
+        self.current = None   # key of the limit named
+        self.live = False     # ...and it binds this tick (not just held)
+        self.since = 0.0      # when the component became limited
+        self.clear_at = 0.0   # when it stopped
+        self.announced = None # key named last in this episode
+        self.last_msg = None  # when a message last named this component
+
+    @property
+    def reason(self):
+        return self.seen[self.current][1] if self.current else None
+
+    @property
+    def limited(self):
+        return self.current is not None
+
+    def update(self, binding, now):
+        for key, r in binding.items():
+            self.seen[key] = (now, r)
+        self.seen = {k: v for k, v in self.seen.items()
+                     if now - v[0] <= LIMIT_RELEASE_S}
+        was = self.limited
+        if self.current not in self.seen:
+            pool = binding or {k: v[1] for k, v in self.seen.items()}
+            self.current = (max(pool, key=lambda k: pool[k].ratio)
+                            if pool else None)
+        self.live = self.current in binding  # binds this tick, not just held
+        if self.limited and not was:
+            self.since = now
+        elif was and not self.limited:
+            self.clear_at = now
+        if (not self.limited and self.announced is not None
+                and now - self.clear_at >= MSG_REARM_S):
+            self.announced = None  # the episode is over
+
+    def due(self, now):
+        """True when the pad should name the limit now.
+
+        The limit must bind on this very tick too: the release hold keeps one
+        stray read "limited" for LIMIT_RELEASE_S, which must not be enough to
+        scroll a message MSG_ONSET_S later. Kinds outside MSG_KINDS (the
+        charger, by default) only breathe.
+        """
+        return (self.live and self.reason.kind in MSG_KINDS
+                and now - self.since >= MSG_ONSET_S
+                and self.current != self.announced
+                and (self.last_msg is None
+                     or now - self.last_msg >= MSG_MIN_GAP_S))
+
+    def mark(self, now):
+        self.announced = self.current
+        self.last_msg = now
+
+    def message(self):
+        """(text, hue, saturation) naming the limit, e.g. "CPU STAPM 28W"."""
+        r = self.reason
+        text = f"{globals()[self.name_const]} {r.word()}"
+        if MSG_SHOW_VALUE and r.value is not None:
+            text += f" {int(r.value + 0.5)}{r.unit}"
+        hue = HUE_AMBER if r.key == "charger" else globals()[self.hue_const]
+        return text[:MSG_TEXT_MAX], hue, 255
+
+
+class Messenger:
+    """Sends limit messages to the pad, one at a time.
+
+    Learns from a probe whether the firmware can show them at all, and from
+    each FRAME B echo whether one is still waiting or playing and whether the
+    replay key was pressed. Echoes reach every open handle, so the preview
+    tool's own messages hold this one back too.
+    """
+
+    SETTLE_S = 1.2  # after sending, until the echoes surely tell its state
+
+    def __init__(self, verbose=False):
+        self.verbose = verbose
+        self.reset()
+
+    def reset(self):
+        self.capable = False
+        self.busy = False
+        self.asked = False
+        self.queue = []
+        self.sent_at = -1e9
+
+    def probe(self, dev):
+        """Ask (empty text) whether the firmware shows messages; see on_echo."""
+        self._write(dev, "", 0, 0)
+
+    def on_echo(self, rep):
+        if len(rep) < REPORT_LEN or rep[1] != SYSMON_CHANNEL:
+            return
+        if rep[2] == SYSMON_VALUE_MESSAGE and rep[MSG_ACK_OFFSET] == MSG_ACK:
+            if not self.capable and self.verbose:
+                print("firmware shows limit messages")
+            self.capable = True
+        elif rep[2] == SYSMON_VALUE_FRAME_B:
+            self.busy = bool(rep[STATUS_OFFSET] & STATUS_MSG)
+            if rep[STATUS_OFFSET] & STATUS_ASK:
+                self.asked = True
+
+    def tick(self, dev, now, trackers):
+        if not self.capable:
+            return
+        if self.asked:
+            # the replay key: what binds now, or that nothing does
+            self.asked = False
+            self.queue = []
+            for t in trackers:
+                if t.limited:
+                    self.queue.append(t.message())
+                    t.mark(now)
+            if not self.queue:
+                self.queue.append((MSG_NO_LIMIT, 0, 0))
+        elif MSG_ENABLE:
+            for t in trackers:
+                if t.due(now):
+                    self.queue.append(t.message())
+                    t.mark(now)
+        if self.queue and not self.busy and now - self.sent_at >= self.SETTLE_S:
+            text, hue, sat = self.queue.pop(0)
+            self._write(dev, text, hue, sat)
+            self.sent_at = now
+            if self.verbose:
+                print(f"message: {text!r}")
+
+    @staticmethod
+    def _write(dev, text, hue, sat):
+        rep = bytearray(REPORT_LEN)
+        rep[0] = VIA_CMD_CUSTOM_SET_VALUE
+        rep[1] = SYSMON_CHANNEL
+        rep[2] = SYSMON_VALUE_MESSAGE
+        rep[3] = 0  # ticker
+        rep[4] = clamp8(hue)
+        rep[5] = clamp8(sat)
+        rep[6] = clamp(MSG_SPEED, 0, 255)
+        raw = text.encode("ascii", "replace")[:MSG_TEXT_MAX]
+        rep[8:8 + len(raw)] = raw
+        dev.write(b"\x00" + bytes(rep))
 
 
 # ---------------------------------------------------------------------------
@@ -1757,14 +2074,19 @@ def raw_pct_to_charge_hue(pct):
     return clamp(pct * HUE_CHARGE_FULL // 100, 0, HUE_CHARGE_FULL)
 
 
-def build_cpu_row(m):
-    """row1: CPU usage, solid red; breathe when APU power-limited."""
-    desc = RowDesc(level=pct_to_level(m["cpu"]), hue0=HUE_RED)
-    if m["cpu_power"] or m["cpu_psrc"]:
+def limit_breathe(desc, reason):
+    """Breathe a row held back by a limit (see LIMIT_KINDS)."""
+    if reason is not None:
         desc.envelope = ENV_BREATHE
         desc.floor = LIMIT_FLOOR
-        desc.period = breathe_period(m["cpu_psrc"])
+        desc.period = breathe_period(reason.key == "charger")
     return desc
+
+
+def build_cpu_row(m):
+    """row1: CPU usage, solid red; breathe when an APU limit binds."""
+    return limit_breathe(RowDesc(level=pct_to_level(m["cpu"]), hue0=HUE_RED),
+                         m.get("cpu_limit"))
 
 
 def build_mem_row(m):
@@ -1792,15 +2114,11 @@ def build_igpu_row(m):
 
 
 def build_dgpu_row(m):
-    """row4: dGPU usage, solid green; breathe when dGPU power-limited."""
+    """row4: dGPU usage, solid green; breathe when a dGPU limit binds."""
     if not m["dgpu_present"]:
         return RowDesc(level=0)
-    desc = RowDesc(level=pct_to_level(m["dgpu"]), hue0=HUE_GREEN)
-    if m["dgpu_power"] or m["dgpu_psrc"]:
-        desc.envelope = ENV_BREATHE
-        desc.floor = LIMIT_FLOOR
-        desc.period = breathe_period(m["dgpu_psrc"])
-    return desc
+    return limit_breathe(RowDesc(level=pct_to_level(m["dgpu"]), hue0=HUE_GREEN),
+                         m.get("dgpu_limit"))
 
 
 def build_temp_row(m):
@@ -1937,7 +2255,7 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
     # install on this very machine: Tctl pinned at exactly 100.0 C while the EC
     # read 41 C, which drove the temperature row to full and blinking. (That
     # was this host reading libryzenadj's THM *limit* getter instead of the
-    # value -- fixed, see RyzenAdjSource.snapshot -- but a different CPU's table
+    # value -- fixed, see RyzenAdjSource.PAIRS -- but a different CPU's table
     # can still decode wrong.) The EC sensor is the Framework firmware's own,
     # and is the source this hardware is actually specified around.
     #
@@ -1972,15 +2290,18 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
     on_ac = flags_ac
     weak_charger = on_ac and discharging and batt_rate >= ASSIST_MIN_W
 
-    # APU power-limit: authoritative ryzenadj STAPM/PPT binding when available,
-    # else the LHM package-power plateau heuristic (limited=None).
-    cpu_limited = RyzenAdjSource.power_limited(rj)
-    cpu_power, cpu_psrc = apu.evaluate(
-        (cpu_pkg_w, cpu_load) if (cpu_pkg_w is not None or cpu_load is not None)
-        else None, on_ac, weak_charger, limited=cpu_limited)
-    dgpu_power, dgpu_psrc = nv.evaluate(on_ac, weak_charger)
+    # The limits binding this tick (LimitTracker holds them steady): the APU's
+    # from the ryzenadj SMU table when it reads, else from the LHM
+    # package-power plateau heuristic; the dGPU's from NVML.
+    if rj is not None:
+        cpu_binding = apu_reasons(rj, on_ac, weak_charger)
+    else:
+        cpu_binding = apu.reasons(
+            (cpu_pkg_w, cpu_load) if (cpu_pkg_w is not None or cpu_load is not None)
+            else None, on_ac, weak_charger)
+    dgpu_binding = nv.evaluate(on_ac, weak_charger)
     if not dgpu_present:
-        dgpu_power = dgpu_psrc = False
+        dgpu_binding = {}
 
     return {
         "has_batt": has_batt,
@@ -1992,12 +2313,12 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
         "rate_w": batt_rate,
 
         "cpu": cpu,
-        "cpu_power": cpu_power,
-        "cpu_psrc": cpu_psrc,
+        "cpu_binding": cpu_binding,  # {key: Reason} binding this tick
+        "cpu_limit": None,           # the Reason named; set by LimitTracker
         # raw limit-detection inputs, surfaced for --verbose diagnostics
         "cpu_pkg_w": cpu_pkg_w,
         "cpu_load": cpu_load,
-        "cpu_limits": rj,  # ryzenadj SMU snapshot (stapm/fast/slow) or None
+        "cpu_limits": rj,  # ryzenadj SMU snapshot (value, limit pairs) or None
         "weak_charger": weak_charger,
 
         "raw_mem": raw_mem,
@@ -2009,8 +2330,8 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
         "dgpu": clamp(dgpu, 0, 100),
         "dgpu_present": dgpu_present,
         "dgpu_src": "nvml" if nv_util is not None else "pdh",
-        "dgpu_power": dgpu_power,
-        "dgpu_psrc": dgpu_psrc,
+        "dgpu_binding": dgpu_binding,
+        "dgpu_limit": None,
 
         "has_temp": has_temp,
         "temp_c": clamp(raw_temp, 0, 254) if has_temp else 0,
@@ -2325,6 +2646,10 @@ def run(args, stop_event=None, resume_check=None):
             print(f"adapter luid 0x{luid:X}: compute-only [NPU -> iGPU row ghost]")
     psutil.cpu_percent(interval=None)  # prime; first call always returns 0
 
+    cpu_track = LimitTracker("MSG_NAME_CPU", "HUE_RED")
+    gpu_track = LimitTracker("MSG_NAME_GPU", "HUE_GREEN")
+    messenger = Messenger(verbose=args.verbose)
+
     dev = None
     published_state = False
     while not stop_event.is_set():
@@ -2349,8 +2674,15 @@ def run(args, stop_event=None, resume_check=None):
                     stop_event.wait(5)
                     continue
                 print("Connected to macropad")
+                messenger.reset()
+                messenger.probe(dev)
 
             m = gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache)
+            now = time.monotonic()
+            cpu_track.update(m["cpu_binding"], now)
+            gpu_track.update(m["dgpu_binding"], now)
+            m["cpu_limit"] = cpu_track.reason
+            m["dgpu_limit"] = gpu_track.reason
             rows = [ROW_BUILDERS[i](m) for i in range(6)]
             if not published_state:
                 # First complete tick: record what this process can actually
@@ -2366,29 +2698,35 @@ def run(args, stop_event=None, resume_check=None):
                 for name, r in zip(names, rows):
                     print(f"  {name:5s} {r!r}")
                 # limit-detection diagnostics: shows which source drove the APU
-                # verdict. With ryzenadj it prints the SMU value/limit watt
-                # pairs (the * marks a limit in APU_LIMIT_SIGNALS that is
-                # binding); otherwise it shows the LHM heuristic inputs (pkg_w/
-                # load = None means LHM isn't running -> no APU breathe). dgpu
-                # power/psrc need pynvml.
+                # verdict. With ryzenadj it prints the SMU value/limit pairs
+                # (the * marks one binding this tick); otherwise it shows the
+                # LHM heuristic inputs (pkg_w/load = None means LHM isn't
+                # running -> no APU breathe). The dGPU's need pynvml. -> names
+                # the limit the row breathes for (held LIMIT_RELEASE_S).
                 rj = m["cpu_limits"]
                 if rj:
+                    units = {k: u for k, (_, u) in APU_SIGNALS.items()}
                     pairs = " ".join(
-                        f"{k}={rj[k][0]:.1f}/{rj[k][1]:.1f}W"
-                        f"{'*' if (k in APU_LIMIT_SIGNALS and rj[k][1] > 0 and rj[k][0] >= APU_LIMIT_NEAR * rj[k][1]) else ''}"
-                        for k in ("stapm", "fast", "slow") if k in rj)
+                        f"{k}={rj[k][0]:.1f}/{rj[k][1]:.1f}{units[k]}"
+                        f"{'*' if k in m['cpu_binding'] else ''}"
+                        for k in APU_SIGNALS if k in rj)
                     cpu_src = f"ryzenadj[{pairs}]"
                 else:
                     cpu_src = f"heuristic(pkg_w={m['cpu_pkg_w']} load={m['cpu_load']})"
+                dgpu_now = " ".join(map(repr, m["dgpu_binding"].values())) or "-"
                 print(f"  limits ac={m['ac']} weak={m['weak_charger']} "
-                      f"cpu {cpu_src} ->power={m['cpu_power']},psrc={m['cpu_psrc']} "
-                      f"dgpu[{m['dgpu_src']}]->power={m['dgpu_power']},"
-                      f"psrc={m['dgpu_psrc']}")
+                      f"cpu {cpu_src} -> {m['cpu_limit']!r} "
+                      f"dgpu[{m['dgpu_src']}] {dgpu_now} -> {m['dgpu_limit']!r}")
             for rep in build_frame(rows, m["brightness"]):
                 dev.write(b"\x00" + rep)
-            # drain the VIA echo so the report buffer doesn't fill up
-            while dev.read(REPORT_LEN):
-                pass
+            # drain the VIA echoes so the report buffer doesn't fill up; they
+            # carry the firmware's message status and the replay key
+            while True:
+                rep = dev.read(REPORT_LEN)
+                if not rep:
+                    break
+                messenger.on_echo(rep)
+            messenger.tick(dev, now, (cpu_track, gpu_track))
         except KeyboardInterrupt:
             break
         except OSError as err:
