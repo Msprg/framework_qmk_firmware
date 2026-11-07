@@ -257,7 +257,8 @@ changes (STAPM → TDC, say; at most every 30 s), and a new episode starts once
 the component has been free of limits for 2 minutes. When several limits bind
 at once the closest to its limit is named, and it stays named while it holds.
 Which kinds get named is `MSG_KINDS` (`power, current, thermal, clock`): the
-slow charger breathe is clear enough without text, so it isn't.
+slow charger breathe is clear enough without text, so it isn't. Each message
+sent is also written to `sysmon.log` (`Message to the pad: CPU STAPM 28W`).
 
 **Keypad 5 with NumLock off** replays it on demand: the pad names what makes
 each row breathe right now, the charger included (`CPU CHARGER`, in amber), or
@@ -510,7 +511,7 @@ the `limits …` line shows either `cpu ryzenadj[stapm=…/…W slow=…/…W td
 load=…)`, then `clock[…GHz busy=…%]` (the busy CPUs' fastest clock and the
 busiest core; `HELD` when held at base), then `->` and the limit the row
 breathes for, so you can confirm which source is driving the CPU row.
-`message: '…'` lines show what the pad is told.
+`Message to the pad: …` lines show what the pad is told.
 
 **Temperature** comes from one of (tried in this order):
 

@@ -2414,8 +2414,9 @@ class Messenger:
                     self.inflight = _Inflight(tracker, key, seq, now)
                 else:
                     tracker.shown(key, now)  # older firmware: named as sent
-            if self.verbose:
-                print(f"message: {text!r}")
+            # into sysmon.log: the only record of what the pad was told
+            log(f"Message to the pad: {text}"
+                + (" (replay key)" if replay else ""))
             break  # one per tick
 
     def _drop_queue(self):
