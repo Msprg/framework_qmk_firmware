@@ -595,15 +595,22 @@ ghost descriptor (4 bytes, FRAME C):
   +0 level   0-255  fraction of the 4-segment bar (0 = no ghost)
   +1 hue     0-255  ghost colour
   +2 val     0-255  ghost brightness (the row's envelope scales it too)
-  +3 flags   reserved (0)
+  +3 flags   bit0    anchor: 0 = fills from the left, like the main bar;
+                     1 = from the right end (level 63 = the last key alone)
+             bits1-7 reserved (0)
+FRAME C echo:
+  [27] 0x01  the firmware draws ghost bars (older firmware echoes 0)
+  [28] 0x01  ...and reads their flags (firmware before them draws every ghost from the left)
 ```
 
 The firmware glides each row's `level`, fills the bar (solid or gradient),
 applies the envelope to the whole-row brightness, then paints any overlay
 segments from the fill boundary — all timed off its own clock, so the bars stay
 smooth between the host's updates. A ghost bar glides the same way and adds,
-per segment, whatever part the ghost covers beyond the main fill. VIA's echo
-is the ACK.
+per segment, whatever part the ghost covers beyond the main fill; a
+right-anchored one fills from the last key leftward and shows in what the main
+bar leaves unfilled at that end. A ghost sent at level 0 glides out in the
+colour and at the end it had. VIA's echo is the ACK.
 
 When frames stop, what happens depends on how. After a GOODBYE the firmware
 restores the stock global current and hands over to the regular RGB effect at
@@ -618,6 +625,9 @@ their own when FRAME C stops arriving within `timeout`, so an older host can
 never leave a stale ghost behind. Ghost-capable firmware also sets byte `[27]`
 of its FRAME C echo to `0x01` (older firmware echoes the frame unchanged), which
 is how `--selftest` reports that the module needs a reflash to draw the NPU.
+Byte `[28]` says the firmware reads the ghost flags; the host sends a
+right-anchored ghost only once it has seen that, since firmware without the
+flags would draw it at the wrong end.
 
 MESSAGE (`0x05`) is how the host names a limit (see [The pad names the
 limit](#the-pad-names-the-limit)). The bars dim out over 0.3 s, the text
