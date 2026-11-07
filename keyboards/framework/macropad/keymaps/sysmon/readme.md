@@ -13,6 +13,14 @@ normally — the stats ride on a private custom-value channel, `0x42`):
 | 5 | dGPU usage | green bar (dark if no dGPU); breathes when a limit holds the dGPU back, and the pad names it (see below); the last key glows dim light blue/teal while the dGPU is powered off (D3cold) |
 | 6 | System temperature | fixed green→deep-red gradient across the row; bar length scales 30–90 °C; whole row blinks at ~1 Hz above 90 °C |
 
+**Lights off.** With NumLock off, the top-left key is the macropad's RGB
+toggle (Framework's stock layer). It switches the whole pad dark, bars
+included, and the pad remembers that across restarts; press it again to bring
+them back. VIA's "All Off" switches it off the same way (kept across
+restarts once VIA saves it), and the same key brings it back. The service log and `--selftest`
+both say when the pad is dark for this reason; limit messages due meanwhile
+are dropped, not saved up.
+
 ## Boot rainbow
 
 From power-up until the host first connects, the macropad shows a dim, static
@@ -48,7 +56,8 @@ power-up pool (`boot_pool[]` in `keymap.c`), currently all 22:
 Each power-up picks one from a shuffle bag: every cycle of power-ups (one per
 pooled animation) plays each pooled animation once, in a fresh order, never
 the same one twice in a row. The position is a counter in the EEPROM user word
-(written after the animation, so clear of USB enumeration). The random parts
+(written once the animation is over, played out or cut short by a key, and
+USB is configured, so clear of enumeration). The random parts
 (twinkles, fire, flicker, fireworks, lightning, glitches...) are re-randomized on
 every boot, and on every round of a replay.
 
@@ -235,9 +244,11 @@ at once the closest to its limit is named, and it stays named while it holds.
 Which kinds get named is `MSG_KINDS` (`power, current, thermal`): the slow
 charger breathe is clear enough without text, so it isn't.
 
-**Keypad 5 with NumLock off** (where it does nothing) replays it on demand:
-the pad names what makes each row breathe right now, the charger included
-(`CPU CHARGER`, in amber), or says NO LIMIT.
+**Keypad 5 with NumLock off** replays it on demand: the pad names what makes
+each row breathe right now, the charger included (`CPU CHARGER`, in amber), or
+says NO LIMIT. While the host is streaming and the pad is lit, the pad keeps
+that key to itself (with NumLock off it would only send Clear); otherwise it
+is an ordinary keypad 5.
 
 The words, the timings (`MSG_ONSET_S`, `MSG_MIN_GAP_S`, `MSG_REARM_S`), the
 speed and whether the value is shown are all in the `[messages]` section of
@@ -613,8 +624,13 @@ FRAME B appends three globals after its three row descriptors:
   [28] glide       units of 4 ms   per-row level glide   (default 300 ms => 75)
   [29] timeout     units of 100 ms no-data fallback       (default 5000 ms => 50)
 FRAME B echo:
+  [29] the sequence number of the last MESSAGE dropped unplayed (replaced by a
+       newer one, dropped as the pad went dark or the host went away; 0 = none)
+  [30] ...and of the last one played to its end
   [31] status      bit0 a MESSAGE is waiting or playing,
-                   bit1 the replay key was pressed (reported once; older firmware: 0)
+                   bit1 the replay key was pressed (reported once; older firmware: 0),
+                   bit2 the RGB lighting is off (RGB toggle, or VIA's All Off): nothing shows,
+                   bit4 the pad is suspended (lid closed): nothing shows either
 
 ghost descriptor (4 bytes, FRAME C):
   +0 level   0-255  fraction of the 4-segment bar (0 = no ghost)
@@ -648,8 +664,11 @@ FRAME C is optional in both directions. Firmware that predates it ignores value
 `0x03` and draws the plain bars. Firmware that has it fades the ghosts out on
 their own when FRAME C stops arriving within `timeout`, so an older host can
 never leave a stale ghost behind. Ghost-capable firmware also sets byte `[27]`
-of its FRAME C echo to `0x01` (older firmware echoes the frame unchanged), which
-is how `--selftest` reports that the module needs a reflash to draw the NPU.
+of its FRAME C echo to `0x01` (older firmware echoes the frame unchanged).
+`--selftest` reads the same from the BOOT REPLAY status's capability byte, so
+it sends no frames (a frame would show, and end the boot rainbow); firmware
+from before that byte predates this host, and the self-test says to flash the
+bundled image.
 Byte `[28]` says the firmware reads the ghost flags; the host sends a
 right-anchored ghost only once it has seen that, since firmware without the
 flags would draw it at the wrong end.
@@ -661,27 +680,37 @@ its last column is gone the bars fade back in the way they do after the boot
 rainbow. The bars keep running underneath, so they return as they are by then.
 A message waits until the bars show and have settled (not mid-fade), is dropped
 if the host goes away first, and never plays over the boot rainbow or the
-disconnect warning. A new one replaces one waiting or playing; the host waits
-for the FRAME B echo's bit0 to clear before it sends the next.
+disconnect warning. A new one replaces one waiting or playing; the host sends
+the next only once the FRAME B echo reports this one played or dropped (by its
+sequence number), and counts a limit as named only once its message played.
+With older firmware, which can't say, it waits for the echo's bit0 to clear
+instead, and counts a limit as named as its message is sent.
 
 ```text
 [3]      style: 0 = ticker (others reserved; played as the ticker)
 [4] [5]  hue, saturation of the text (saturation 0 = white)
 [6]      speed, columns per second (0 = 8; 2..40)
-[7]      reserved (0)
+[7]      sequence number, 1..255 (0 = none), reported back in the FRAME B echo
 [8..30]  text, NUL-terminated, up to 23 characters (A-Z, 0-9, space, - ! .;
          uppercase W and M are the tall forms). Empty: nothing happens -- a probe
 echo [31] 0x01: the firmware shows messages (older firmware echoes it unchanged)
+     [9]  0x02, in the probe's echo only: ...and reports each one's outcome
+          (FRAME B echo [29..30])
 ```
 
 The replay key is keypad 5 while NumLock is off. The firmware catches it by
 keycode rather than through the keymap (VIA keeps the keymap in EEPROM, where a
-new default would never reach a pad that already has one), and only while the
-bars show; the host answers through the FRAME B echo's bit1.
+new default would never reach a pad that already has one), in the pre-process
+hook, so neither its press nor its release reaches the computer -- but only
+while the host is streaming and the pad is lit (dark, there is nothing to show
+the answer on): a host that never reports NumLock (macOS, a pre-boot
+environment) keeps an ordinary keypad 5. The host answers through the FRAME B
+echo's bit1.
 
-Value `0x10` (BOOT REPLAY) isn't sent by the host; it replays boot animations
-for previewing (`host/bootanim_preview.py`) and never counts as host data, so
-it doesn't end the pre-connect rainbow:
+Value `0x10` (BOOT REPLAY) isn't sent by the service; it replays boot
+animations for previewing (`host/bootanim_preview.py`), and its `0xFD` status
+query, which changes nothing, is how `--selftest` identifies the firmware. It
+never counts as host data, so it doesn't end the pre-connect rainbow:
 
 ```text
 [3] first variant, 1-based (0 = all; 0xFC = preview warning styles [4]..[5];
@@ -694,9 +723,13 @@ it doesn't end the pre-connect rainbow:
        and the hold after each don't change
 echo [11..14] boot counter in RAM (u32 LE)   [15] this power-up's pick (1-based)
      [16..19] boot counter in EEPROM (u32 LE; lags by one until the boot animation ends)
-     [20]     display: 0 = regular RGB effect, 1 = boot rainbow, 2 = bars, 3 = warning
+     [20]     display: 0 = regular RGB effect, 1 = boot rainbow, 2 = bars, 3 = warning,
+              4 = nothing (the lighting off, or the pad suspended)
      [21]     1 while an animation is playing (the power-up one too)
      [22]     1 while a MESSAGE waits or plays
+     [23]     capabilities: bit7 set (older firmware: 0), bit0 ghost bars,
+              bit1 ghost flags, bit2 messages
+     [24]     1 while the RGB lighting is on, 0 while it is off (RGB toggle, or VIA's All Off)
 
 custom text (0xFB): [4] style 0 flash / 1 ticker / 2 pop, [5] colour 0 rainbow /
 1 per letter / 2 white, [6..7] speed (u16 LE; 0 = default), [8..] text, NUL-terminated

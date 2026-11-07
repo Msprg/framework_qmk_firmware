@@ -24,6 +24,7 @@
 #include QMK_KEYBOARD_H
 #include "factory.h"
 #include "via.h"
+#include "usb_util.h" // usb_connected_state: the boot counter is saved once USB is configured
 
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     // Same layout as the default keymap; see keymaps/default for diagrams
@@ -157,14 +158,24 @@ void enable_factory_mode(bool enable) {
 //   data[3]     style: 0 = ticker (others reserved; played as the ticker)
 //   data[4..5]  hue and saturation of the text (saturation 0 = white)
 //   data[6]     speed, columns per second (0 = SYSMON_MSG_CPS)
-//   data[7]     reserved (0)
+//   data[7]     sequence number, 1..255, chosen by the host (0 = none)
 //   data[8..30] text, NUL-terminated, up to 23 characters (the boot text's
 //               font: A-Z, 0-9, space, - ! .). Empty: nothing happens (a probe).
 //   echo: data[31] = SYSMON_MSG_ACK, so the host can tell message-capable
-//   firmware from older firmware (which echoes it unchanged).
+//   firmware from older firmware (which echoes it unchanged). Exactly 0x01:
+//   hosts from before the outcome reports test it for equality. The probe's
+//   echo also carries data[9] = SYSMON_MSG_SEQ_ACK (inside its empty text):
+//   this firmware reports what became of each message (FRAME B, below).
 // The FRAME B echo reports in data[31]: bit0 a message is waiting or playing,
 // bit1 the replay key (keypad 5 with NumLock off) was pressed since the last
-// FRAME B -- the host answers that with a MESSAGE. Older firmware echoes 0.
+// FRAME B -- the host answers that with a MESSAGE --, bit2 the RGB matrix is
+// switched off (RGB_TOG), so nothing the host sends shows, bit4 the pad is
+// suspended (the keyboard's idle handling, lid closed): nothing shows either.
+// data[30] is the sequence number of the last message played to its end,
+// data[29] that of the last one dropped unplayed (replaced by a newer one,
+// dropped as the pad went dark or the host went away); 0 = none since
+// power-up. (Both overwrite host bytes the echo doesn't need back.) Older
+// firmware echoes 0 in data[31] and the host's own data[29..30].
 //
 // REBOOT (value_id 0x11, no payload): restart the macropad as a power-up
 // would, boot animation included -- for trying the startup without
@@ -199,9 +210,13 @@ void enable_factory_mode(bool enable) {
 // power-up picked (1-based, 0 = none yet), and the counter as stored in
 // EEPROM (u32 LE; lags by one until this boot's animation has finished).
 // data[20] is what the display shows: 0 = regular RGB effect, 1 = boot
-// rainbow, 2 = sysmon bars, 3 = disconnect warning. data[21] is 1 while an
-// animation plays, data[22] while a MESSAGE waits or plays.
-// It never counts as host data, so it doesn't end the pre-connect rainbow.
+// rainbow, 2 = sysmon bars, 3 = disconnect warning, 4 = nothing (the lighting
+// off, or the pad suspended). data[21] is 1 while an
+// animation plays, data[22] while a MESSAGE waits or plays. data[23] is the
+// firmware's capabilities (SYSMON_CAPS_*; 0 from firmware before them) and
+// data[24] is 1 while the lighting is on, 0 while it is off (sysmon_lights_off).
+// It never counts as host data, so it doesn't end the pre-connect rainbow;
+// the 0xFD query changes nothing at all, which makes it the self-test's probe.
 //
 // VIA echoes the buffer back, which serves as the ACK.
 // ---------------------------------------------------------------------------
@@ -222,8 +237,19 @@ void enable_factory_mode(bool enable) {
 #define SYSMON_GHOST_FLAGS_ACK 0x01 // ...and this at data[28]: ghost flags are read
 #define SYSMON_GHOST_RIGHT (1 << 0) // ghost flags bit0: the ghost fills from the right end
 #define SYSMON_MSG_ACK 0x01   // written into the MESSAGE echo at data[31]
+#define SYSMON_MSG_SEQ_ACK 0x02 // in the probe's echo at data[9]: FRAME B reports message outcomes
 #define SYSMON_STATUS_MSG 0x01 // FRAME B echo data[31]: a message is waiting or playing
 #define SYSMON_STATUS_ASK 0x02 // ... and the replay key was pressed since the last one
+#define SYSMON_STATUS_DARK 0x04 // ... and the lighting is off (RGB_TOG, or VIA's All Off)
+#define SYSMON_STATUS_SUSPENDED 0x10 // ... and the pad is suspended (lid closed): nothing shows
+// BOOT REPLAY status echo data[23]: what this firmware can do, so a self-test
+// can tell without sending frames (which would show). Bit 7 marks the byte as
+// written: older firmware echoes it as sent, 0.
+#define SYSMON_CAPS_VALID 0x80
+#define SYSMON_CAPS_GHOSTS 0x01       // draws FRAME C ghost bars
+#define SYSMON_CAPS_GHOST_FLAGS 0x02  // ...and reads their flags
+#define SYSMON_CAPS_MESSAGES 0x04     // shows a MESSAGE
+#define SYSMON_CAPS (SYSMON_CAPS_VALID | SYSMON_CAPS_GHOSTS | SYSMON_CAPS_GHOST_FLAGS | SYSMON_CAPS_MESSAGES)
 
 // flags field bit layout
 #define SYSMON_FLAG_GRADIENT (1 << 0)      // bit0: solid hue0 vs hue0->hue1
@@ -275,6 +301,15 @@ static sysmon_ghost_t sysmon_ghosts[6];
 static uint8_t        sysmon_brightness     = 255;
 static uint8_t        sysmon_glide_units    = SYSMON_DEFAULT_GLIDE_UNITS;
 static uint8_t        sysmon_timeout_units  = SYSMON_DEFAULT_TIMEOUT_UNITS;
+// The timer now, as a timestamp where 0 means "never": 0 itself becomes the
+// millisecond before it (UINT32_MAX), never one after. (Not timer_read32() | 1
+// -- nor 0 -> 1 --, which is 1 ms in the future: an elapsed time read in that
+// same millisecond wraps to ~4.29e9.)
+static uint32_t sysmon_stamp(void) {
+    uint32_t t = timer_read32();
+    return t ? t : UINT32_MAX;
+}
+
 static uint32_t       sysmon_last_update    = 0;
 static uint32_t       sysmon_ghost_update   = 0; // last FRAME C; 0 = never
 static bool           sysmon_goodbye        = false; // host said it is stopping
@@ -285,8 +320,24 @@ static bool           sysmon_quiet          = false; // suspended since the last
 #define DISP_BOOT 1   // boot animation / static rainbow
 #define DISP_SYSMON 2 // the bars
 #define DISP_WARN 3   // the disconnect warning
-#define DISP_MSG 4    // a message's end; only ever where a fade into the bars starts
+#define DISP_DARK 4   // dark: a message's end, or frames that stopped (the matrix
+                      // switched off, a suspend); only ever where a fade into the bars starts
 static uint8_t sysmon_disp = DISP_EFFECT;
+static bool    sysmon_went_dark = false; // frames stopped since the last one (see sysmon_indicators)
+static uint32_t usb_up_since     = 0;     // USB went ACTIVE then (0: not now); see housekeeping
+
+// The lighting is off: the matrix switched off -- RGB_TOG, or VIA's "All Off"
+// (which disables it too; kept across restarts once VIA saves). QMK then skips the
+// indicator hook, where all of the display lives. (A "none" mode can't be
+// current: QMK keeps the mode at 1 or above.)
+static bool sysmon_lights_off(void) {
+    return !rgb_matrix_is_enabled();
+}
+
+// Nothing is drawn: the lighting is off, or the pad is suspended.
+static bool sysmon_dark(void) {
+    return sysmon_lights_off() || rgb_matrix_get_suspend_state();
+}
 
 // MESSAGE: the text and how it looks; it is drawn with the bars, further down.
 static char     msg_text[24];
@@ -295,6 +346,30 @@ static bool     msg_waiting = false; // received; plays once the bars have settl
 static bool     msg_playing = false;
 static uint32_t msg_t0;
 static bool     sysmon_ask = false; // the replay key was pressed, not yet reported
+static uint8_t  msg_seq         = 0; // the waiting or playing message's sequence number
+static uint8_t  msg_played_seq  = 0; // the last one played to its end
+static uint8_t  msg_dropped_seq = 0; // the last one dropped unplayed
+
+// The message waiting or playing goes unplayed (dropped, or replaced): report
+// its sequence number in the FRAME B echo, so the host names that limit again.
+static void sysmon_msg_report_drop(void) {
+    if ((msg_waiting || msg_playing) && msg_seq) msg_dropped_seq = msg_seq;
+}
+
+// Something else takes the display for a while: a message waits it out, and
+// one cut off mid-play restarts once the bars are back.
+static void sysmon_msg_hold(void) {
+    if (msg_playing) {
+        msg_playing = false;
+        msg_waiting = true;
+    }
+}
+
+static void sysmon_msg_drop(void) {
+    sysmon_msg_report_drop();
+    msg_waiting = msg_playing = false;
+    msg_seq                   = 0;
+}
 static void     sysmon_message(const uint8_t *p);
 
 #define SYSMON_WARN_STYLES 5
@@ -330,7 +405,7 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
             sysmon_decode_row(0, payload + 0 * SYSMON_ROW_BYTES);
             sysmon_decode_row(1, payload + 1 * SYSMON_ROW_BYTES);
             sysmon_decode_row(2, payload + 2 * SYSMON_ROW_BYTES);
-            sysmon_last_update = timer_read32();
+            sysmon_last_update = sysmon_stamp(); // 0 means never
             sysmon_goodbye     = false;
             sysmon_quiet       = false;
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_FRAME_B) {
@@ -341,16 +416,26 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
             sysmon_brightness    = payload[3 * SYSMON_ROW_BYTES + 0];
             sysmon_glide_units   = payload[3 * SYSMON_ROW_BYTES + 1];
             sysmon_timeout_units = payload[3 * SYSMON_ROW_BYTES + 2];
-            sysmon_last_update   = timer_read32();
+            sysmon_last_update   = sysmon_stamp(); // 0 means never
             sysmon_goodbye       = false;
             sysmon_quiet         = false;
+            // A message is for the bars only. With nothing drawn one would
+            // wait to play, stale, when the pad is lit again (and hold off
+            // every message behind it): drop it (the host is told).
+            if (sysmon_dark()) sysmon_msg_drop();
             // Status for the host, in the echo (data[31]); a key press is
-            // reported once.
-            payload[28] = (uint8_t)((msg_waiting || msg_playing ? SYSMON_STATUS_MSG : 0) | (sysmon_ask ? SYSMON_STATUS_ASK : 0));
+            // reported once. The message outcomes go in data[29..30], past
+            // the globals already read above.
+            payload[28] = (uint8_t)((msg_waiting || msg_playing ? SYSMON_STATUS_MSG : 0) | (sysmon_ask ? SYSMON_STATUS_ASK : 0) |
+                                    (sysmon_lights_off() ? SYSMON_STATUS_DARK : 0) |
+                                    (rgb_matrix_get_suspend_state() ? SYSMON_STATUS_SUSPENDED : 0));
+            payload[26] = msg_dropped_seq; // data[29]
+            payload[27] = msg_played_seq;  // data[30]
             sysmon_ask  = false;
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_MESSAGE) {
             sysmon_message(payload);
             payload[28] = SYSMON_MSG_ACK; // data[31], past the longest text
+            if (!payload[5]) payload[6] = SYSMON_MSG_SEQ_ACK; // the probe's: data[9], in its empty text
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_FRAME_C) {
             for (uint8_t row = 0; row < 6; row++) {
                 const uint8_t *src = payload + row * SYSMON_GHOST_BYTES;
@@ -363,7 +448,7 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
                     sysmon_ghosts[row].flags = src[3];
                 }
             }
-            sysmon_ghost_update = timer_read32();
+            sysmon_ghost_update = sysmon_stamp(); // 0 means never
             // VIA echoes this buffer back: mark it so the host can detect
             // ghost support (payload[24] = data[27], past the descriptors),
             // and that the ghost flags are read (payload[25] = data[28]).
@@ -372,7 +457,7 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_GOODBYE) {
             sysmon_goodbye = true;
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_REBOOT) {
-            sysmon_reboot_at = timer_read32() | 1; // restart once the echo is out
+            sysmon_reboot_at = sysmon_stamp(); // restart once the echo is out
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_TRACE) {
             sysmon_trace_cmd(payload);
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_BOOT_REPLAY) {
@@ -410,8 +495,8 @@ static const uint8_t sysmon_row_leds[6][4] = {
 // efficiently, so a linear map runs visibly too bright at the dim end.
 //
 // A GCC write takes effect at once, but a PWM frame takes about 5 ms to
-// stream out (198 registers over 400 kHz I2C), and the frame is drawn over
-// five main-loop passes before that. Written at the start of a frame, as it
+// stream out (198 registers over 400 kHz I2C), after the frame has been
+// drawn. Written at the start of a frame, as it
 // used to be, a rising GCC lit the previous frame at the new current until
 // the new PWM arrived: a visible flash when the dim boot rainbow handed over
 // to brighter bars. So a frame only requests its GCC
@@ -438,12 +523,14 @@ static void sysmon_write_gcc(uint8_t gcc) {
 // step with the current for those few ms run dim, never bright. The regular
 // flush that follows finds nothing left to send.
 static uint8_t sysmon_trace_change; // this frame's GCC change, for the trace: 1 rising, 2 falling
+static bool    sysmon_gcc_flushed;  // this frame's commit sent the PWM itself
 
 static void sysmon_gcc_commit(void) {
     uint8_t g = sysmon_gcc_next;
     if (g == sysmon_gcc) return;
     bool rising         = g > sysmon_gcc;
     sysmon_trace_change = rising ? 1 : 2;
+    sysmon_gcc_flushed  = true;
     if (rising) rgb_matrix_driver.flush();
     sysmon_gcc = g;
     IS31FL_unlock_register(DRIVER_ADDR_1, ISSI_PAGE_FUNCTION);
@@ -774,21 +861,24 @@ static void sysmon_render_row(uint8_t row, sysmon_glide_t *g, sysmon_glide_t *gg
 // Like the sysmon bars, it dims through the global current with PWM at full
 // scale, so the animations keep all 256 PWM levels at a low brightness.
 //
-// Every animation is a pure function of the time since it started: the
-// indicator hook runs several times per frame (once per LED chunk), so no
-// state may advance per call. Each one ends on the exact static frame.
+// Every animation is a pure function of the time since it started, so a
+// replay at another speed, a dropped frame or a trace replay all show the same
+// thing. Each one ends on the exact static frame.
 //
 // The pick is a shuffle bag over a boot counter kept in the EEPROM user word:
 // every BOOT_POOL_COUNT boots play each pooled animation once, in a fresh order, and
 // never the same one twice in a row. (Nothing here seeds random8(), so it
 // would replay the same "random" sequence on every boot.) The counter is
-// written back only after the animation, clear of USB enumeration.
+// written back once the animation is over and USB is configured, clear of
+// USB enumeration (see housekeeping_task_user).
 // ---------------------------------------------------------------------------
 
 // 0..255, same scale as the host's brightness byte. The scale is squared on the
 // way to the global current: 33 is GCC 3, about half as bright to the eye as
 // the earlier 64 (GCC 11). (32 would truncate to GCC 2.)
 #define BOOT_BRIGHTNESS 33
+#define BOOT_SAVE_SETTLE_MS 2000 // the counter is saved this long after USB came up, at the soonest
+#define BOOT_SAVE_NO_USB_MS 30000 // ...or, with USB never configured, this long after power-up
 #define BOOT_HUE_START 0   // top-left: red
 #define BOOT_HUE_END 205   // bottom-right: violet (191 reads as blue on these LEDs)
 
@@ -2093,12 +2183,16 @@ static uint8_t boot_bag_pick(uint32_t n) {
     return boot_pool[cur[n % BOOT_POOL_COUNT]];
 }
 
-// Draw the next power-up pick and advance the counter (saved after playback).
-static uint8_t boot_next_pick(void) {
+static void boot_counter_load(void) {
     if (!boot_counter_loaded) {
         boot_counter_loaded = true;
         boot_counter        = eeconfig_read_user();
     }
+}
+
+// Draw the next power-up pick and advance the counter (saved after playback).
+static uint8_t boot_next_pick(void) {
+    boot_counter_load();
     uint8_t v = boot_bag_pick(boot_counter);
     boot_base_seed = boot_hash32(boot_counter ^ 0xB0075EEDU);
     boot_counter++;
@@ -2179,14 +2273,17 @@ static void boot_put32(uint8_t *out, uint32_t v) {
     for (uint8_t b = 0; b < 4; b++) out[b] = (uint8_t)(v >> (8 * b));
 }
 
-// Status for the BOOT REPLAY echo (12 bytes; layout in the protocol notes).
+// Status for the BOOT REPLAY echo (14 bytes; layout in the protocol notes).
 static void boot_status(uint8_t *out) {
+    boot_counter_load(); // (no pick may have loaded it: the animation skipped)
     boot_put32(out, boot_counter);
     out[4] = boot_powerup_pick;
     boot_put32(out + 5, eeconfig_read_user());
-    out[9]  = sysmon_disp;
+    out[9]  = sysmon_dark() ? DISP_DARK : sysmon_disp; // dark: nothing shows
     out[10] = boot_playing;
     out[11] = msg_waiting || msg_playing;
+    out[12] = SYSMON_CAPS;
+    out[13] = !sysmon_lights_off();
 }
 
 // Variant n's name tag. Up to 9: n white dots in reading order from the
@@ -2222,7 +2319,7 @@ static bool boot_render(void) {
         uint8_t v = boot_first + k % boot_span;
         if (t < boot_slot_ms(v) && boot_seed_slot != k) {
             // Fresh randomness for every slot, so repeats differ. Keyed to
-            // the slot, not the call: the hook runs several times a frame.
+            // the slot, not the frame, so it is drawn once per slot.
             boot_seed_slot = k;
             boot_reseed(boot_hash32(boot_base_seed + k));
         }
@@ -2259,6 +2356,19 @@ static bool boot_render(void) {
     return false;
 }
 
+static uint32_t sysmon_timeout_ms(void) {
+    return (uint32_t)sysmon_timeout_units * 100;
+}
+
+// ms since the last FRAME A/B (0 before the first)
+static uint32_t sysmon_since(void) {
+    return sysmon_last_update ? timer_elapsed32(sysmon_last_update) : 0;
+}
+
+static bool sysmon_host_live(void) {
+    return sysmon_last_update != 0 && !sysmon_goodbye && sysmon_since() <= sysmon_timeout_ms();
+}
+
 // Any key press drops the boot rainbow for the regular effect: the rainbow
 // waits for the host, and a pad used without one should answer its keys.
 //
@@ -2267,22 +2377,89 @@ static bool boot_render(void) {
 // the CPU and dGPU back. It is caught by keycode rather than put in the
 // keymap: VIA keeps the keymap in EEPROM, where a new default would never
 // reach a pad that already has one.
-bool process_record_user(uint16_t keycode, keyrecord_t *record) {
+//
+// This is the pre-process hook, not process_record_user: the Framework
+// keyboard code calls process_record_user and ignores what it returns, so
+// returning false there still sent KP_5 to the host (Clear on Windows). False
+// here drops the event before any keycode handling. The release is dropped
+// only if its press was, so NumLock changing while the key is held can't
+// leave KP_5 stuck down or release a key that was never pressed.
+//
+// Only while the sysmon host is streaming, i.e. there to answer, and the pad
+// is lit (dark, there is nothing to show the answer on). Anywhere else the key
+// stays an ordinary keypad 5: a host that never reports NumLock (macOS, a
+// pre-boot environment) reads as NumLock off all the time, and swallowing the
+// key there would take it away for good.
+bool pre_process_record_user(uint16_t keycode, keyrecord_t *record) {
+    static matrix_row_t swallowed[MATRIX_ROWS]; // keys whose press was swallowed
+    keypos_t            k = record->event.key;
     if (record->event.pressed) {
         boot_dismissed = true;
         boot_playing   = false;
     }
-    if (keycode == KC_P5 && !host_keyboard_led_state().num_lock) {
-        if (record->event.pressed && sysmon_disp == DISP_SYSMON) sysmon_ask = true;
+    if (!IS_KEYEVENT(record->event)) return true; // not a matrix key (an encoder, say)
+    matrix_row_t bit = (matrix_row_t)1 << k.col;
+    if (!record->event.pressed && (swallowed[k.row] & bit)) {
+        // its release, by position: VIA can remap the key while it is held,
+        // and more than one key can be keypad 5
+        swallowed[k.row] &= (matrix_row_t)~bit;
         return false;
     }
-    return true;
+    if (keycode != KC_P5 || !record->event.pressed) return true;
+    if (host_keyboard_led_state().num_lock || !sysmon_host_live() || sysmon_dark()) return true;
+    swallowed[k.row] |= bit;
+    sysmon_ask = true;
+    return false;
 }
 
+// The boot counter is saved once the animation is over (played out, or cut
+// short by a key) and USB is configured: a flash write stalls the MCU, which
+// during enumeration can make it fail. A key press alone is no sign of that --
+// keys are scanned from power-up -- so the USB state is checked, not a time.
+// Saved from here rather than from the indicator hook, which QMK stops calling
+// while the RGB matrix is off: a pick that is never saved plays again next time.
+//
 // REBOOT: restart a moment after the command, so its echo still goes out. The
-// boot counter is normally saved after the animation; save it now, or a
-// reboot during the animation would replay the same pick.
+// counter is saved first even mid-animation (USB is up: the command came over
+// it), or a reboot during the animation would replay the same pick.
 void housekeeping_task_user(void) {
+    // Runs with the matrix off too, unlike the indicator hook: note that the
+    // pad went dark, for the display to start from dark when it is back.
+    if (sysmon_dark()) sysmon_went_dark = true;
+    // The power-up animation belongs to the power-up. With the lighting off
+    // at power-up (RGB_TOG's off persists), the first frame comes whenever it
+    // is back -- a key, or VIA -- maybe hours later: don't play it then.
+    // (Checked here, at once: a first frame merely delayed by a USB suspend,
+    // the pad plugged into a sleeping laptop, still plays it on wake. Not in
+    // keyboard_post_init_user, which macropad.c already defines.)
+    static bool boot_checked = false;
+    if (!boot_checked) {
+        boot_checked = true;
+        if (sysmon_lights_off()) boot_armed = false;
+    }
+    // USB configured and settled: SET_CONFIGURATION comes before the host's
+    // HID setup (descriptors, SET_IDLE, the LED report), so wait a moment more.
+    // (A suspend restarts it: suspend_power_down_user clears usb_up_since, as
+    // housekeeping doesn't run in the suspend loop to see USB go away.)
+    if (!usb_connected_state()) {
+        usb_up_since = 0;
+    } else if (!usb_up_since) {
+        usb_up_since = sysmon_stamp();
+    }
+    static bool usb_ever_up = false;
+    if (usb_up_since) usb_ever_up = true;
+    // (With nothing drawn nothing plays, so a replay started meanwhile
+    // counts as over: its pick is saved too.)
+    if (boot_counter_dirty && (!boot_playing || sysmon_dark())) {
+        bool usb_settled = usb_up_since && timer_elapsed32(usb_up_since) >= BOOT_SAVE_SETTLE_MS;
+        // (No host configuring USB at all -- power only: nothing to keep clear
+        // of. Only if it never came up: down again later is a re-enumeration.)
+        bool no_usb = !usb_ever_up && timer_read32() >= BOOT_SAVE_NO_USB_MS;
+        if (usb_settled || no_usb) {
+            boot_counter_dirty = false;
+            eeconfig_update_user(boot_counter);
+        }
+    }
     if (sysmon_reboot_at && timer_elapsed32(sysmon_reboot_at) >= 50) {
         if (boot_counter_dirty) eeconfig_update_user(boot_counter);
         soft_reset_keyboard();
@@ -2306,7 +2483,9 @@ void shutdown_user(void) {
 // A USB suspend (sleep) silences the host for an expected reason: don't greet
 // the wake-up with a disconnect warning. The next frame clears this.
 void suspend_power_down_user(void) {
-    sysmon_quiet = true;
+    sysmon_quiet     = true;
+    sysmon_went_dark = true; // nothing is drawn while suspended
+    usb_up_since     = 0;    // the bus re-settles after the wake
 }
 
 // --- disconnect warning ----------------------------------------------------
@@ -2426,21 +2605,15 @@ static bool warn_preview_render(void) {
 #define SYSMON_XFADE_MS 700
 static uint8_t  sysmon_xf_from = DISP_EFFECT;
 static uint32_t sysmon_xf_t0;
-static bool     sysmon_new_frame;                      // this call starts a frame (the first of its 5)
 static bool     sysmon_xf_ready;                       // this fade's start frame is taken
+static uint8_t  sysmon_xf_gf;                          // the current it was shown at
 static float    sysmon_xf_s[RGB_MATRIX_LED_COUNT][3];  // the start frame, perceptual
 static float    sysmon_xf_t[RGB_MATRIX_LED_COUNT][3];  // the bars, perceptual,
 static RGB      sysmon_xf_tc[RGB_MATRIX_LED_COUNT];    // as of these colors
 static uint8_t  sysmon_xf_tg;                          // at this current (0: none yet)
-static RGB      sysmon_xf_out[RGB_MATRIX_LED_COUNT];   // the frame's blend
-static uint8_t  sysmon_xf_g;                           // and its current
 
 static bool sysmon_xfading(void) {
     return sysmon_xf_from != DISP_EFFECT && timer_elapsed32(sysmon_xf_t0) < SYSMON_XFADE_MS;
-}
-
-static uint8_t sysmon_xf_from_gcc(void) {
-    return sysmon_gcc_for(sysmon_xf_from == DISP_BOOT ? BOOT_BRIGHTNESS : sysmon_brightness);
 }
 
 // c, drawn for global current gcc, as PWM for current g (clipped at full).
@@ -2485,20 +2658,31 @@ static void sysmon_xf_light(const float p[3], float o[3]) {
     o[2]    = MAX(-0.0041960863f * l - 0.7034186147f * m + 1.7076147010f * s, 0.0f);
 }
 
-// The fade's frame (once per frame; the other calls send it again): every
-// key e of the way along its line, and the current it all goes out at.
-static void sysmon_xf_frame(uint8_t gb) {
-    uint8_t gf = sysmon_xf_from_gcc();
+// The fade's frame: every key e of the way along its line, written out, and
+// the current it all goes out at (returned).
+//
+// The start frame is lit at the current on the chip when the fade begins:
+// what the last frame of the rainbow, the warning or the message actually went
+// out at. Not the current the host's brightness byte asks for -- a host
+// coming back at a new screen brightness would start the fade at that one,
+// and the warning would jump brighter or dimmer on the fade's first frame.
+static uint8_t sysmon_xf_frame(uint8_t gb) {
     if (!sysmon_xf_ready) {
+        // From dark the start frame is black, lit at any current alike: take
+        // the bars' own. The chip's can be stale -- the pad went dark at
+        // another screen brightness -- and holding it through the fade would
+        // run the bars at a much higher current on a few PWM steps.
+        sysmon_xf_gf = sysmon_xf_from == DISP_DARK ? gb : sysmon_gcc;
         for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
             RGB a = {.r = 0, .g = 0, .b = 0}; // a message ends on dark
             if (sysmon_xf_from == DISP_BOOT) a = boot_own[i];
             if (sysmon_xf_from == DISP_WARN) a = sysmon_warn_rgb(sysmon_warn_shown, i, sysmon_warn_el);
-            sysmon_xf_to(a, gf, sysmon_xf_s[i]);
+            sysmon_xf_to(a, sysmon_xf_gf, sysmon_xf_s[i]);
         }
         sysmon_xf_ready = true;
     }
-    float e = sysmon_smooth((float)timer_elapsed32(sysmon_xf_t0) / SYSMON_XFADE_MS);
+    uint8_t gf = sysmon_xf_gf;
+    float   e  = sysmon_smooth((float)timer_elapsed32(sysmon_xf_t0) / SYSMON_XFADE_MS);
     float light[RGB_MATRIX_LED_COUNT][3], top = 0;
     for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
         RGB b = sysmon_fb[i];
@@ -2525,9 +2709,9 @@ static void sysmon_xf_frame(uint8_t gb) {
     for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
         uint8_t o[3];
         for (uint8_t c = 0; c < 3; c++) o[c] = (uint8_t)MIN(light[i][c] / g + 0.5f, 255.0f);
-        sysmon_xf_out[i] = (RGB){.r = o[0], .g = o[1], .b = o[2]};
+        rgb_matrix_set_color(i, o[0], o[1], o[2]);
     }
-    sysmon_xf_g = (uint8_t)g;
+    return (uint8_t)g;
 }
 
 // Write the bars' frame, blended with the previous display while a fade
@@ -2544,11 +2728,7 @@ static void sysmon_flush(uint8_t gcc_bars) {
         }
         return;
     }
-    if (sysmon_new_frame || !sysmon_xf_ready) sysmon_xf_frame(gcc_bars);
-    sysmon_write_gcc(sysmon_xf_g);
-    for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
-        rgb_matrix_set_color(i, sysmon_xf_out[i].r, sysmon_xf_out[i].g, sysmon_xf_out[i].b);
-    }
+    sysmon_write_gcc(sysmon_xf_frame(gcc_bars));
 }
 
 // --- messages ----------------------------------------------------------------
@@ -2563,6 +2743,17 @@ static void sysmon_flush(uint8_t gcc_bars) {
 
 static void sysmon_message(const uint8_t *p) {
     if (!p[5]) return; // no text: a capability probe
+    // A number reported earlier is about an earlier message: a restarted host
+    // numbers from 1 again, and the pad keeps its reports while it has power.
+    // (Cleared first: the drop report below, of the one this replaces, must
+    // stand even if that one carried the same number -- two hosts at once.)
+    if (p[4]) {
+        if (msg_played_seq == p[4]) msg_played_seq = 0;
+        if (msg_dropped_seq == p[4]) msg_dropped_seq = 0;
+    }
+    // A new one replaces one waiting or playing: that one is dropped.
+    sysmon_msg_report_drop();
+    msg_seq = p[4]; // data[7]
     uint8_t q = 0;
     for (; q < sizeof(msg_text) - 1 && p[5 + q]; q++) msg_text[q] = (char)p[5 + q];
     msg_text[q]     = 0;
@@ -2632,10 +2823,18 @@ typedef struct {
 _Static_assert(sizeof(sysmon_trace_frame_t) == 76, "trace frame layout");
 
 extern uint8_t              g_pwm_buffer[DRIVER_COUNT][ISSI_MAX_LEDS]; // the driver's, as sent
+extern bool                 g_pwm_buffer_update_required[DRIVER_COUNT]; // ...and whether it changed
 static sysmon_trace_frame_t sysmon_trace[SYSMON_TRACE_FRAMES];
 static uint16_t             sysmon_trace_head;  // the next frame to write
 static uint16_t             sysmon_trace_count; // frames held
 static bool                 sysmon_trace_frozen;
+
+// A key's PWM as the driver holds it (what goes out with the next flush).
+static RGB sysmon_led_get(uint8_t i) {
+    is31_led led;
+    memcpy_P(&led, &g_is31_leds[i], sizeof(led));
+    return (RGB){.r = g_pwm_buffer[led.driver][led.r], .g = g_pwm_buffer[led.driver][led.g], .b = g_pwm_buffer[led.driver][led.b]};
+}
 
 // Record the frame just drawn (once per frame, after the GCC commit).
 static void sysmon_trace_frame(void) {
@@ -2648,11 +2847,10 @@ static void sysmon_trace_frame(void) {
     f->info                 = (uint8_t)((sysmon_disp & 3) | (change << 2) | (sysmon_xfading() ? 0x10 : 0) | (msg_playing ? 0x20 : 0));
     for (uint8_t r = 0; r < 6; r++) {
         for (uint8_t c = 0; c < 4; c++) {
-            is31_led led;
-            memcpy_P(&led, &g_is31_leds[sysmon_row_leds[r][c]], sizeof(led));
-            f->px[r][c][0] = g_pwm_buffer[led.driver][led.r];
-            f->px[r][c][1] = g_pwm_buffer[led.driver][led.g];
-            f->px[r][c][2] = g_pwm_buffer[led.driver][led.b];
+            RGB px         = sysmon_led_get(sysmon_row_leds[r][c]);
+            f->px[r][c][0] = px.r;
+            f->px[r][c][1] = px.g;
+            f->px[r][c][2] = px.b;
         }
     }
     sysmon_trace_head = (uint16_t)((sysmon_trace_head + 1) % SYSMON_TRACE_FRAMES);
@@ -2698,42 +2896,63 @@ static void sysmon_trace_cmd(uint8_t *p) {
 //      SYSMON_WARN_MS after the no-data timeout
 //   5. otherwise (goodbye, warning over, or rainbow dismissed): the regular
 //      RGB effect
-// Every mode draws all the keys on every call (5 per frame, one per chunk).
+// Every mode draws all the keys; this runs once per frame.
+//
+// All of it runs from the RGB matrix's indicator hook, which QMK skips while
+// the matrix is switched off (RGB_TOG: NumLock off, then the top-left key).
+// That is the pad's lights-off switch and is left to work as one: the bars go
+// dark with everything else until it is pressed again. The FRAME B echo
+// reports it (SYSMON_STATUS_DARK), so the host can say why the pad is dark.
 static bool sysmon_indicators(void) {
     static bool geometry_ready = false;
     if (!geometry_ready) {
         geometry_ready = true;
         boot_geometry_init();
     }
+    // The power-up animation plays on the first frame -- unless a key or the
+    // host came first, or the matrix was off at power-up (housekeeping_task_
+    // user disarms it then). No pick is used up when it doesn't play.
     if (boot_armed) {
-        boot_armed        = false;
-        boot_powerup_pick = boot_next_pick() + 1;
-        boot_start(boot_powerup_pick - 1, 1, 1, false);
+        boot_armed = false;
+        if (!boot_dismissed && sysmon_last_update == 0) {
+            boot_powerup_pick = boot_next_pick() + 1;
+            boot_start(boot_powerup_pick - 1, 1, 1, false);
+        }
+    }
+
+    // Frames that stopped (the matrix switched off, a suspend) leave
+    // sysmon_disp at what showed before. The pad was dark since, so whatever
+    // comes next starts from dark: the bars fade in from it, rather than from
+    // a stale rainbow or warning frame. (After a USB suspend the host itself
+    // was asleep: the regular effect shows until it streams again, and the
+    // bars cut in from that, as before.)
+    if (sysmon_went_dark) {
+        sysmon_went_dark = false;
+        if (sysmon_disp != DISP_EFFECT) sysmon_disp = DISP_DARK;
     }
 
     if (boot_render()) {
         sysmon_set_gcc(BOOT_BRIGHTNESS);
         sysmon_disp = DISP_BOOT;
-        msg_waiting = msg_playing = false; // (only a replay preview gets here with the host live)
+        // A message is for the bars: it waits out the animation (the power-up
+        // one can finish after the host connects, a replay preview can play
+        // over live data) and plays once they are back.
+        sysmon_msg_hold();
         return false;
     }
     if (warn_preview_render()) {
         sysmon_set_gcc(sysmon_last_update ? sysmon_slewed_val() : BOOT_BRIGHTNESS);
         sysmon_disp = DISP_WARN;
+        sysmon_msg_hold(); // it waits this out too, as the boot animation's
         return false;
     }
-    if (boot_counter_dirty) {
-        // Deferred until the animation is over, clear of USB enumeration
-        // (a flash write stalls the MCU).
-        boot_counter_dirty = false;
-        eeconfig_update_user(boot_counter);
-    }
-
-    uint32_t timeout_ms = (uint32_t)sysmon_timeout_units * 100;
-    uint32_t since      = sysmon_last_update ? timer_elapsed32(sysmon_last_update) : 0;
-    if (sysmon_last_update == 0 || since > timeout_ms || sysmon_goodbye) {
-        msg_waiting = msg_playing = false; // a message is for the bars only
-        sysmon_ask  = false;
+    uint32_t timeout_ms = sysmon_timeout_ms();
+    uint32_t since      = sysmon_since();
+    if (!sysmon_host_live()) {
+        // A message is for the bars only: the host is gone, so drop it (the
+        // host is told when it is back, and names that limit again).
+        sysmon_msg_drop();
+        sysmon_ask = false;
         if (sysmon_last_update == 0 && !boot_dismissed) {
             sysmon_set_gcc(BOOT_BRIGHTNESS);
             boot_render_static();
@@ -2786,7 +3005,9 @@ static bool sysmon_indicators(void) {
     }
     if (msg_playing && !sysmon_msg_render()) {
         msg_playing     = false;
-        sysmon_xf_from  = DISP_MSG;
+        if (msg_seq) msg_played_seq = msg_seq;
+        msg_seq = 0;
+        sysmon_xf_from  = DISP_DARK;
         sysmon_xf_t0    = timer_read32();
         sysmon_xf_ready = false;
     }
@@ -2795,14 +3016,73 @@ static bool sysmon_indicators(void) {
     return false;
 }
 
+// QMK renders a frame in chunks (five here) and calls this after each one.
+// The sysmon display covers every key, so it is drawn once, on the frame's
+// first call, kept, and put back over what each later chunk of the regular
+// effect drew. (Drawing it on every call did all the work five times over.
+// Rendering in one pass instead would have changed the stock effects:
+// Raindrops adds a drop per render call.)
+//
+// Once the frame is complete its global current goes out with it
+// (sysmon_gcc_commit) and the trace records it, once per frame.
+//
+// A sysmon frame is complete as soon as it is drawn, so its current goes out
+// on the first call -- never waiting for a last call that an effect rendering
+// in one call, like Digital Rain, never makes. When that commit sends the PWM
+// itself (the current moves: fades, slews), the restore over the last chunk
+// leaves the buffer as sent, so QMK's regular flush is told there is nothing
+// new.
+//
+// A regular-effect frame is complete on its last call, or for a one-call
+// effect on its first: recognised by two single-call frames in a row (QMK
+// restarting a frame after its first chunk, on an effect change, leaves one).
+// Not every one-call frame repaints every key (Pixel Flow's waiting frames,
+// Jellybean Raindrops), so the first effect frame after the sysmon display
+// starts from black: the stock current then never lights up a leftover bars
+// or rainbow frame.
+static RGB  sysmon_frame[RGB_MATRIX_LED_COUNT]; // this frame, as sysmon drew it
+static bool sysmon_frame_effect;                // ...or the regular effect shows
+
 bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
-    sysmon_new_frame = led_min == 0;
-    bool effect      = sysmon_indicators();
-    if (led_max >= RGB_MATRIX_LED_COUNT) { // the frame is complete
+    static uint8_t calls      = 0;    // calls in the frame so far
+    static uint8_t singles    = 0;    // frames in a row that had just one call
+    static bool    committed  = false; // this frame's current is out
+    static bool    was_effect = false; // the last frame showed the regular effect
+    bool           early      = false; // commit on the first call
+    if (led_min == 0) {
+        // Two in a row: one alone can be a frame QMK restarted after its
+        // first chunk (an effect change), not a one-call effect.
+        singles             = calls == 1 ? (singles < 2 ? singles + 1 : 2) : 0;
+        calls               = 0;
+        committed           = false;
+        sysmon_gcc_flushed  = false;
+        sysmon_frame_effect = sysmon_indicators();
+        if (!sysmon_frame_effect) {
+            for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) sysmon_frame[i] = sysmon_led_get(i);
+        } else if (!was_effect) {
+            // handing over to the effect: from black, not the last bars frame
+            rgb_matrix_set_color_all(0, 0, 0);
+        }
+        was_effect = sysmon_frame_effect;
+        early      = sysmon_frame_effect ? singles >= 2 : true;
+    } else if (!sysmon_frame_effect && led_max >= RGB_MATRIX_LED_COUNT) {
+        // Once, on the last chunk (only the buffer after it goes out): every
+        // key, not just this chunk's -- some effects (Raindrops, Pixel Rain)
+        // light a random key anywhere on each call.
+        for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) rgb_matrix_set_color(i, sysmon_frame[i].r, sysmon_frame[i].g, sysmon_frame[i].b);
+        // The buffer is now the frame the commit already sent, if it sent it:
+        // QMK's regular flush needn't send it again.
+        if (sysmon_gcc_flushed) {
+            for (uint8_t d = 0; d < DRIVER_COUNT; d++) g_pwm_buffer_update_required[d] = false;
+        }
+    }
+    if (calls < UINT8_MAX) calls++;
+    if (!committed && (early || led_max >= RGB_MATRIX_LED_COUNT)) {
+        committed = true;
         sysmon_gcc_commit();
         sysmon_trace_frame();
     }
-    return effect;
+    return sysmon_frame_effect;
 }
 
 #endif // RGB_MATRIX_ENABLE
