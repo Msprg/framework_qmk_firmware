@@ -180,8 +180,25 @@ if ($BuildFirmware) {
 if (-not (Test-Path $builtUf2)) {
     throw "No firmware at $builtUf2. Build it once (-BuildFirmware) or copy a .uf2 there."
 }
+# A reused image older than its sources predates them: the host would then
+# ship firmware it tells to be reflashed, with that same image. The sources:
+# the Framework keyboard code, the macropad's, and the sysmon keymap -- each
+# folder's own files only (the keymap's host\ tree, its venvs and PyInstaller
+# output are not firmware); QMK's core is left out (rarely edited here). An
+# mtime check, so a branch switch can warn about an image that is in fact
+# current.
+$fwDir    = Join-Path $RepoRoot "keyboards\framework"
+$uf2Time  = (Get-Item $builtUf2).LastWriteTime
+$srcDirs  = @($fwDir, (Join-Path $fwDir "macropad"), (Join-Path $fwDir "macropad\keymaps\sysmon"))
+$newer = $srcDirs | ForEach-Object { Get-ChildItem $_ -File } | Where-Object {
+    $_.Extension -in ".c", ".h", ".mk", ".json" -and $_.LastWriteTime -gt $uf2Time }
+if ($newer -and -not $BuildFirmware) {
+    Write-Host ("    WARNING: $Uf2Name is older than " + (($newer | ForEach-Object Name) -join ", ") +
+                " -- rebuild it with -BuildFirmware, or the installer ships stale firmware.") `
+        -ForegroundColor Yellow
+}
 Copy-Item $builtUf2 (Join-Path $PackagingDir $Uf2Name) -Force
-Write-Ok "$Uf2Name  ($([math]::Round((Get-Item $builtUf2).Length / 1KB)) KB, built $((Get-Item $builtUf2).LastWriteTime))"
+Write-Ok "$Uf2Name  ($([math]::Round((Get-Item $builtUf2).Length / 1KB)) KB, built $uf2Time)"
 
 # --- 4. version resource + freeze ----------------------------------------
 Write-Step "Version resource"

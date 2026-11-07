@@ -108,7 +108,10 @@ Name: "{group}\Uninstall {#AppName}";                   Filename: "{uninstallexe
 ; Order matters: config first (so the service reads it on its very first start),
 ; then registration, then the optional flash, then the start.
 Filename: "{app}\{#ExeName}"; Parameters: "--write-default-config"; StatusMsg: "Writing the default configuration..."; Flags: runhidden waituntilterminated
-Filename: "{app}\{#ExeName}"; Parameters: "--install-service";      StatusMsg: "Registering the boot-start service...";  Flags: runhidden waituntilterminated
+; --install-service runs through cmd, like the winget step below: a hidden
+; [Run] entry's exit code is thrown away, and its output with it. The marker
+; file is written only when it succeeds; CurStepChanged checks for it.
+Filename: "{cmd}"; Parameters: "/c """"{app}\{#ExeName}"" --install-service > ""{tmp}\install-service.log"" 2>&1 && echo ok> ""{tmp}\install-service.ok"""""; StatusMsg: "Registering the boot-start service...";  Flags: runhidden waituntilterminated
 
 ; Full resolved path, not a bare "winget.exe": the App Execution Alias is not
 ; on a path Inno can resolve, and with skipifdoesntexist that failed silently.
@@ -120,7 +123,11 @@ Filename: "{cmd}"; Parameters: "/c """"{code:WingetPath}"" install --id Framewor
 ; Flashing is interactive by nature (it waits for the module to re-enumerate),
 ; so it gets a visible console rather than running hidden, and pauses itself at
 ; the end so the result can be read.
-Filename: "{app}\{#ExeName}"; Parameters: "--flash"; StatusMsg: "Flashing the macropad..."; Flags: waituntilterminated; Tasks: flashfirmware
+Filename: "{app}\{#ExeName}"; Parameters: "--flash"; StatusMsg: "Flashing the macropad..."; Flags: waituntilterminated; Tasks: flashfirmware; Check: not WizardSilent
+; A silent install has nobody to answer a question or close the window, so
+; it runs hidden: launched hidden, the flasher asks nothing and doesn't wait
+; for Enter (applog.can_prompt / pause_if_own_console).
+Filename: "{app}\{#ExeName}"; Parameters: "--flash"; StatusMsg: "Flashing the macropad..."; Flags: runhidden waituntilterminated; Tasks: flashfirmware; Check: WizardSilent
 
 Filename: "{app}\{#ExeName}"; Parameters: "--start-service"; StatusMsg: "Starting the service..."; Flags: runhidden waituntilterminated; Tasks: startservice
 
@@ -390,14 +397,15 @@ begin
     CmdOk(ExpandConstant('{sys}\net.exe'), 'stop {#ServiceName}');
 end;
 
-// Last few lines of winget's captured output, for the failure dialog.
-function WingetLogTail: String;
+// The last few lines of a step's captured output in {tmp}, for its failure
+// dialog (winget, --install-service).
+function LogTail(const Name: String): String;
 var
   Lines: TArrayOfString;
   I, First: Integer;
 begin
   Result := '';
-  if not LoadStringsFromFile(ExpandConstant('{tmp}\winget.log'), Lines) then
+  if not LoadStringsFromFile(ExpandConstant('{tmp}\') + Name, Lines) then
     Exit;
   First := GetArrayLength(Lines) - 8;
   if First < 0 then First := 0;
@@ -406,10 +414,44 @@ begin
       Result := Result + Trim(Lines[I]) + #13#10;
 end;
 
+// The service as the SCM holds it: registered, and not just marked for
+// deletion (such a service keeps its key, with DeleteFlag = 1, until the last
+// handle to it closes).
+function ServiceRegistered: Boolean;
+var
+  DeleteFlag: Cardinal;
+begin
+  Result := ServiceInstalled;
+  if Result and RegQueryDWordValue(HKEY_LOCAL_MACHINE,
+      'SYSTEM\CurrentControlSet\Services\{#ServiceName}', 'DeleteFlag',
+      DeleteFlag) then
+    Result := DeleteFlag = 0;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   Tail: String;
 begin
+  // Check the --install-service step: by its own success marker, since an
+  // upgrade whose reconfigure failed still leaves the old, valid service in
+  // the registry, and by the registry too. Without a current service the pad
+  // stays dark, or runs the old version, with nothing to say why.
+  if (CurStep = ssPostInstall) and
+     (not FileExists(ExpandConstant('{tmp}\install-service.ok')) or
+      not ServiceRegistered) then
+  begin
+    Tail := LogTail('install-service.log');
+    if Tail <> '' then
+      Tail := #13#10 + 'It said:' + #13#10 + #13#10 + Tail;
+    SuppressibleMsgBox(
+      'The {#ServiceName} service could not be registered or updated, so' + #13#10 +
+      'the macropad may not show the bars (or runs the old version).' + #13#10 +
+      Tail + #13#10 +
+      'If the Services console or Task Manager is open, close it (or' + #13#10 +
+      'restart Windows), then run this setup again.',
+      mbError, MB_OK, IDOK);
+  end;
+
   // Verify the winget step actually did something. It runs hidden and its exit
   // code is not surfaced, so a failure (winget declining to run under Setup's
   // elevated token, no network, the package id having moved) would otherwise be
@@ -418,7 +460,7 @@ begin
   begin
     if not FrameworkToolPresent then
     begin
-      Tail := WingetLogTail;
+      Tail := LogTail('winget.log');
       if Tail <> '' then
         Tail := #13#10 + 'winget said:' + #13#10 + #13#10 + Tail;
       MsgBox('framework_tool could not be installed automatically.' + #13#10 +
