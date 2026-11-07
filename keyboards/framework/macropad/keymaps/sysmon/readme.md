@@ -10,7 +10,7 @@ normally — the stats ride on a private custom-value channel, `0x42`):
 | 2 | CPU usage | red bar; breathes when a limit holds the APU back, and the pad names it (see below) |
 | 3 | Memory usage | gold bar; whole row blinks at ~1 Hz when usage is critically high (≥90%) |
 | 4 | iGPU + NPU usage | red bar for the iGPU; NPU usage as a dim cyan *ghost* bar behind it, visible where the NPU is busier than the iGPU (see below) |
-| 5 | dGPU usage | green bar (dark if no dGPU); breathes when a limit holds the dGPU back, and the pad names it (see below) |
+| 5 | dGPU usage | green bar (dark if no dGPU); breathes when a limit holds the dGPU back, and the pad names it (see below); the last key glows dim light blue/teal while the dGPU is powered off (D3cold) |
 | 6 | System temperature | fixed green→deep-red gradient across the row; bar length scales 30–90 °C; whole row blinks at ~1 Hz above 90 °C |
 
 ## Boot rainbow
@@ -159,6 +159,30 @@ same PDH `GPU Engine` counters as the GPUs, scoped to the NPU's LUID. On a
 machine without an NPU the row is just the iGPU bar. Drawing the ghost needs the
 firmware from this version (protocol FRAME C, below); older firmware ignores it
 and shows the plain iGPU bar.
+
+## dGPU sleep marker
+
+On a hybrid-graphics laptop the dGPU powers itself off when nothing uses it.
+While it is off, in **D3cold**, the dGPU row's last (right) key glows a dim,
+steady light blue/teal (`HUE_DGPU_OFF`, `ROW_VAL_DGPU_OFF`). When something
+wakes the GPU the key fades out, and it fades back in once the GPU is off
+again; the green usage bar is unchanged.
+
+The state comes from Plug and Play: each device's most recent power state
+(what Device Manager shows as *Power data*), a property lookup that involves
+no I/O to the GPU, so reading it can't wake it. PnP reports D3 for D3hot and
+D3cold alike; it is D3cold when the PCIe port above the GPU is in D3 as well,
+since Windows only powers the port down once the link is off. On the FW16's
+RTX 5070, an idle GPU drops to D3hot within about a second and its port
+follows 6-8 s later, so the key lights up a few seconds after the GPU goes
+idle. Background activity wakes the GPU now and then for a second or two; the
+key goes out for those wakes too.
+
+`--verbose` shows the state at the end of the `limits` line (`power=D0`,
+`D3hot`, `D3cold`), and `--selftest` reports it. The marker needs the
+firmware from this version (it is a right-anchored ghost bar, protocol FRAME C
+below); with older firmware the host sends no marker at all, rather than one
+at the wrong end of the row.
 
 ## Limit indication
 
@@ -539,10 +563,11 @@ either works during development. What is available:
   own), `MSG_ONSET_S` / `MSG_MIN_GAP_S` / `MSG_REARM_S`,
   `MSG_SPEED`, `MSG_SHOW_VALUE`, and every word (`MSG_NAME_*`, `MSG_WORD_*`,
   `MSG_NO_LIMIT`)
-- **colours**: the `HUE_*` constants (including `HUE_NPU`, the ghost bar) and
-  the temperature gradient endpoints
+- **colours**: the `HUE_*` constants (including `HUE_NPU`, the ghost bar, and
+  `HUE_DGPU_OFF`, the dGPU sleep marker) and the temperature gradient endpoints
 - **mappings**: `RATE_SEG_W1/2/3` (watts → animated segments),
-  `ROW_VAL_BATT_IDLE`, `ROW_VAL_NPU_GHOST`, `BATT_DRIFT_FLOOR`, `LIMIT_FLOOR`
+  `ROW_VAL_BATT_IDLE`, `ROW_VAL_NPU_GHOST`, `ROW_VAL_DGPU_OFF`,
+  `BATT_DRIFT_FLOOR`, `LIMIT_FLOOR`
 - **cadences**: the `PERIOD_*` constants (blink / breathe / pulse, in 32 ms units)
 - **globals**: `GLIDE_MS_DEFAULT`, `TIMEOUT_MS_DEFAULT`
 - **polling**: the `TTL_*` source-cache lifetimes (how often each slow sensor is read)

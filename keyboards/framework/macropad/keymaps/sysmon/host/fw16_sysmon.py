@@ -15,7 +15,7 @@ private VIA channel (0x42):
     value_id 0x01 = FRAME A: rows 0,1,2
     value_id 0x02 = FRAME B: rows 3,4,5 + globals
     value_id 0x03 = FRAME C: optional per-row ghost bars (the NPU on the iGPU
-                    row); older firmware ignores it
+                    row, the dGPU sleep marker); older firmware ignores it
 
 Dependencies (Windows):
     pip install hidapi psutil wmi
@@ -134,11 +134,14 @@ REPORT_LEN = 32
 #   +0 level  uint8 0..255 fraction of the 4-segment bar (0 = no ghost)
 #   +1 hue    uint8 0..255 QMK hue of the ghost
 #   +2 val    uint8 0..255 ghost brightness (the row's envelope scales it too)
-#   +3 flags  uint8 reserved (0)
+#   +3 flags  uint8 bit0 = anchored at the right end (fills leftward from the
+#             last key; level 63 = the last key alone), bits1-7 reserved (0)
 #   Firmware without ghost support ignores value_id 0x03; firmware with it
 #   fades the ghosts out if FRAME C stops arriving within the timeout, and sets
 #   data[27] = 0x01 in its FRAME C echo (older firmware echoes it unchanged),
-#   which is how --selftest tells whether a reflash is needed.
+#   which is how --selftest tells whether a reflash is needed. Firmware that
+#   reads the flags also sets data[28] = 0x01; a right-anchored ghost is only
+#   sent once that has been seen (without it, it would show at the left end).
 #
 # MESSAGE (value_id 0x05, sent only when there is something to say): a line
 #   of text the firmware scrolls over the bars -- the bars dim out, the text
@@ -163,6 +166,12 @@ ROW_DESC_LEN = 8
 GHOST_DESC_LEN = 4
 GHOST_ACK_OFFSET = 27   # FRAME C echo byte the firmware marks when it draws ghosts
 GHOST_ACK = 0x01
+GHOST_FLAGS_ACK_OFFSET = 28  # ...and this one when it reads the ghost flags
+GHOST_FLAGS_ACK = 0x01
+GHOST_FLAG_RIGHT = 0x01      # ghost flags bit0: anchored at the row's right end
+GHOST_LEVEL_ONE_KEY = 63     # a ghost covering exactly one segment (64 would
+                             # spill 1/255 onto the next key, which the
+                             # firmware's visibility lift can make glow)
 MSG_ACK_OFFSET = 31     # MESSAGE echo byte the firmware marks when it can show one
 MSG_ACK = 0x01
 STATUS_OFFSET = 31      # FRAME B echo: the firmware's status bits
@@ -221,11 +230,14 @@ HUE_TEMP_LO = 85    # temperature gradient start (green, cool)
 HUE_TEMP_HI = 0     # temperature gradient end (red, hot)
 HUE_CHARGE_FULL = 85  # charging hue at 100% (pct*85/100, red->green)
 HUE_NPU = 128       # NPU ghost bar on the iGPU row (cyan)
+HUE_DGPU_OFF = 140  # dGPU powered off (D3cold): the dGPU row's last key (light
+                    # blue/teal; kept off HUE_NPU, the row right above)
 
 # Brightness levels (base row_val)
 ROW_VAL_FULL = 255
 ROW_VAL_BATT_IDLE = 80   # AC-idle dim green; firmware lifts via visible_pwm
 ROW_VAL_NPU_GHOST = 96   # NPU ghost bar: dim, so the bright iGPU bar reads first
+ROW_VAL_DGPU_OFF = 80    # the D3cold marker: steady and dim, like the idle battery
 
 # Battery policy
 BATT_CRITICAL_PCT = 15   # raw % below which a discharging battery blinks red
@@ -700,6 +712,146 @@ class GpuMonitor:
             elif self.igpu_re.search(desc):
                 igpu += total
         return min(100, igpu), min(100, dgpu), self.dgpu_present, npu
+
+
+class DgpuPower:
+    """The dGPU's device power state from Plug and Play, without waking it.
+
+    On a hybrid-graphics laptop the dGPU powers off when nothing uses it. PnP
+    keeps each device's most recent D-state (DEVPKEY_Device_PowerData, the
+    "Power data" Device Manager shows), and reading it is a cfgmgr32 property
+    lookup: no I/O to the device, so it can't wake it -- unlike NVML, whose
+    calls power the GPU up (about 2 s) and keep it up while they continue.
+
+    PnP says D3 for D3hot and D3cold alike. The difference is the PCIe port
+    above the GPU: for D3cold Windows takes the link down and powers the port
+    to D3 as well. Measured on the FW16's RTX 5070: an idle GPU drops to D3
+    within ~1 s with its port still at D0 (D3hot), and the port follows 6-8 s
+    later (D3cold). Short wakes from background activity bring both to D0.
+
+    The device is found by name among the present display adapters (the same
+    regex as the PDH dGPU match), then re-found by its instance ID on every
+    read, so a driver reinstall or a disabled device is picked up again.
+    """
+
+    RETRY_S = 10  # min seconds between scans while no dGPU devnode is found
+    DISPLAY_CLASS = "{4d36e968-e325-11ce-bfc1-08002be10318}"
+
+    def __init__(self, dgpu_pattern, announce=False):
+        self.dgpu_re = re.compile(dgpu_pattern, re.IGNORECASE)
+        self.announce = announce  # log the device once it is found
+        self.device_id = None
+        self.name = None
+        self._next_scan = 0.0
+        self._cfg = None
+        try:
+            import ctypes
+            from ctypes import wintypes as wt
+            cfg = ctypes.WinDLL("cfgmgr32")
+            pdword = ctypes.POINTER(wt.DWORD)
+            cfg.CM_Locate_DevNodeW.argtypes = (pdword, wt.LPCWSTR, wt.ULONG)
+            cfg.CM_Get_Parent.argtypes = (pdword, wt.DWORD, wt.ULONG)
+            cfg.CM_Get_DevNode_PropertyW.argtypes = (
+                wt.DWORD, ctypes.c_void_p, ctypes.POINTER(wt.ULONG),
+                ctypes.c_void_p, ctypes.POINTER(wt.ULONG), wt.ULONG)
+            cfg.CM_Get_Device_ID_List_SizeW.argtypes = (
+                ctypes.POINTER(wt.ULONG), wt.LPCWSTR, wt.ULONG)
+            cfg.CM_Get_Device_ID_ListW.argtypes = (
+                wt.LPCWSTR, ctypes.c_void_p, wt.ULONG, wt.ULONG)
+            for fn in (cfg.CM_Locate_DevNodeW, cfg.CM_Get_Parent,
+                       cfg.CM_Get_DevNode_PropertyW,
+                       cfg.CM_Get_Device_ID_List_SizeW, cfg.CM_Get_Device_ID_ListW):
+                fn.restype = wt.DWORD  # CONFIGRET; 0 = CR_SUCCESS
+        except (OSError, AttributeError):
+            return
+        self._ctypes, self._wt, self._cfg = ctypes, wt, cfg
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("Data1", wt.DWORD), ("Data2", wt.WORD),
+                        ("Data3", wt.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+        class DEVPROPKEY(ctypes.Structure):
+            _fields_ = [("fmtid", GUID), ("pid", wt.ULONG)]
+
+        # {a45c254e-df1c-4efd-8020-67d146a850e0}: the DEVPKEY_Device_* set
+        dev = GUID(0xA45C254E, 0xDF1C, 0x4EFD,
+                   (ctypes.c_ubyte * 8)(0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0))
+        self._key_desc = DEVPROPKEY(dev, 2)       # DEVPKEY_Device_DeviceDesc
+        self._key_friendly = DEVPROPKEY(dev, 14)  # DEVPKEY_Device_FriendlyName
+        self._key_power = DEVPROPKEY(dev, 32)     # DEVPKEY_Device_PowerData
+
+    def _prop(self, inst, key):
+        """A devnode property's raw bytes, or None."""
+        ctypes, wt = self._ctypes, self._wt
+        kind, size = wt.ULONG(), wt.ULONG(0)
+        self._cfg.CM_Get_DevNode_PropertyW(inst, ctypes.byref(key), ctypes.byref(kind),
+                                           None, ctypes.byref(size), 0)
+        if not size.value:
+            return None
+        buf = (ctypes.c_ubyte * size.value)()
+        if self._cfg.CM_Get_DevNode_PropertyW(inst, ctypes.byref(key), ctypes.byref(kind),
+                                              buf, ctypes.byref(size), 0):
+            return None
+        return bytes(buf)
+
+    def _locate(self, device_id):
+        inst = self._wt.DWORD()
+        if self._cfg.CM_Locate_DevNodeW(self._ctypes.byref(inst), device_id, 0):
+            return None
+        return inst.value
+
+    def _d_state(self, inst):
+        """0..3 for D0..D3 (CM_POWER_DATA.PD_MostRecentPowerState), or None."""
+        data = self._prop(inst, self._key_power)
+        if not data or len(data) < 8:
+            return None
+        state = int.from_bytes(data[4:8], "little")  # PowerDeviceD0 = 1 .. D3 = 4
+        return state - 1 if 1 <= state <= 4 else None
+
+    def _scan(self):
+        """Find the present display adapter whose name matches the dGPU regex."""
+        ctypes, wt = self._ctypes, self._wt
+        self._next_scan = time.monotonic() + self.RETRY_S
+        flags = 0x200 | 0x100  # CM_GETIDLIST_FILTER_CLASS | _PRESENT
+        size = wt.ULONG()
+        if self._cfg.CM_Get_Device_ID_List_SizeW(ctypes.byref(size), self.DISPLAY_CLASS, flags):
+            return
+        buf = ctypes.create_unicode_buffer(size.value)
+        if self._cfg.CM_Get_Device_ID_ListW(self.DISPLAY_CLASS, buf, size, flags):
+            return
+        for device_id in buf[:size.value].split("\0"):
+            inst = self._locate(device_id) if device_id else None
+            if inst is None:
+                continue
+            raw = self._prop(inst, self._key_friendly) or self._prop(inst, self._key_desc)
+            name = raw.decode("utf-16-le", "replace").rstrip("\0") if raw else ""
+            if self.dgpu_re.search(name):
+                if self.announce and device_id != self.device_id:
+                    log(f"dGPU power state from PnP: {name}")
+                self.device_id, self.name = device_id, name
+                return
+
+    def state(self):
+        """'D0'..'D2', 'D3hot', 'D3cold', or None (no dGPU found / unreadable)."""
+        if self._cfg is None:
+            return None
+        inst = self._locate(self.device_id) if self.device_id else None
+        if inst is None:
+            if time.monotonic() < self._next_scan:
+                return None
+            self._scan()
+            inst = self._locate(self.device_id) if self.device_id else None
+            if inst is None:
+                return None
+        d = self._d_state(inst)
+        if d is None:
+            return None
+        if d < 3:
+            return f"D{d}"
+        parent = self._wt.DWORD()
+        if self._cfg.CM_Get_Parent(self._ctypes.byref(parent), inst, 0):
+            return "D3hot"
+        return "D3cold" if self._d_state(parent.value) == 3 else "D3hot"
 
 
 class Reason:
@@ -1926,7 +2078,7 @@ class RowDesc:
                  gradient=False, envelope=ENV_NONE,
                  overlay_shape=OVL_NONE, overlay_dir=OVL_DIR_UP,
                  overlay_count=0, period=0, floor=0,
-                 ghost_level=0, ghost_hue=0, ghost_val=0):
+                 ghost_level=0, ghost_hue=0, ghost_val=0, ghost_right=False):
         self.level = level
         self.row_val = row_val
         self.hue0 = hue0
@@ -1941,6 +2093,7 @@ class RowDesc:
         self.ghost_level = ghost_level
         self.ghost_hue = ghost_hue
         self.ghost_val = ghost_val
+        self.ghost_right = ghost_right
 
     def flags_byte(self):
         f = 0
@@ -1968,7 +2121,7 @@ class RowDesc:
             clamp8(self.ghost_level),
             clamp8(self.ghost_hue),
             clamp8(self.ghost_val),
-            0,  # flags, reserved
+            GHOST_FLAG_RIGHT if self.ghost_right else 0,
         ))
 
     def __repr__(self):
@@ -1983,6 +2136,7 @@ class RowDesc:
         flr = f" floor={self.floor}" if (self.envelope == ENV_BREATHE
                                          or self.overlay_shape == OVL_SINE) else ""
         ghost = (f" ghost={self.ghost_level}@hue{self.ghost_hue}/val{self.ghost_val}"
+                 f"{' right' if self.ghost_right else ''}"
                  if self.ghost_level else "")
         return (f"lvl={self.level} val={self.row_val} hue={self.hue0}{grad}"
                 f"{envs}{ovls}{flr}{ghost}")
@@ -2114,11 +2268,25 @@ def build_igpu_row(m):
 
 
 def build_dgpu_row(m):
-    """row4: dGPU usage, solid green; breathe when a dGPU limit binds."""
-    if not m["dgpu_present"]:
-        return RowDesc(level=0)
-    return limit_breathe(RowDesc(level=pct_to_level(m["dgpu"]), hue0=HUE_GREEN),
-                         m.get("dgpu_limit"))
+    """row4: dGPU usage, solid green; breathe when a dGPU limit binds.
+
+    While the dGPU is powered off (D3cold) the row's last key glows dim
+    HUE_DGPU_OFF: a right-anchored one-key ghost, so it glides in and out and
+    stays clear of the bar. Not tied to dgpu_present: finding the device in
+    D3cold is proof enough that there is one. It needs firmware that reads the
+    ghost flags (m["ghost_flags"]); without them it would show at the left end.
+    """
+    if m["dgpu_present"]:
+        desc = limit_breathe(RowDesc(level=pct_to_level(m["dgpu"]), hue0=HUE_GREEN),
+                             m.get("dgpu_limit"))
+    else:
+        desc = RowDesc(level=0)
+    if m.get("ghost_flags"):
+        desc.ghost_level = GHOST_LEVEL_ONE_KEY if m["dgpu_power"] == "D3cold" else 0
+        desc.ghost_hue = HUE_DGPU_OFF
+        desc.ghost_val = ROW_VAL_DGPU_OFF
+        desc.ghost_right = True
+    return desc
 
 
 def build_temp_row(m):
@@ -2239,6 +2407,9 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
     if nv_util is not None:
         dgpu, dgpu_present = nv_util, True
 
+    # Whether the dGPU is powered off, from PnP (never wakes it; see DgpuPower).
+    dgpu_power = cache["dgpu_power"]()
+
     # One LHM snapshot feeds both temperature and CPU power this tick.
     lhm_temp, cpu_pkg_w, cpu_load = cache["lhm"]()
 
@@ -2330,6 +2501,7 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
         "dgpu": clamp(dgpu, 0, 100),
         "dgpu_present": dgpu_present,
         "dgpu_src": "nvml" if nv_util is not None else "pdh",
+        "dgpu_power": dgpu_power,  # 'D0'..'D3cold', None = unknown
         "dgpu_binding": dgpu_binding,
         "dgpu_limit": None,
 
@@ -2612,6 +2784,7 @@ def run(args, stop_event=None, resume_check=None):
     ec = EcThermal()
     charge_limit = EcChargeLimit()
     gpu = GpuMonitor(args.igpu_match, args.dgpu_match)
+    dpower = DgpuPower(args.dgpu_match, announce=True)
     apu = ApuLimits(cap_watts=args.cpu_power_cap)
     nv = NvGpuLimits(enabled=not args.no_nvml)
     lhmlib = LhmLibSource(enabled=not args.no_lhm_lib)
@@ -2635,6 +2808,8 @@ def run(args, stop_event=None, resume_check=None):
         "lhm": Cached(lhm_snapshot, TTL_LHM_SNAPSHOT),
         "ryzenadj": Cached(ryzen.snapshot, TTL_RYZENADJ),
         "ec_temp": Cached(ec.temperature, TTL_EC_THERMAL),
+        # every tick: two devnode property lookups, microseconds
+        "dgpu_power": Cached(dpower.state, 0.0),
     }
 
     if args.verbose:
@@ -2651,6 +2826,7 @@ def run(args, stop_event=None, resume_check=None):
     messenger = Messenger(verbose=args.verbose)
 
     dev = None
+    ghost_flags = False  # the firmware reads ghost flags (seen in a FRAME C echo)
     published_state = False
     while not stop_event.is_set():
         try:
@@ -2674,6 +2850,7 @@ def run(args, stop_event=None, resume_check=None):
                     stop_event.wait(5)
                     continue
                 print("Connected to macropad")
+                ghost_flags = False  # a reflash may have changed the firmware
                 messenger.reset()
                 messenger.probe(dev)
 
@@ -2683,6 +2860,7 @@ def run(args, stop_event=None, resume_check=None):
             gpu_track.update(m["dgpu_binding"], now)
             m["cpu_limit"] = cpu_track.reason
             m["dgpu_limit"] = gpu_track.reason
+            m["ghost_flags"] = ghost_flags
             rows = [ROW_BUILDERS[i](m) for i in range(6)]
             if not published_state:
                 # First complete tick: record what this process can actually
@@ -2716,7 +2894,8 @@ def run(args, stop_event=None, resume_check=None):
                 dgpu_now = " ".join(map(repr, m["dgpu_binding"].values())) or "-"
                 print(f"  limits ac={m['ac']} weak={m['weak_charger']} "
                       f"cpu {cpu_src} -> {m['cpu_limit']!r} "
-                      f"dgpu[{m['dgpu_src']}] {dgpu_now} -> {m['dgpu_limit']!r}")
+                      f"dgpu[{m['dgpu_src']}] {dgpu_now} -> {m['dgpu_limit']!r} "
+                      f"power={m['dgpu_power']}")
             for rep in build_frame(rows, m["brightness"]):
                 dev.write(b"\x00" + rep)
             # drain the VIA echoes so the report buffer doesn't fill up; they
@@ -2725,6 +2904,9 @@ def run(args, stop_event=None, resume_check=None):
                 rep = dev.read(REPORT_LEN)
                 if not rep:
                     break
+                if (len(rep) > GHOST_FLAGS_ACK_OFFSET and rep[1] == SYSMON_CHANNEL
+                        and rep[2] == SYSMON_VALUE_FRAME_C):
+                    ghost_flags = rep[GHOST_FLAGS_ACK_OFFSET] == GHOST_FLAGS_ACK
                 messenger.on_echo(rep)
             messenger.tick(dev, now, (cpu_track, gpu_track))
         except KeyboardInterrupt:
