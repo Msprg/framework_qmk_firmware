@@ -274,39 +274,56 @@ def probe_firmware():
             pass
 
 
-def _probe_ghost_support(dev, eng):
-    """The module runs sysmon firmware; does it also draw ghost bars?
+def _probe_ack(dev, eng, value_id, offset, ack):
+    """Send an empty report of value_id; True if its echo carries ack at offset.
 
-    Sends an all-zero FRAME C (legal: no ghosts) and reads the echo back.
-    Ghost-capable firmware marks byte GHOST_ACK_OFFSET of the echo; older
-    firmware echoes FRAME C unchanged. Without that check, firmware that
-    predates the ghost bars fails silently: the iGPU row just never shows the
-    NPU. Other echoes can arrive first (a running service gets them too), so
-    only a FRAME C echo counts.
+    Older firmware echoes such a report unchanged. Other echoes can arrive
+    first (a running service gets them too), so only this value's echo counts.
     """
     import time
-    ok = Result("firmware", "sysmon firmware", OK,
-                "device acknowledged channel 0x42; draws ghost bars")
     probe = bytearray(eng.REPORT_LEN)
     probe[0] = eng.VIA_CMD_CUSTOM_SET_VALUE
     probe[1] = eng.SYSMON_CHANNEL
-    probe[2] = eng.SYSMON_VALUE_FRAME_C
+    probe[2] = value_id
     try:
         dev.write(b"\x00" + bytes(probe))
         deadline = time.monotonic() + 1.0
         while time.monotonic() < deadline:
             reply = dev.read(eng.REPORT_LEN)
-            if (reply and len(reply) > eng.GHOST_ACK_OFFSET
-                    and reply[1] == eng.SYSMON_CHANNEL
-                    and reply[2] == eng.SYSMON_VALUE_FRAME_C):
-                if reply[eng.GHOST_ACK_OFFSET] == eng.GHOST_ACK:
-                    return ok
-                break
+            if (reply and len(reply) > offset
+                    and reply[1] == eng.SYSMON_CHANNEL and reply[2] == value_id):
+                return reply[offset] == ack
             if not reply:
                 time.sleep(0.02)
     except Exception:
         pass
-    # Old firmware. Only worth flagging where a ghost would actually be drawn.
+    return False
+
+
+def _probe_ghost_support(dev, eng):
+    """The module runs sysmon firmware; does it draw ghost bars and messages?
+
+    An all-zero FRAME C (legal: no ghosts) and an empty MESSAGE (a probe: it
+    shows nothing) each come back marked by firmware that has the feature.
+    Without that check, older firmware fails silently: the iGPU row just never
+    shows the NPU, and limits are never named.
+    """
+    ghosts = _probe_ack(dev, eng, eng.SYSMON_VALUE_FRAME_C,
+                        eng.GHOST_ACK_OFFSET, eng.GHOST_ACK)
+    messages = _probe_ack(dev, eng, eng.SYSMON_VALUE_MESSAGE,
+                          eng.MSG_ACK_OFFSET, eng.MSG_ACK)
+    if ghosts and messages:
+        return Result("firmware", "sysmon firmware", OK,
+                      "device acknowledged channel 0x42; draws ghost bars and "
+                      "limit messages")
+    if not messages:
+        return Result("firmware", "sysmon firmware", DEGRADED,
+                      "device acknowledged channel 0x42; firmware predates "
+                      "limit messages" + ("" if ghosts else " and ghost bars"),
+                      "The CPU/dGPU rows still breathe on a limit, but the pad "
+                      "can't name it. Flash the bundled firmware (--flash).")
+    # Messages but no ghosts can't happen (ghosts are older); kept for safety.
+    # Only worth flagging where a ghost would actually be drawn.
     detail = "device acknowledged channel 0x42; firmware predates ghost bars"
     try:
         has_npu = bool(eng.compute_only_adapter_luids())
@@ -355,8 +372,8 @@ def probe_ryzenadj():
                 hint)
         snap = src.snapshot() or {}
         pairs = ", ".join(
-            f"{k}={snap[k][0]:.1f}/{snap[k][1]:.1f}W"
-            for k in ("stapm", "fast", "slow") if k in snap)
+            f"{k}={snap[k][0]:.1f}/{snap[k][1]:.1f}{unit}"
+            for k, (_, unit) in eng.APU_SIGNALS.items() if k in snap)
         return Result("ryzenadj", "AMD APU power limits", OK,
                       pairs or "SMU table readable")
     finally:

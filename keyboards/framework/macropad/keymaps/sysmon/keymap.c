@@ -144,6 +144,24 @@ void enable_factory_mode(bool enable) {
 // disconnect warning (caution stripes) for SYSMON_WARN_MS, then falls back to
 // the regular effect. The next FRAME A/B cancels either state.
 //
+// MESSAGE (value_id 0x05): a line of text for the user to read -- which limit
+// holds a component back, say. The bars dim out, the text scrolls through on
+// dark like an LED ticker, and the bars fade back in. It waits until the bars
+// show and have settled, and is dropped if the host goes away first; it never
+// plays over the boot rainbow or the disconnect warning. A new one replaces
+// one waiting or playing.
+//   data[3]     style: 0 = ticker (others reserved; played as the ticker)
+//   data[4..5]  hue and saturation of the text (saturation 0 = white)
+//   data[6]     speed, columns per second (0 = SYSMON_MSG_CPS)
+//   data[7]     reserved (0)
+//   data[8..30] text, NUL-terminated, up to 23 characters (the boot text's
+//               font: A-Z, 0-9, space, - ! .). Empty: nothing happens (a probe).
+//   echo: data[31] = SYSMON_MSG_ACK, so the host can tell message-capable
+//   firmware from older firmware (which echoes it unchanged).
+// The FRAME B echo reports in data[31]: bit0 a message is waiting or playing,
+// bit1 the replay key (keypad 5 with NumLock off) was pressed since the last
+// FRAME B -- the host answers that with a MESSAGE. Older firmware echoes 0.
+//
 // REBOOT (value_id 0x11, no payload): restart the macropad as a power-up
 // would, boot animation included -- for trying the startup without
 // replugging. It goes about 300 ms after the echo; a boot pick still playing
@@ -178,7 +196,7 @@ void enable_factory_mode(bool enable) {
 // EEPROM (u32 LE; lags by one until this boot's animation has finished).
 // data[20] is what the display shows: 0 = regular RGB effect, 1 = boot
 // rainbow, 2 = sysmon bars, 3 = disconnect warning. data[21] is 1 while an
-// animation plays.
+// animation plays, data[22] while a MESSAGE waits or plays.
 // It never counts as host data, so it doesn't end the pre-connect rainbow.
 //
 // VIA echoes the buffer back, which serves as the ACK.
@@ -189,6 +207,7 @@ void enable_factory_mode(bool enable) {
 #define SYSMON_FRAME_B 0x02 // rows 3,4,5 + globals
 #define SYSMON_FRAME_C 0x03 // ghost bars, rows 0..5
 #define SYSMON_GOODBYE 0x04 // host stopping on purpose: no disconnect warning
+#define SYSMON_MESSAGE 0x05 // a line of text scrolled over the bars
 #define SYSMON_BOOT_REPLAY 0x10 // replay the boot animation (preview/tuning)
 #define SYSMON_REBOOT 0x11 // restart the macropad (testing the startup)
 #define SYSMON_TRACE 0x12  // LED trace: freeze / read / restart
@@ -196,6 +215,9 @@ void enable_factory_mode(bool enable) {
 #define SYSMON_ROW_BYTES 8   // per-row descriptor size in the payload
 #define SYSMON_GHOST_BYTES 4 // per-row ghost descriptor size in FRAME C
 #define SYSMON_GHOST_ACK 0x01 // written into the FRAME C echo at data[27]
+#define SYSMON_MSG_ACK 0x01   // written into the MESSAGE echo at data[31]
+#define SYSMON_STATUS_MSG 0x01 // FRAME B echo data[31]: a message is waiting or playing
+#define SYSMON_STATUS_ASK 0x02 // ... and the replay key was pressed since the last one
 
 // flags field bit layout
 #define SYSMON_FLAG_GRADIENT (1 << 0)      // bit0: solid hue0 vs hue0->hue1
@@ -257,7 +279,17 @@ static bool           sysmon_quiet          = false; // suspended since the last
 #define DISP_BOOT 1   // boot animation / static rainbow
 #define DISP_SYSMON 2 // the bars
 #define DISP_WARN 3   // the disconnect warning
+#define DISP_MSG 4    // a message's end; only ever where a fade into the bars starts
 static uint8_t sysmon_disp = DISP_EFFECT;
+
+// MESSAGE: the text and how it looks; it is drawn with the bars, further down.
+static char     msg_text[24];
+static uint8_t  msg_hue, msg_sat, msg_cps;
+static bool     msg_waiting = false; // received; plays once the bars have settled
+static bool     msg_playing = false;
+static uint32_t msg_t0;
+static bool     sysmon_ask = false; // the replay key was pressed, not yet reported
+static void     sysmon_message(const uint8_t *p);
 
 #define SYSMON_WARN_STYLES 5
 static uint8_t warn_prev_first = 0, warn_prev_last = 0; // warning-style preview; 0 = none
@@ -306,6 +338,13 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
             sysmon_last_update   = timer_read32();
             sysmon_goodbye       = false;
             sysmon_quiet         = false;
+            // Status for the host, in the echo (data[31]); a key press is
+            // reported once.
+            payload[28] = (uint8_t)((msg_waiting || msg_playing ? SYSMON_STATUS_MSG : 0) | (sysmon_ask ? SYSMON_STATUS_ASK : 0));
+            sysmon_ask  = false;
+        } else if (*command_id == id_custom_set_value && *value_id == SYSMON_MESSAGE) {
+            sysmon_message(payload);
+            payload[28] = SYSMON_MSG_ACK; // data[31], past the longest text
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_FRAME_C) {
             for (uint8_t row = 0; row < 6; row++) {
                 const uint8_t *src = payload + row * SYSMON_GHOST_BYTES;
@@ -1689,11 +1728,12 @@ static uint8_t     boot_text_cols[BOOT_TEXT_MAXCOLS]; // bits 0-5 = pad rows 0-5
 static uint8_t     boot_text_hue[BOOT_TEXT_MAXCOLS];  // per-letter color of each column
 static uint8_t     boot_text_ncols;
 static const char *boot_text_built = NULL;
+static bool        boot_text_block; // whether the built text has the block
 
-// Lay the text out as columns: each glyph, a blank column, and at the end a
-// 4-column block of the rainbow itself that scrolls in and docks.
-static void boot_text_build(const char *txt) {
-    if (boot_text_built == txt) return;
+// Lay the text out as columns: each glyph, a blank column, and (block) at the
+// end a 4-column block of the rainbow itself that scrolls in and docks.
+static void boot_text_build(const char *txt, bool block) {
+    if (boot_text_built == txt && boot_text_block == block) return;
     uint8_t letters = boot_text_letters(txt), k = 0, n = 0;
     for (const char *p = txt; *p && n < BOOT_TEXT_MAXCOLS - 10; p++) {
         const boot_glyph_t *g   = boot_glyph(*p, false);
@@ -1710,9 +1750,12 @@ static void boot_text_build(const char *txt) {
         boot_text_hue[n]    = hue;
         boot_text_cols[n++] = 0;
     }
-    for (uint8_t q = 0; q < 4; q++) boot_text_cols[n++] = BOOT_TEXT_BLOCK;
+    if (block) {
+        for (uint8_t q = 0; q < 4; q++) boot_text_cols[n++] = BOOT_TEXT_BLOCK;
+    }
     boot_text_ncols = n;
     boot_text_built = txt;
+    boot_text_block = block;
 }
 
 static uint8_t boot_text_px(int32_t col, uint8_t r) {
@@ -1725,7 +1768,7 @@ static uint8_t boot_text_px(int32_t col, uint8_t r) {
 // Full-speed and slowing-down times of a ticker, ms (it decelerates over the
 // last two columns as the rainbow block docks).
 static void boot_text_scroll_times(const char *txt, uint16_t cps, int32_t *t1, int32_t *td) {
-    boot_text_build(txt);
+    boot_text_build(txt, true);
     int32_t D = (int32_t)boot_text_ncols * 256, L = 2 * 256, v = (int32_t)MAX(cps, 1) * 256;
     *t1       = (D - L) * 1000 / v;
     *td       = 2 * L * 1000 / v;
@@ -2118,13 +2161,14 @@ static void boot_put32(uint8_t *out, uint32_t v) {
     for (uint8_t b = 0; b < 4; b++) out[b] = (uint8_t)(v >> (8 * b));
 }
 
-// Status for the BOOT REPLAY echo (9 bytes; layout in the protocol notes).
+// Status for the BOOT REPLAY echo (12 bytes; layout in the protocol notes).
 static void boot_status(uint8_t *out) {
     boot_put32(out, boot_counter);
     out[4] = boot_powerup_pick;
     boot_put32(out + 5, eeconfig_read_user());
     out[9]  = sysmon_disp;
     out[10] = boot_playing;
+    out[11] = msg_waiting || msg_playing;
 }
 
 // Variant n's name tag. Up to 9: n white dots in reading order from the
@@ -2198,10 +2242,20 @@ static bool boot_render(void) {
 }
 
 // Any RGB key means the user wants the regular effect: drop the rainbow.
+//
+// With NumLock off, keypad 5 (which does nothing then) is the replay key: it
+// asks the host, through the next FRAME B echo, to say again which limits hold
+// the CPU and dGPU back. It is caught by keycode rather than put in the
+// keymap: VIA keeps the keymap in EEPROM, where a new default would never
+// reach a pad that already has one.
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     if (record->event.pressed && (IS_RGB_KEYCODE(keycode) || keycode == BL_STEP)) {
         boot_dismissed = true;
         boot_playing   = false;
+    }
+    if (keycode == KC_P5 && !host_keyboard_led_state().num_lock) {
+        if (record->event.pressed && sysmon_disp == DISP_SYSMON) sysmon_ask = true;
+        return false;
     }
     return true;
 }
@@ -2418,7 +2472,9 @@ static void sysmon_xf_frame(uint8_t gb) {
     uint8_t gf = sysmon_xf_from_gcc();
     if (!sysmon_xf_ready) {
         for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
-            RGB a = sysmon_xf_from == DISP_BOOT ? boot_own[i] : sysmon_warn_rgb(sysmon_warn_shown, i, sysmon_warn_el);
+            RGB a = {.r = 0, .g = 0, .b = 0}; // a message ends on dark
+            if (sysmon_xf_from == DISP_BOOT) a = boot_own[i];
+            if (sysmon_xf_from == DISP_WARN) a = sysmon_warn_rgb(sysmon_warn_shown, i, sysmon_warn_el);
             sysmon_xf_to(a, gf, sysmon_xf_s[i]);
         }
         sysmon_xf_ready = true;
@@ -2476,6 +2532,67 @@ static void sysmon_flush(uint8_t gcc_bars) {
     }
 }
 
+// --- messages ----------------------------------------------------------------
+
+// A MESSAGE (layout in the protocol notes): the bars dim out over
+// SYSMON_MSG_DIM_MS, the text scrolls through on dark at a steady pace in the
+// boot text's font, and once its last column has gone the bars fade back in
+// the way they fade in after the boot rainbow, from dark. The bars keep
+// running underneath, so they come back as they are by then.
+#define SYSMON_MSG_DIM_MS 300
+#define SYSMON_MSG_CPS 8 // columns per second: about 8 s for "CPU STAPM 28W"
+
+static void sysmon_message(const uint8_t *p) {
+    if (!p[5]) return; // no text: a capability probe
+    uint8_t q = 0;
+    for (; q < sizeof(msg_text) - 1 && p[5 + q]; q++) msg_text[q] = (char)p[5 + q];
+    msg_text[q]     = 0;
+    msg_hue         = p[1];
+    msg_sat         = p[2];
+    msg_cps         = p[3] ? MIN(MAX(p[3], 2), 40) : SYSMON_MSG_CPS;
+    boot_text_built = NULL; // same buffer, new contents
+    if (msg_playing) {
+        msg_t0 = timer_read32() - SYSMON_MSG_DIM_MS; // already dark: straight to the text
+    } else {
+        msg_waiting = true;
+    }
+}
+
+// Draw the message into sysmon_fb, over the bars rendered there. False once
+// it has finished. A pure function of the time since it started.
+static bool sysmon_msg_render(void) {
+    uint32_t t = timer_elapsed32(msg_t0);
+    if (t < SYSMON_MSG_DIM_MS) {
+        // even steps in lightness (cube-root space), down to exactly 0
+        float e = 1 - sysmon_smooth((float)t / SYSMON_MSG_DIM_MS), k = e * e * e;
+        for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
+            RGB c        = sysmon_fb[i];
+            sysmon_fb[i] = (RGB){.r = (uint8_t)(c.r * k), .g = (uint8_t)(c.g * k), .b = (uint8_t)(c.b * k)};
+        }
+        return true;
+    }
+    t -= SYSMON_MSG_DIM_MS;
+    boot_text_build(msg_text, false);
+    // Column 0 enters at the right edge; done when the last one has left.
+    uint32_t len = ((uint32_t)boot_text_ncols + 4) * 1000 / msg_cps;
+    if (t >= len) return false;
+    int32_t p    = (int32_t)(t * msg_cps * 256 / 1000) - 4 * 256;
+    int32_t base = p >> 8; // arithmetic shift: floors
+    uint8_t fr   = (uint8_t)(p & 0xFF);
+    RGB     ink  = hsv_to_rgb((HSV){msg_hue, msg_sat, 255});
+    for (uint8_t r = 0; r < 6; r++) {
+        for (uint8_t c = 0; c < 4; c++) {
+            // between two columns, a blend of both; lifted like a partial bar
+            // segment so a key the text is gliding across stays visible at a
+            // very low current
+            uint8_t v = boot_lerp(boot_text_px(base + c, r), boot_text_px(base + c + 1, r), fr);
+            if (v) v = (uint8_t)sysmon_visible_pwm(v);
+            sysmon_fb[BOOT_KEY(r, c)] = boot_rgb_scale(ink, v);
+        }
+    }
+    return true;
+}
+
 // --- LED trace ---------------------------------------------------------------
 
 // A flight recorder, always running: every frame as it goes to the LED chip --
@@ -2490,7 +2607,7 @@ typedef struct {
     uint8_t  gcc;         // the global current the frame went out at
     uint8_t  info;        // bits 0-1 display (DISP_*); bits 2-3 GCC change
                           // (1 rising: PWM sent first, 2 falling: GCC first);
-                          // bit 4 cross-fading
+                          // bit 4 cross-fading; bit 5 a message is showing
     uint8_t  px[6][4][3]; // PWM, pad rows top to bottom, columns left to right, R G B
 } sysmon_trace_frame_t;
 _Static_assert(sizeof(sysmon_trace_frame_t) == 76, "trace frame layout");
@@ -2509,7 +2626,7 @@ static void sysmon_trace_frame(void) {
     sysmon_trace_frame_t *f = &sysmon_trace[sysmon_trace_head];
     f->t                    = (uint16_t)timer_read32();
     f->gcc                  = sysmon_gcc;
-    f->info                 = (uint8_t)((sysmon_disp & 3) | (change << 2) | (sysmon_xfading() ? 0x10 : 0));
+    f->info                 = (uint8_t)((sysmon_disp & 3) | (change << 2) | (sysmon_xfading() ? 0x10 : 0) | (msg_playing ? 0x20 : 0));
     for (uint8_t r = 0; r < 6; r++) {
         for (uint8_t c = 0; c < 4; c++) {
             is31_led led;
@@ -2555,7 +2672,8 @@ static void sysmon_trace_cmd(uint8_t *p) {
 // Display priority, highest first:
 //   1. a playing boot animation (it is short; finish it even if the host
 //      connects meanwhile, and a replay preview must show over live data)
-//   2. fresh host data: the sysmon bars (cross-fading in from 1, 3 or 4)
+//   2. fresh host data: the sysmon bars (cross-fading in from 1, 3 or 4), or
+//      a message over them
 //   3. the host has never connected: the static boot rainbow
 //   4. the host went silent without a goodbye: the disconnect warning, for
 //      SYSMON_WARN_MS after the no-data timeout
@@ -2577,6 +2695,7 @@ static bool sysmon_indicators(void) {
     if (boot_render()) {
         sysmon_set_gcc(BOOT_BRIGHTNESS);
         sysmon_disp = DISP_BOOT;
+        msg_waiting = msg_playing = false; // (only a replay preview gets here with the host live)
         return false;
     }
     if (warn_preview_render()) {
@@ -2594,6 +2713,8 @@ static bool sysmon_indicators(void) {
     uint32_t timeout_ms = (uint32_t)sysmon_timeout_units * 100;
     uint32_t since      = sysmon_last_update ? timer_elapsed32(sysmon_last_update) : 0;
     if (sysmon_last_update == 0 || since > timeout_ms || sysmon_goodbye) {
+        msg_waiting = msg_playing = false; // a message is for the bars only
+        sysmon_ask  = false;
         if (sysmon_last_update == 0 && !boot_dismissed) {
             sysmon_set_gcc(BOOT_BRIGHTNESS);
             boot_render_static();
@@ -2636,6 +2757,20 @@ static bool sysmon_indicators(void) {
         sysmon_render_row(row, &glides[row], &ghost_glides[row], glide_ms, timeout_ms);
     }
     sysmon_glide_snap = false;
+
+    // A message waits for the fade into the bars to finish, then draws over
+    // them; at its end the bars fade back in from the dark it ends on.
+    if (msg_waiting && !sysmon_xfading()) {
+        msg_waiting = false;
+        msg_playing = true;
+        msg_t0      = timer_read32();
+    }
+    if (msg_playing && !sysmon_msg_render()) {
+        msg_playing     = false;
+        sysmon_xf_from  = DISP_MSG;
+        sysmon_xf_t0    = timer_read32();
+        sysmon_xf_ready = false;
+    }
     sysmon_flush(gcc_bars); // and picks the frame's current
 
     return false;
