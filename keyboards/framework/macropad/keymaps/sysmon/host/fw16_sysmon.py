@@ -189,9 +189,10 @@ GHOST_DESC_LEN = 4
 GHOST_FLAGS_ACK_OFFSET = 28  # FRAME C echo byte the firmware marks when it reads the ghost flags
 GHOST_FLAGS_ACK = 0x01
 GHOST_FLAG_RIGHT = 0x01      # ghost flags bit0: anchored at the row's right end
-GHOST_LEVEL_ONE_KEY = 63     # a ghost covering exactly one segment (64 would
-                             # spill 1/255 onto the next key, which the
-                             # firmware's visibility lift can make glow)
+GHOST_LEVEL_KEYS = (0, 63, 127, 191, 255)  # a ghost covering exactly 0..4
+                             # segments: n*255//4, as one more (64 for one key)
+                             # would spill 1/255 onto the next key, which the
+                             # firmware's visibility lift can make glow
 MSG_ACK_OFFSET = 31     # MESSAGE echo byte the firmware marks when it can show one
 MSG_ACK = 0x01
 MSG_SEQ_ACK = 0x02      # the probe's echo at MSG_SEQ_PROBE_OFFSET: FRAME B
@@ -269,8 +270,8 @@ HUE_TEMP_LO = 85    # temperature gradient start (green, cool)
 HUE_TEMP_HI = 0     # temperature gradient end (red, hot)
 HUE_CHARGE_FULL = 85  # charging hue at 100% (pct*85/100, red->green)
 HUE_NPU = 128       # NPU ghost bar on the iGPU row (cyan)
-HUE_DGPU_OFF = 140  # dGPU powered off (D3cold): the dGPU row's last key (light
-                    # blue/teal; kept off HUE_NPU, the row right above)
+HUE_DGPU_OFF = 140  # dGPU powered off (D3cold): the dGPU row's keys from the
+                    # right (light blue/teal; kept off HUE_NPU, the row above)
 
 # Brightness levels (base row_val)
 ROW_VAL_FULL = 255
@@ -300,6 +301,10 @@ TEMP_CRITICAL_C = 90
 # Temperature bar scaling: clamp(t,30,90) -> 0..255 level.
 TEMP_MIN_C = 30
 TEMP_MAX_C = 90
+
+# The D3cold marker grows: the last key lights as the dGPU powers off, and one
+# more for each further DGPU_OFF_STEP_S it stays off without a break, up to 4.
+DGPU_OFF_STEP_S = 900.0
 
 # Breathe overlay floor for power-limited rows (~43% of 255: dim but readable).
 LIMIT_FLOOR = 110
@@ -919,6 +924,60 @@ class DgpuPower:
         if self._cfg.CM_Get_Parent(self._ctypes.byref(parent), inst, 0):
             return "D3hot"
         return "D3cold" if self._d_state(parent.value) == 3 else "D3hot"
+
+
+class DgpuSleepWatch:
+    """How long the dGPU has stayed powered off (D3cold) without a break.
+
+    A thread of its own looks at DgpuPower every POLL_S, apart from the main
+    loop: a background wake lasts a second or two, and a main-loop tick can
+    stall about that long (WMI, framework_tool) or stop for seconds while the
+    pad is away. A look that isn't D3cold ends the streak, and so does a gap
+    between two looks longer than GAP_S (the machine slept, the process was
+    frozen): the GPU could have woken unseen. The next D3cold look starts over.
+    """
+
+    POLL_S = 0.25
+    GAP_S = 3.0
+
+    def __init__(self, power):
+        self.power = power
+        # (state, since, seen): the last look's state, when the streak it
+        # belongs to started (None = not in D3cold) and when that look was
+        # taken, all monotonic. One tuple, so a reader never sees half a look.
+        self._look = (None, None, None)
+        self._failed = False
+
+    def observe(self, now):
+        try:
+            state = self.power.state()
+        except Exception as err:  # keep looking; a dead thread would freeze the marker
+            if not self._failed:
+                self._failed = True
+                log(f"dGPU power state could not be read: {err!r}")
+            state = None
+        _, since, seen = self._look
+        if state != "D3cold" or seen is None or now - seen > self.GAP_S:
+            since = None
+        if state == "D3cold" and since is None:
+            since = now
+        self._look = (state, since, now)
+
+    def start(self, stop_event):
+        def loop():
+            while True:
+                self.observe(time.monotonic())
+                if stop_event.wait(self.POLL_S):
+                    return
+        threading.Thread(target=loop, name="dgpu-sleep-watch", daemon=True).start()
+
+    def snapshot(self):
+        """(state, seconds in D3cold so far or None): 'D0'..'D3cold' or None.
+
+        The time runs to the last look, not to now, so a stale look (the
+        watcher not yet past a gap) can't count time nobody saw."""
+        state, since, seen = self._look
+        return state, (None if since is None else seen - since)
 
 
 class Reason:
@@ -2660,14 +2719,24 @@ def build_igpu_row(m):
     return desc
 
 
+def dgpu_off_keys(off_s):
+    """Keys of the D3cold marker for a streak off_s seconds long (None = none):
+    1 at once, one more at the start of each DGPU_OFF_STEP_S, at most 4."""
+    if off_s is None:
+        return 0
+    return min(4, 1 + int(off_s // DGPU_OFF_STEP_S))
+
+
 def build_dgpu_row(m):
     """row4: dGPU usage, solid green; breathe when a dGPU limit binds.
 
-    While the dGPU is powered off (D3cold) the row's last key glows dim
-    HUE_DGPU_OFF: a right-anchored one-key ghost, so it glides in and out and
-    stays clear of the bar. Not tied to dgpu_present: finding the device in
-    D3cold is proof enough that there is one. It needs firmware that reads the
-    ghost flags (m["ghost_flags"]); without them it would show at the left end.
+    While the dGPU is powered off (D3cold) the row glows dim HUE_DGPU_OFF from
+    its last key: a right-anchored ghost, so it glides in and out and stays
+    clear of the bar. One key at once, then one more per DGPU_OFF_STEP_S the
+    GPU stays off without a break (dgpu_off_keys). Not tied to dgpu_present:
+    finding the device in D3cold is proof enough that there is one. It needs
+    firmware that reads the ghost flags (m["ghost_flags"]); without them it
+    would show at the left end.
     """
     if m["dgpu_present"]:
         desc = limit_breathe(RowDesc(level=pct_to_level(m["dgpu"]), hue0=HUE_GREEN),
@@ -2675,7 +2744,7 @@ def build_dgpu_row(m):
     else:
         desc = RowDesc(level=0)
     if m.get("ghost_flags"):
-        desc.ghost_level = GHOST_LEVEL_ONE_KEY if m["dgpu_power"] == "D3cold" else 0
+        desc.ghost_level = GHOST_LEVEL_KEYS[dgpu_off_keys(m["dgpu_off_s"])]
         desc.ghost_hue = HUE_DGPU_OFF
         desc.ghost_val = ROW_VAL_DGPU_OFF
         desc.ghost_right = True
@@ -2802,9 +2871,6 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
     if nv_util is not None:
         dgpu, dgpu_present = nv_util, True
 
-    # Whether the dGPU is powered off, from PnP (never wakes it; see DgpuPower).
-    dgpu_power = cache["dgpu_power"]()
-
     # One LHM snapshot feeds both temperature and CPU power this tick.
     lhm_temp, cpu_pkg_w, cpu_load = cache["lhm"]()
 
@@ -2904,7 +2970,6 @@ def gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache):
         "dgpu": clamp(dgpu, 0, 100),
         "dgpu_present": dgpu_present,
         "dgpu_src": "nvml" if nv_util is not None else "pdh",
-        "dgpu_power": dgpu_power,  # 'D0'..'D3cold', None = unknown
         "dgpu_binding": dgpu_binding,
         "dgpu_limit": None,
 
@@ -3195,7 +3260,8 @@ def run(args, stop_event=None, resume_check=None):
     ec = EcThermal()
     charge_limit = EcChargeLimit()
     gpu = GpuMonitor(args.igpu_match, args.dgpu_match)
-    dpower = DgpuPower(args.dgpu_match, announce=True)
+    dwatch = DgpuSleepWatch(DgpuPower(args.dgpu_match, announce=True))
+    dwatch.start(stop_event)
     apu = ApuLimits(cap_watts=args.cpu_power_cap)
     clock = CpuClock()
     nv = NvGpuLimits(enabled=not args.no_nvml)
@@ -3213,8 +3279,6 @@ def run(args, stop_event=None, resume_check=None):
         "ec_temp": Cached(ec.temperature, TTL_EC_THERMAL),
         # the last-resort ACPI zone: a WMI query, so not every tick
         "acpi_temp": Cached(sources.acpi_temperature, TTL_TEMP),
-        # every tick: two devnode property lookups, microseconds
-        "dgpu_power": Cached(dpower.state, 0.0),
         # every tick (it debounces by reads): one PDH collect, about a ms
         "clock": Cached(clock.read, 0.0),
     }
@@ -3268,6 +3332,9 @@ def run(args, stop_event=None, resume_check=None):
             m["cpu_limit"] = cpu_track.reason
             m["dgpu_limit"] = gpu_track.reason
             m["ghost_flags"] = ghost_flags
+            # whether the dGPU is powered off, and for how long without a
+            # break, from PnP (never wakes it; see DgpuPower, DgpuSleepWatch)
+            m["dgpu_power"], m["dgpu_off_s"] = dwatch.snapshot()
             rows = [ROW_BUILDERS[i](m) for i in range(6)]
             if not published_state:
                 # First complete tick: record what this process can actually
@@ -3309,7 +3376,8 @@ def run(args, stop_event=None, resume_check=None):
                 print(f"  limits ac={m['ac']} weak={m['weak_charger']} "
                       f"cpu {cpu_src} -> {m['cpu_limit']!r} "
                       f"dgpu[{m['dgpu_src']}] {dgpu_now} -> {m['dgpu_limit']!r} "
-                      f"power={m['dgpu_power']}")
+                      f"power={m['dgpu_power']}"
+                      + (f" for {m['dgpu_off_s']:.0f}s" if m["dgpu_off_s"] is not None else ""))
             for rep in build_frame(rows, m["brightness"]):
                 dev.write(b"\x00" + rep)
             # drain the VIA echoes so the report buffer doesn't fill up; they

@@ -11,7 +11,7 @@
 //   row 1: CPU usage
 //   row 2: memory usage
 //   row 3: iGPU usage (NPU usage as a dim ghost bar behind it)
-//   row 4: dGPU usage (its last key dimly lit while the dGPU is powered off)
+//   row 4: dGPU usage (dimly lit from its last key while the dGPU is powered off)
 //   row 5: system temperature
 //
 // Overall brightness is dictated by the host (it follows the laptop's

@@ -10,7 +10,7 @@ normally — the stats ride on a private custom-value channel, `0x42`):
 | 2 | CPU usage | red bar; breathes when a limit holds the APU back, and the pad names it (see below) |
 | 3 | Memory usage | gold bar; whole row blinks at ~1 Hz when usage is critically high (≥90%) |
 | 4 | iGPU + NPU usage | red bar for the iGPU; NPU usage as a dim cyan *ghost* bar behind it, visible where the NPU is busier than the iGPU (see below) |
-| 5 | dGPU usage | green bar (dark if no dGPU); breathes when a limit holds the dGPU back, and the pad names it (see below); the last key glows dim light blue/teal while the dGPU is powered off (D3cold) |
+| 5 | dGPU usage | green bar (dark if no dGPU); breathes when a limit holds the dGPU back, and the pad names it (see below); while the dGPU is powered off (D3cold) dim light blue/teal keys grow from the right, one per 15 minutes it stays off |
 | 6 | System temperature | fixed green→deep-red gradient across the row; bar length scales 30–90 °C; whole row blinks at ~1 Hz above 90 °C |
 
 **Lights off.** With NumLock off, the top-left key is the macropad's RGB
@@ -173,9 +173,19 @@ and shows the plain iGPU bar.
 
 On a hybrid-graphics laptop the dGPU powers itself off when nothing uses it.
 While it is off, in **D3cold**, the dGPU row's last (right) key glows a dim,
-steady light blue/teal (`HUE_DGPU_OFF`, `ROW_VAL_DGPU_OFF`). When something
-wakes the GPU the key fades out, and it fades back in once the GPU is off
-again; the green usage bar is unchanged.
+steady light blue/teal (`HUE_DGPU_OFF`, `ROW_VAL_DGPU_OFF`). The longer the GPU
+stays off without a break, the further the dim bar grows to the left: each key
+stands for a 15-minute stretch that has begun (`DGPU_OFF_STEP_S`). The last key
+lights as the GPU powers off, the next after 15 minutes, the third after 30 and
+the fourth after 45; it stays at four keys after that. When something wakes the
+GPU, even for a second, the bar fades out, and the count starts again from one
+key once the GPU is off again. The green usage bar is unchanged.
+
+A wake is only seen if the host is looking: it checks the power state four
+times a second, on a thread of its own, so a busy tick or a disconnected pad
+can't hide one. Time nobody watched can't count: a gap of more than a few
+seconds between two checks (the laptop slept) starts the count over, and so
+does the host starting.
 
 The state comes from Plug and Play: each device's most recent power state
 (what Device Manager shows as *Power data*), a property lookup that involves
@@ -188,7 +198,8 @@ idle. Background activity wakes the GPU now and then for a second or two; the
 key goes out for those wakes too.
 
 `--verbose` shows the state at the end of the `limits` line (`power=D0`,
-`D3hot`, `D3cold`), and `--selftest` reports it. The marker needs the
+`D3hot`, or `D3cold for 1234s`, the time off so far), and `--selftest`
+reports it. The marker needs the
 firmware from this version (it is a right-anchored ghost bar, protocol FRAME C
 below); with older firmware the host sends no marker at all, rather than one
 at the wrong end of the row.
@@ -585,7 +596,8 @@ Running from source, the same file is written next to the script; create it with
 either works during development. What is available:
 
 - **thresholds**: `BATT_CRITICAL_PCT`, `MEM_CRITICAL_PCT`, `TEMP_CRITICAL_C`,
-  `TEMP_MIN_C` / `TEMP_MAX_C`, `ASSIST_MIN_W`, `DRIFT_MIN_W`
+  `TEMP_MIN_C` / `TEMP_MAX_C`, `ASSIST_MIN_W`, `DRIFT_MIN_W`,
+  `DGPU_OFF_STEP_S` (how long each key of the dGPU sleep marker stands for)
 - **limits**: `LIMIT_KINDS` (which kinds — `power`/`current`/`thermal`/`clock`/
   `charger` — breathe), `APU_LIMIT_NEAR` (how close to a limit counts as
   binding), `APU_LIMIT_SIGNALS` (which SMU power limits — `stapm`/`slow`/`fast` —
