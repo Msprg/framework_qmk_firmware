@@ -750,8 +750,8 @@ static void sysmon_render_row(uint8_t row, sysmon_glide_t *g, sysmon_glide_t *gg
 // the bottom-right one (BOOT_HUE_END), introduced by a short animation picked
 // from boot_anims[]. Once the host has connected the rainbow is done for this
 // power cycle: a later host dropout falls back to the regular RGB effect, as
-// before. Pressing any RGB key also dismisses it, so the regular effect stays
-// reachable without a host.
+// before. Pressing any key also dismisses it (and cuts its animation short),
+// so without a host the pad goes to the regular effect at the first touch.
 //
 // Like the sysmon bars, it dims through the global current with PWM at full
 // scale, so the animations keep all 256 PWM levels at a low brightness.
@@ -810,7 +810,7 @@ static uint8_t  boot_rank[BOOT_N];   // the keys in a shuffled order, 0..255
 
 static bool     boot_armed     = true;  // start playing on the first frame
 static bool     boot_playing   = false;
-static bool     boot_dismissed = false; // an RGB key was pressed
+static bool     boot_dismissed = false; // a key was pressed
 static uint32_t boot_t0;
 static uint8_t  boot_first;    // first variant of the playlist (0-based)
 static uint8_t  boot_span;     // variants in the playlist
@@ -2241,7 +2241,8 @@ static bool boot_render(void) {
     return false;
 }
 
-// Any RGB key means the user wants the regular effect: drop the rainbow.
+// Any key press drops the boot rainbow for the regular effect: the rainbow
+// waits for the host, and a pad used without one should answer its keys.
 //
 // With NumLock off, keypad 5 (which does nothing then) is the replay key: it
 // asks the host, through the next FRAME B echo, to say again which limits hold
@@ -2249,7 +2250,7 @@ static bool boot_render(void) {
 // keymap: VIA keeps the keymap in EEPROM, where a new default would never
 // reach a pad that already has one.
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
-    if (record->event.pressed && (IS_RGB_KEYCODE(keycode) || keycode == BL_STEP)) {
+    if (record->event.pressed) {
         boot_dismissed = true;
         boot_playing   = false;
     }
