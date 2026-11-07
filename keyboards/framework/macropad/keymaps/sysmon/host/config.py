@@ -103,6 +103,11 @@ SCHEMA = [
             comment="NPU ghost bar on the iGPU row (128 = cyan). Pick a hue\n"
                     "well away from HUE_RED: a segment the two bars share mixes\n"
                     "both colors."),
+    Setting("HUE_DGPU_OFF", "colours", INT, lo=0, hi=255,
+            comment="The dGPU row's last key while the dGPU is powered off\n"
+                    "(D3cold): 140 = light blue/teal, kept off HUE_NPU (the row\n"
+                    "above). Always fully saturated (the marker is a ghost bar,\n"
+                    "which has no saturation of its own)."),
 
     Setting("ROW_VAL_FULL", "levels", INT, lo=1, hi=255,
             comment="Base brightness of a normal row, before the global\n"
@@ -115,6 +120,11 @@ SCHEMA = [
                     "dim so the bright iGPU bar reads first; the ghost only\n"
                     "shows where the NPU is busier than the iGPU. Needs the\n"
                     "ghost-bar firmware (FRAME C); older firmware ignores it."),
+    Setting("ROW_VAL_DGPU_OFF", "levels", INT, lo=1, hi=255,
+            comment="Brightness of the dGPU row's last key while the dGPU is\n"
+                    "powered off (D3cold): steady and dim, like the idle battery\n"
+                    "row. Needs firmware that reads the ghost flags; older\n"
+                    "firmware shows no marker."),
     Setting("BATT_DRIFT_FLOOR", "levels", INT, lo=0, hi=255,
             comment="Trough of the faint cap-drift breathe; the peak is\n"
                     "ROW_VAL_BATT_IDLE. Keep the gap small -- this is meant to\n"

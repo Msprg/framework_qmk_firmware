@@ -313,9 +313,19 @@ def _probe_ghost_support(dev, eng):
     messages = _probe_ack(dev, eng, eng.SYSMON_VALUE_MESSAGE,
                           eng.MSG_ACK_OFFSET, eng.MSG_ACK)
     if ghosts and messages:
-        return Result("firmware", "sysmon firmware", OK,
-                      "device acknowledged channel 0x42; draws ghost bars and "
-                      "limit messages")
+        if _probe_ack(dev, eng, eng.SYSMON_VALUE_FRAME_C,
+                      eng.GHOST_FLAGS_ACK_OFFSET, eng.GHOST_FLAGS_ACK):
+            return Result("firmware", "sysmon firmware", OK,
+                          "device acknowledged channel 0x42; draws ghost bars, "
+                          "limit messages and the dGPU sleep marker")
+        detail = ("device acknowledged channel 0x42; draws ghost bars and limit "
+                  "messages, but predates the dGPU sleep marker")
+        if _dgpu_power() is None:
+            return Result("firmware", "sysmon firmware", OK,
+                          detail + " (only needed with a dGPU; none found here)")
+        return Result("firmware", "sysmon firmware", DEGRADED, detail,
+                      "The dGPU row can't show when the dGPU is powered off. "
+                      "Flash the bundled firmware (--flash).")
     if not messages:
         return Result("firmware", "sysmon firmware", DEGRADED,
                       "device acknowledged channel 0x42; firmware predates "
@@ -425,6 +435,30 @@ def probe_ring0():
         "ring0", "Ring0 driver", OK,
         f"Memory Integrity off, vulnerable-driver blocklist "
         f"{'on' if blocklist else 'off'} (WinRing0 loads on this machine)")
+
+
+def _dgpu_power():
+    """The dGPU's power state as the engine reads it, or None (no dGPU found)."""
+    try:
+        eng = paths.engine_module()
+        return eng.DgpuPower(eng.build_parser().get_default("dgpu_match")).state()
+    except Exception:
+        return None
+
+
+def probe_dgpu_power():
+    """Is the dGPU powered off? (the dGPU row's last key shows D3cold)
+
+    Runs before probe_nvml: NVML initialisation wakes a powered-off dGPU.
+    """
+    state = _dgpu_power()
+    if state is None:
+        return Result("dgpu_power", "dGPU power state", NA,
+                      "no dGPU found among the display adapters")
+    what = {"D3cold": "powered off; the dGPU row's last key glows dim teal",
+            "D3hot": "idle in D3hot (the port powers off a few seconds later)",
+            "D0": "powered on"}.get(state, "in a low-power state")
+    return Result("dgpu_power", "dGPU power state", OK, f"{state}: {what}")
 
 
 def probe_nvml():
@@ -855,6 +889,7 @@ PROBES = [
     probe_firmware,
     probe_ring0,
     probe_ryzenadj,
+    probe_dgpu_power,
     probe_nvml,
     probe_lhm,
     probe_framework_tool,
