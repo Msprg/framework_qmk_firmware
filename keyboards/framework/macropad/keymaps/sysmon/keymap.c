@@ -1774,7 +1774,10 @@ static const boot_glyph_t boot_font[] = {
     {'-', 0, 3, {0, 0x0, 0x0, 0x7, 0x0, 0x0}},
     {'!', 0, 1, {0, 0x1, 0x1, 0x1, 0x0, 0x1}},
     {'.', 0, 1, {0, 0x0, 0x0, 0x0, 0x0, 0x1}},
-    {' ', 0, 2, {0, 0, 0, 0, 0, 0}},
+    // In a ticker a space is only the gaps either side of it: 4 dark columns
+    // between words, as many as the pad is wide. Any more and the dark pad
+    // looks like the end of the text.
+    {' ', 0, 0, {0, 0, 0, 0, 0, 0}},
 };
 
 // The glyph for c. narrow: the letter must fit four columns. Unknown
@@ -1830,7 +1833,11 @@ static RGB boot_text_rgb(uint8_t mode, uint8_t i, uint8_t letter_hue, uint8_t s,
 
 // --- ticker ---
 
-#define BOOT_TEXT_MAXCOLS 160
+// Dark columns after each letter. A key between two columns shows a blend of
+// both, so a gap of one is never dark on any key while the text moves; with
+// two, one key column is always fully dark between letters.
+#define BOOT_TEXT_GAP 2
+#define BOOT_TEXT_MAXCOLS (23 * (5 + BOOT_TEXT_GAP) + 4) // 23 of the widest letters, and the block
 #define BOOT_TEXT_BLOCK 0x80 // a column of the closing rainbow block (all rows)
 static uint8_t     boot_text_cols[BOOT_TEXT_MAXCOLS]; // bits 0-5 = pad rows 0-5
 static uint8_t     boot_text_hue[BOOT_TEXT_MAXCOLS];  // per-letter color of each column
@@ -1838,12 +1845,13 @@ static uint8_t     boot_text_ncols;
 static const char *boot_text_built = NULL;
 static bool        boot_text_block; // whether the built text has the block
 
-// Lay the text out as columns: each glyph, a blank column, and (block) at the
-// end a 4-column block of the rainbow itself that scrolls in and docks.
+// Lay the text out as columns: each glyph, BOOT_TEXT_GAP blank columns, and
+// (block) at the end a 4-column block of the rainbow itself that scrolls in
+// and docks.
 static void boot_text_build(const char *txt, bool block) {
     if (boot_text_built == txt && boot_text_block == block) return;
     uint8_t letters = boot_text_letters(txt), k = 0, n = 0;
-    for (const char *p = txt; *p && n < BOOT_TEXT_MAXCOLS - 10; p++) {
+    for (const char *p = txt; *p && n <= BOOT_TEXT_MAXCOLS - (5 + BOOT_TEXT_GAP) - 4; p++) {
         const boot_glyph_t *g   = boot_glyph(*p, false);
         uint8_t             hue = boot_letter_hue(k, letters);
         k += *p != ' ';
@@ -1855,8 +1863,10 @@ static void boot_text_build(const char *txt, bool block) {
             boot_text_hue[n]    = hue;
             boot_text_cols[n++] = m;
         }
-        boot_text_hue[n]    = hue;
-        boot_text_cols[n++] = 0;
+        for (uint8_t q = 0; q < BOOT_TEXT_GAP; q++) {
+            boot_text_hue[n]    = hue;
+            boot_text_cols[n++] = 0;
+        }
     }
     if (block) {
         for (uint8_t q = 0; q < 4; q++) boot_text_cols[n++] = BOOT_TEXT_BLOCK;
@@ -2046,13 +2056,13 @@ static void boot_anim_text_pop(uint16_t t) {
 }
 
 // 18 FW16 ticker
-#define BOOT_TEXT_FW16_MS 3050
+#define BOOT_TEXT_FW16_MS 3500
 static void boot_anim_text_fw16(uint16_t t) {
     boot_text_scroll(t, "FW16", 9, BOOT_TXT_RAINBOW);
 }
 
 // 19 FRAMEWORK ticker, at an easy reading pace
-#define BOOT_TEXT_FWK_MS 7750
+#define BOOT_TEXT_FWK_MS 9050
 static void boot_anim_text_framework(uint16_t t) {
     boot_text_scroll(t, "FRAMEWORK", 7, BOOT_TXT_RAINBOW);
 }
@@ -2070,7 +2080,7 @@ static void boot_anim_text_framework_letters(uint16_t t) {
 
 // 22 FRAMEWORK16 ticker, each letter its own color (no space: the step from
 // letters to digits is clear enough, and a gap there looked like the end)
-#define BOOT_TEXT_FWK16_MS 9050
+#define BOOT_TEXT_FWK16_MS 10600
 static void boot_anim_text_framework16(uint16_t t) {
     boot_text_scroll(t, "FRAMEWORK16", 7, BOOT_TXT_LETTERS);
 }
@@ -2739,7 +2749,7 @@ static void sysmon_flush(uint8_t gcc_bars) {
 // the way they fade in after the boot rainbow, from dark. The bars keep
 // running underneath, so they come back as they are by then.
 #define SYSMON_MSG_DIM_MS 300
-#define SYSMON_MSG_CPS 8 // columns per second: about 8 s for "CPU STAPM 28W"
+#define SYSMON_MSG_CPS 8 // columns per second: about 9.5 s for "CPU STAPM 28W"
 
 static void sysmon_message(const uint8_t *p) {
     if (!p[5]) return; // no text: a capability probe

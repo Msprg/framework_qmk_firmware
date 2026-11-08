@@ -261,7 +261,7 @@ SCHEMA = [
             comment="A limit is named once per episode; an episode ends when the\n"
                     "component has been free of limits this many seconds."),
     Setting("MSG_SPEED", "messages", INT, lo=2, hi=40,
-            comment="Ticker speed, columns per second (a letter is about 5)."),
+            comment="Ticker speed, columns per second (a letter is about 6)."),
     Setting("MSG_SHOW_VALUE", "messages", INT, lo=0, hi=1,
             comment="1: end with the limit's value right now ('28W'; for a dGPU\n"
                     "thermal slowdown its temperature). 0: just the names."),

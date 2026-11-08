@@ -48,10 +48,10 @@ power-up pool (`boot_pool[]` in `keymap.c`), currently all 22:
 | 16 | Glitch | the picture boots like a corrupted video signal until it holds clean |
 | 17 | FW16 pop | F, W, 1, 6 pop up one at a time as big letters in the rainbow colours; the rest sparkles in around the 6, darkest patches first, so the pad fills in evenly |
 | 18 | FW16 scroll | "FW16" scrolls through like an LED ticker, then the rainbow slides in behind it |
-| 19 | FRAMEWORK scroll | the same with "FRAMEWORK", at an easy reading pace (~7.5 s) |
+| 19 | FRAMEWORK scroll | the same with "FRAMEWORK", at an easy reading pace (~9 s) |
 | 20 | FRAMEWORK flash | white letters flash one at a time like a sign spelling itself out, then the rainbow sputters on like neon |
 | 21 | FRAMEWORK scroll, letter colours | each letter keeps its own colour as it moves, F red through K violet |
-| 22 | FRAMEWORK16 scroll, letter colours | the same with "FRAMEWORK16" (~9 s) |
+| 22 | FRAMEWORK16 scroll, letter colours | the same with "FRAMEWORK16" (~10.5 s) |
 
 Each power-up picks one from a shuffle bag: every cycle of power-ups (one per
 pooled animation) plays each pooled animation once, in a fresh order, never
@@ -263,7 +263,7 @@ GPU HOT 87C       thermal slowdown (the GPU's temperature)
 CPU POWER 54W     the package-power heuristic, without ryzenadj (package power)
 ```
 
-That takes about 8 s. It plays once per episode: again only when the limit
+That takes about 9.5 s. It plays once per episode: again only when the limit
 changes (STAPM → TDC, say; at most every 30 s), and a new episode starts once
 the component has been free of limits for 2 minutes. When several limits bind
 at once the closest to its limit is named, and it stays named while it holds.
