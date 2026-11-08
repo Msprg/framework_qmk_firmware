@@ -11,3 +11,6 @@ __pycache__/
 
 # LED traces written by bootanim_preview.py trace.
 traces/
+
+# The limit log a source run writes beside the script (limitlog.py).
+limitlog.sqlite*

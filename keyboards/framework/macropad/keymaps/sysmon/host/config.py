@@ -302,6 +302,40 @@ SCHEMA = [
                     "the slow breathe; named on its own only with charger in\n"
                     "MSG_KINDS)."),
 
+    Setting("LIMITLOG_ENABLE", "limitlog", INT, lo=0, hi=1,
+            comment="1: keep the limit log, limitlog.sqlite beside this file: every\n"
+                    "limit that binds (raw, on battery too), when, for how long,\n"
+                    "and what the machine was doing. Read it with the Start menu's\n"
+                    "'Limit report', or fw16-sysmon.exe --limit-report."),
+    Setting("LIMITLOG_ACTIVE_S", "limitlog", FLOAT, lo=0.4, hi=600,
+            comment="Seconds between samples while a limit binds or the CPU or\n"
+                    "dGPU is busy (and LIMITLOG_LINGER_S after)."),
+    Setting("LIMITLOG_IDLE_S", "limitlog", FLOAT, lo=1, hi=3600,
+            comment="...and otherwise. Each sample is roughly 1 KB."),
+    Setting("LIMITLOG_LINGER_S", "limitlog", FLOAT, lo=0, hi=3600,
+            comment="How long the busy cadence lasts after the last busy tick."),
+    Setting("LIMITLOG_CPU_ACTIVE_PCT", "limitlog", INT, lo=0, hi=100,
+            comment="Total CPU load (%) that counts as busy for the cadence."),
+    Setting("LIMITLOG_ONSET_S", "limitlog", FLOAT, lo=0, hi=600,
+            comment="A limit held this long becomes an episode. Its time counts in\n"
+                    "the tallies from the first read regardless."),
+    Setting("LIMITLOG_EC_S", "limitlog", FLOAT, lo=1, hi=3600,
+            comment="framework_tool --thermal (EC temperatures, fans, and the EC's\n"
+                    "own APU throttle flags) while busy. Each read spawns a process."),
+    Setting("LIMITLOG_EC_IDLE_S", "limitlog", FLOAT, lo=1, hi=3600,
+            comment="...and while idle."),
+    Setting("LIMITLOG_PROC_S", "limitlog", FLOAT, lo=1, hi=3600,
+            comment="Top CPU processes while busy (six times that while idle)."),
+    Setting("LIMITLOG_PMTABLE_S", "limitlog", FLOAT, lo=0, hi=86400,
+            comment="Keep the raw SMU power table this often (and at the start of\n"
+                    "every CPU limit episode), for decoding the fields libryzenadj\n"
+                    "doesn't name. 0: only at episode starts."),
+    Setting("LIMITLOG_RETENTION_DAYS", "limitlog", INT, lo=1, hi=3650,
+            comment="Samples and raw tables older than this are deleted. Episodes,\n"
+                    "events and the daily tallies are kept for good (they are small)."),
+    Setting("LIMITLOG_MAX_MB", "limitlog", INT, lo=16, hi=1048576,
+            comment="Past this size the oldest samples go first."),
+
     Setting("TTL_BRIGHTNESS", "polling", FLOAT, lo=0, hi=3600,
             comment="Screen-brightness cache lifetime, seconds. Keep this short:\n"
                     "a longer TTL makes the macropad visibly lag a brightness\n"
@@ -332,6 +366,8 @@ SECTION_HELP = {
     "battery": "Charge/discharge power -> how many bar segments animate.",
     "power_limits": "Limit detection: when the CPU and dGPU rows breathe.",
     "messages": "Limit messages: the pad names the limit a row breathes for.",
+    "limitlog": "Limit log: a long-term record of which limits bound, when, and\n"
+                "under what conditions, for tallying later (--limit-report).",
     "polling": "Per-source cache lifetimes. Most ticks reuse cached readings so\n"
                "the poll loop stays cheap; raise these to cut CPU use further,\n"
                "lower them for a more responsive display.",
@@ -345,7 +381,7 @@ _CLI_SKIP = {
     "fetch_lhm", "force", "bootloader", "config", "write_default_config",
     "selftest", "json", "flash", "service", "install_service",
     "uninstall_service", "start_service", "stop_service", "restart_service",
-    "help", "version",
+    "help", "version", "limit_report", "report_days", "export_csv", "limitlog_db",
 }
 
 

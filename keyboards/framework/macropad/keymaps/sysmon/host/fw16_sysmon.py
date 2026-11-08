@@ -39,6 +39,11 @@ APU limit detection (CPU-row breathe, and the message naming the limit):
        load while neither of the above sees a limit -- boost switched off
 The dGPU's come from NVML's throttle reasons. See LIMIT_KINDS, LimitTracker.
 
+Limit log (limitlog.py, LIMITLOG_*): the loop also hands every tick's readings
+to a recorder that keeps a long-term SQLite record of each limit that binds,
+raw and unfiltered, with the context it bound in -- pad or no pad. Tallied by
+--limit-report (limitreport.py).
+
 Temperature sources, tried in order (gather(); --selftest's temperature probe
 walks the same chain):
     1. LibreHardwareMonitor: the in-process LibreHardwareMonitorLib via
@@ -376,6 +381,26 @@ MSG_WORD_BRAKE = "BRAKE"    # dGPU hardware power brake
 MSG_WORD_THERMAL = "HOT"    # dGPU thermal slowdown
 MSG_WORD_CLOCK = "CLK LIMITED"  # CPU held at its base clock (boost off)
 MSG_WORD_CHARGER = "CHARGER"
+
+# Limit log (limitlog.py): a long-term record of every limit that binds, when,
+# and what the machine was doing then, in limitlog.sqlite in the data
+# directory. Read it with --limit-report (or limitreport.py on a copy).
+LIMITLOG_ENABLE = 1
+LIMITLOG_ACTIVE_S = 2.0      # sample interval while a limit binds or a component
+                             # is busy (and for LIMITLOG_LINGER_S after)
+LIMITLOG_IDLE_S = 30.0       # ...and otherwise
+LIMITLOG_LINGER_S = 30.0
+LIMITLOG_CPU_ACTIVE_PCT = 25  # total CPU load that counts as busy for sampling
+LIMITLOG_ONSET_S = 2.0       # a limit held this long becomes an episode (its
+                             # time counts in the tallies from the first read)
+LIMITLOG_EC_S = 5.0          # framework_tool --thermal (EC temperatures, fans,
+LIMITLOG_EC_IDLE_S = 30.0    # the EC's own APU throttle flags): busy / idle
+LIMITLOG_PROC_S = 10.0       # top CPU processes, while busy (6x that idle)
+LIMITLOG_PMTABLE_S = 600.0   # raw SMU table every this often (and at each CPU
+                             # episode's start); 0: only at episode starts
+LIMITLOG_RETENTION_DAYS = 90  # samples and raw tables older than this go;
+                              # episodes, events and tallies are kept for good
+LIMITLOG_MAX_MB = 1024        # ...and the oldest samples go past this size
 
 # Inference thresholds (the LHM package-power fallback used only when ryzenadj
 # is unavailable; all heuristic; tune as needed).
@@ -1033,6 +1058,7 @@ class NvGpuLimits:
     def __init__(self, enabled=True):
         self.available = False
         self.handle = None
+        self.last = None   # the last read's raw values, for the limit log
         self._streak = {}  # reason key -> consecutive reads it has been seen
         self._retryable = False
         self._init_failed = False
@@ -1110,6 +1136,7 @@ class NvGpuLimits:
         NV_DEBOUNCE_READS reads in a row before it counts, so one NVML blip
         can't start the breathe; LimitTracker holds it on the way out.
         """
+        self.last = None
         if not self.available:
             if self._retryable and time.monotonic() >= self._next_init:
                 self._try_init()
@@ -1126,6 +1153,9 @@ class NvGpuLimits:
                 default = enforced
         except Exception:
             return self._debounce({})
+        # raw, unfiltered: the limit log keeps every bit (limitlog.py)
+        self.last = {"reasons": int(reasons), "draw": draw,
+                     "enforced": enforced, "default": default}
 
         sw_cap = bool(reasons & self._sw_power)
         hw_brake = bool(reasons & self._hw_brake)
@@ -1226,6 +1256,9 @@ class ApuLimits:
 
 FRAMEWORK_TOOL_EXE = "framework_tool.exe"
 _framework_tool_path = None    # None = not resolved yet, False = not found
+# One framework_tool at a time: each opens the EC, and the limit log's thread
+# calls it too (limitlog.py).
+_framework_tool_lock = threading.Lock()
 
 
 def find_framework_tool(explicit=None):
@@ -1296,29 +1329,37 @@ def set_framework_tool(explicit=None):
     return path
 
 
-def run_framework_tool(*tool_args):
+def run_framework_tool(*tool_args, timeout=2, wait=1.0):
     """Run framework_tool and return its stdout, or None on transient failure.
 
     Raises FileNotFoundError if the tool is not installed, so callers can
-    disable themselves permanently.
+    disable themselves permanently. Calls are serialised (one EC client at a
+    time): a caller waits up to `wait` seconds for another's call to finish,
+    then gives up (None). The poll loop keeps the short default, so a slow
+    call on the limit log's thread can't stall the frames past the pad's
+    timeout.
     """
     global _framework_tool_path
     if _framework_tool_path is None:
         set_framework_tool()
     if not _framework_tool_path:
         raise FileNotFoundError(FRAMEWORK_TOOL_EXE)
+    if not _framework_tool_lock.acquire(timeout=wait):
+        return None
     try:
         # stdin must be DEVNULL: under CREATE_NO_WINDOW framework_tool
         # sees a fresh console and waits for ENTER before exiting
         return subprocess.run(
             [_framework_tool_path, *tool_args],
-            capture_output=True, text=True, timeout=2,
+            capture_output=True, text=True, timeout=timeout,
             stdin=subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NO_WINDOW).stdout
     except (subprocess.TimeoutExpired, OSError) as err:
         if isinstance(err, FileNotFoundError):
             raise
         return None
+    finally:
+        _framework_tool_lock.release()
 
 
 class EcThermal:
@@ -1804,11 +1845,41 @@ class RyzenAdjSource:
         "thm": ("get_tctl_temp_value", "get_tctl_temp"),
     }
 
+    # More of the table, for the limit log only (limitlog.py), as `ryzenadj
+    # -i` names them: the STAPM / slow PPT time constants, the APU-only slow
+    # PPT, the skin-temperature (STT) limits STAPM is built on, the boost
+    # setpoint, and power, clocks and temperatures. Each one optional: a getter
+    # this libryzenadj lacks, or a NaN (not decoded for this table version),
+    # is left out. Units as libryzenadj gives them.
+    EXTRAS = {
+        "stapm_time": "get_stapm_time", "slow_time": "get_slow_time",
+        "apu_slow_v": "get_apu_slow_value", "apu_slow_l": "get_apu_slow_limit",
+        "stt_apu_v": "get_apu_skin_temp_value",
+        "stt_apu_l": "get_apu_skin_temp_limit",
+        "stt_dgpu_v": "get_dgpu_skin_temp_value",
+        "stt_dgpu_l": "get_dgpu_skin_temp_limit",
+        "cclk_setpoint": "get_cclk_setpoint", "cclk_busy": "get_cclk_busy_value",
+        "socket_w": "get_socket_power", "soc_w": "get_soc_power",
+        "gfx_clk": "get_gfx_clk", "gfx_temp": "get_gfx_temp",
+        "fclk": "get_fclk", "mclk": "get_mem_clk", "l3_clk": "get_l3_clk",
+    }
+    CORE_EXTRAS = {"core_clk": "get_core_clk", "core_power": "get_core_power",
+                   "core_temp": "get_core_temp"}  # (ry, core index)
+    # Set by the limit log, class-wide so a source rebuilt after a resume
+    # keeps them: read EXTRAS into each snapshot's "_extra"; and once, copy the
+    # raw table into the next snapshot's "_table" as (version, bytes).
+    want_extras = False
+    want_table = False
+
     def __init__(self, enabled=True, dll_dir=None):
         self.available = False
         self._lib = None
         self._ry = None
         self._pairs = {}
+        self._extras = {}
+        self._core_fns = {}
+        self._table_fns = None
+        self._ncores = psutil.cpu_count(logical=False) or 0
         self._tctl_moved = False  # two different Tctl readings seen
         self._tctl_last = None
         self._tctl_repeats = 0
@@ -1852,6 +1923,7 @@ class RyzenAdjSource:
                     fn.restype = c_float
                     fn.argtypes = [c_void_p]
                 self._pairs[key] = fns
+            self._bind_extras(lib)
 
             ry = lib.init_ryzenadj()
             if not ry:
@@ -1878,6 +1950,64 @@ class RyzenAdjSource:
             print(f"libryzenadj init failed ({err}); authoritative APU "
                   f"STAPM/PPT limit detection disabled.", file=sys.stderr)
             self.close()
+
+    def _bind_extras(self, lib):
+        """Set up the optional EXTRAS / CORE_EXTRAS / raw-table getters."""
+        from ctypes import c_void_p, c_float, c_int, c_size_t, c_uint32, POINTER
+        for key, name in self.EXTRAS.items():
+            fn = getattr(lib, name, None)
+            if fn is not None:
+                fn.restype = c_float
+                fn.argtypes = [c_void_p]
+                self._extras[key] = fn
+        for key, name in self.CORE_EXTRAS.items():
+            fn = getattr(lib, name, None)
+            if fn is not None:
+                fn.restype = c_float
+                fn.argtypes = [c_void_p, c_int]
+                self._core_fns[key] = fn
+        values, size, ver = (getattr(lib, n, None) for n in
+                             ("get_table_values", "get_table_size", "get_table_ver"))
+        if values is not None and size is not None:
+            values.restype = POINTER(c_float)
+            values.argtypes = [c_void_p]
+            size.restype = c_size_t
+            size.argtypes = [c_void_p]
+            if ver is not None:
+                ver.restype = c_uint32
+                ver.argtypes = [c_void_p]
+            self._table_fns = (values, size, ver)
+
+    @staticmethod
+    def _num(v):
+        """A getter's float, or None for NaN / nonsense."""
+        return round(float(v), 3) if v == v and -1e7 < v < 1e7 else None
+
+    def _read_extras(self, ry):
+        """EXTRAS (+ per-core lists) from the table refresh_table just read.
+        Same thread, right after the refresh: the getters read the table
+        buffer, which the next refresh overwrites."""
+        ex = {}
+        for key, fn in self._extras.items():
+            v = self._num(fn(ry))
+            if v is not None:
+                ex[key] = v
+        for key, fn in self._core_fns.items():
+            vals = [self._num(fn(ry, i)) for i in range(self._ncores)]
+            if any(v is not None for v in vals):
+                ex[key] = vals
+        return ex
+
+    def _read_table(self, ry):
+        """(table version, raw bytes) of the PM table, copied out at once."""
+        import ctypes
+        values, size, ver = self._table_fns
+        n = int(size(ry))
+        ptr = values(ry)
+        if not ptr or not 0 < n <= 0x10000:
+            return None
+        data = ctypes.string_at(ctypes.cast(ptr, ctypes.c_void_p), n)
+        return (int(ver(ry)) if ver is not None else None), data
 
     @staticmethod
     def _ensure_driver(dll_dir):
@@ -1930,10 +2060,16 @@ class RyzenAdjSource:
         if not self.available:
             return None
         ry = self._ry
+        extra = table = None
         try:
             if self._lib.refresh_table(ry) != 0:
                 return None
             raw = {key: (fv(ry), fl(ry)) for key, (fv, fl) in self._pairs.items()}
+            if RyzenAdjSource.want_extras:
+                extra = self._read_extras(ry)
+            if RyzenAdjSource.want_table and self._table_fns:
+                RyzenAdjSource.want_table = False
+                table = self._read_table(ry)
         except Exception:
             return None
         out = {}
@@ -1942,6 +2078,10 @@ class RyzenAdjSource:
             # limit means "not reported" and must not count as binding.
             if lim == lim and val == val and lim > 0:
                 out[key] = (float(val), float(lim))
+        if extra:
+            out["_extra"] = extra
+        if table:
+            out["_table"] = table
         tctl = out["thm"][0] if "thm" in out else None
         out["tctl"] = self._check_stuck(tctl if tctl and tctl > 0 else None)
         if out["tctl"] is None or not self._tctl_moved:
@@ -2109,6 +2249,7 @@ class CpuClock:
         self._next_open = 0.0
         self._failed = False
         self._reads = 0  # consecutive reads that found the CPU held back
+        self.stats = None  # the last read's detail, for the limit log
         logical = psutil.cpu_count(logical=True) or 0
         physical = psutil.cpu_count(logical=False) or 0
         self._smt = bool(physical) and logical == 2 * physical
@@ -2157,9 +2298,11 @@ class CpuClock:
                                                      win32pdh.PDH_FMT_DOUBLE)[1]
         except Exception:
             self._reads = 0
+            self.stats = None
             return None
         cores = {}
         fastest = None
+        active = []  # % Processor Performance of the busy logical CPUs
         for name, t in busy_t.items():
             m = re.fullmatch(r"(\d+),(\d+)", name)  # not "_Total", "0,_Total"
             if not m:
@@ -2170,11 +2313,18 @@ class CpuClock:
             p = perf.get(name)
             if t >= self.ACTIVE_PCT and p is not None:
                 fastest = p if fastest is None else max(fastest, p)
+                active.append(p)
         busiest = min(100.0, max(cores.values(), default=0.0))
         held = (busiest >= CLOCK_BUSY_PCT and fastest is not None
                 and fastest <= 100.0 * CLOCK_BASE_MARGIN)
         self._reads = self._reads + 1 if held else 0
         ghz = base * fastest / 100000.0 if (fastest and base > 0) else None
+        self.stats = {
+            "ghz_avg": (base * sum(active) / len(active) / 100000.0
+                        if active and base > 0 else None),
+            "busy_cores": sum(1 for v in cores.values() if v >= CLOCK_BUSY_PCT),
+            "base_ghz": base / 1000.0 if base > 0 else None,
+        }
         return self._reads >= CLOCK_DEBOUNCE_READS, ghz, busiest
 
 
@@ -2362,6 +2512,7 @@ class Messenger:
         self.seq = 0          # the last sequence number used
         self.lights_off = False  # the lighting switched off; kept across
                                  # reconnects, so a still-dark pad isn't re-logged
+        self.on_sent = None   # called with (text, replay) per message sent
         self.reset()
 
     def reset(self):
@@ -2476,6 +2627,8 @@ class Messenger:
             # into sysmon.log: the only record of what the pad was told
             log(f"Message to the pad: {text}"
                 + (" (replay key)" if replay else ""))
+            if self.on_sent is not None:
+                self.on_sent(text, replay)  # the limit log; never raises
             break  # one per tick
 
     def _drop_queue(self):
@@ -3075,6 +3228,21 @@ def build_parser():
                             help="stop the installed service")
     deployment.add_argument("--restart-service", action="store_true",
                             help="restart the service (apply sysmon.ini changes)")
+
+    limitlog = parser.add_argument_group(
+        "limit log", "the long-term record of what held the CPU and dGPU back")
+    limitlog.add_argument("--limit-report", action="store_true",
+                          help="tally the limit log: which limits bound, how "
+                               "long, under what conditions, and exit")
+    limitlog.add_argument("--report-days", type=float, default=None,
+                          metavar="N",
+                          help="with --limit-report: only the last N days")
+    limitlog.add_argument("--export-csv", default=None, metavar="DIR",
+                          help="with --limit-report: also write every table "
+                               "as CSV into DIR")
+    limitlog.add_argument("--limitlog-db", default=None, metavar="PATH",
+                          help="with --limit-report: read this copy of "
+                               "limitlog.sqlite instead")
     return parser
 
 
@@ -3135,6 +3303,13 @@ def main(argv=None, stop_event=None, resume_check=None):
     if args.fetch_lhm:
         fetch_lhm_dlls(force=args.force)
         return
+
+    if args.limit_report:
+        import limitreport
+        rc = limitreport.report(args.limitlog_db, days=args.report_days,
+                                csv_dir=args.export_csv)
+        pause_if_own_console()
+        return rc
 
     # The one-shot actions below are what shortcuts and the installer launch.
     # Each ends with pause_if_own_console() so the window sticks around long
@@ -3296,34 +3471,57 @@ def run(args, stop_event=None, resume_check=None):
     gpu_track = LimitTracker("MSG_NAME_GPU", "HUE_GREEN")
     messenger = Messenger(verbose=args.verbose)
 
+    # The limit log records from the same readings, pad or no pad. It must
+    # never take the loop down: every call into it catches its own errors.
+    recorder = None
+    if LIMITLOG_ENABLE:
+        try:
+            import limitlog
+            recorder = limitlog.Recorder(sys.modules[__name__], clock=clock,
+                                         nv=nv, dwatch=dwatch)
+            messenger.on_sent = recorder.message
+            print(f"Limit log: {recorder.path}")
+        except Exception as err:
+            log(f"Limit log disabled: {err}")
+            recorder = None
+
     dev = None
+    next_open = 0.0      # when to look for the pad again while it is absent
     ghost_flags = False  # the firmware reads ghost flags (seen in a FRAME C echo)
     published_state = False
     while not stop_event.is_set():
         try:
             if resume_check is not None and resume_check():
+                if recorder is not None:
+                    recorder.resumed()
                 if dev is not None:
                     try:
                         dev.close()
                     except Exception:
                         pass
                     dev = None
+                    next_open = 0.0
                 if ryzen.available:
                     ryzen.close()
                     ryzen = RyzenAdjSource(enabled=not args.no_ryzenadj,
                                            dll_dir=args.ryzenadj_dir)
                     cache["ryzenadj"] = Cached(ryzen.snapshot, TTL_RYZENADJ)
-            if dev is None:
+            if dev is None and (recorder is None or time.monotonic() >= next_open):
+                next_open = time.monotonic() + 5
                 dev = open_device()
-                if dev is None:
-                    # module unplugged / not enumerated yet (the service starts
-                    # before the USB stack has necessarily settled)
-                    stop_event.wait(5)
-                    continue
-                print("Connected to macropad")
-                ghost_flags = False  # a reflash may have changed the firmware
-                messenger.reset()
-                messenger.probe(dev)
+                if dev is not None:
+                    print("Connected to macropad")
+                    ghost_flags = False  # a reflash may have changed the firmware
+                    messenger.reset()
+                    messenger.probe(dev)
+                    if recorder is not None:
+                        recorder.pad(True)
+            if dev is None and recorder is None:
+                # module unplugged / not enumerated yet (the service starts
+                # before the USB stack has necessarily settled); with the limit
+                # log on, the loop runs on without it and looks again every 5 s
+                stop_event.wait(5)
+                continue
 
             m = gather(sources, gpu, charge_limit, apu, nv, ryzen, args, cache)
             now = time.monotonic()
@@ -3378,6 +3576,11 @@ def run(args, stop_event=None, resume_check=None):
                       f"dgpu[{m['dgpu_src']}] {dgpu_now} -> {m['dgpu_limit']!r} "
                       f"power={m['dgpu_power']}"
                       + (f" for {m['dgpu_off_s']:.0f}s" if m["dgpu_off_s"] is not None else ""))
+            if recorder is not None:
+                recorder.observe(m, now, cpu_track, gpu_track)
+            if dev is None:
+                stop_event.wait(args.interval)
+                continue
             for rep in build_frame(rows, m["brightness"]):
                 dev.write(b"\x00" + rep)
             # drain the VIA echoes so the report buffer doesn't fill up; they
@@ -3399,7 +3602,10 @@ def run(args, stop_event=None, resume_check=None):
                 dev.close()
             except Exception:
                 pass
+            if dev is not None and recorder is not None:
+                recorder.pad(False)
             dev = None
+            next_open = 0.0
             stop_event.wait(2)
             continue
         try:
@@ -3410,6 +3616,8 @@ def run(args, stop_event=None, resume_check=None):
     if dev is not None:
         send_goodbye(dev)
         dev.close()
+    if recorder is not None:
+        recorder.close()  # bounded: the SCM doesn't wait long for a stop
     lhmlib.close()
     ryzen.close()
     # A clean exit says goodbye (above), so the firmware hands over to the

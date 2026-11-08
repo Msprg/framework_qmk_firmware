@@ -99,6 +99,7 @@ Name: "{group}\Self-test (what works on this machine)"; Filename: "{app}\{#ExeNa
 Name: "{group}\Live view (console)";                    Filename: "{app}\{#ExeName}"; Parameters: "--verbose"; Comment: "Run in the foreground and print each tick"
 Name: "{group}\Edit settings (sysmon.ini)";             Filename: "{win}\notepad.exe"; Parameters: """{commonappdata}\FW16Sysmon\sysmon.ini"""
 Name: "{group}\View log";                               Filename: "{win}\notepad.exe"; Parameters: """{commonappdata}\FW16Sysmon\sysmon.log"""
+Name: "{group}\Limit report";                           Filename: "{app}\{#ExeName}"; Parameters: "--limit-report"; Comment: "Which limits held the CPU and dGPU back, how long, and under what conditions"
 Name: "{group}\Flash firmware onto the macropad";       Filename: "{app}\{#ExeName}"; Parameters: "--flash"
 Name: "{group}\Restart the service";                    Filename: "{app}\{#ExeName}"; Parameters: "--restart-service"; Comment: "Apply changes made to sysmon.ini"
 Name: "{group}\Third-party notices";                    Filename: "{app}\THIRD-PARTY-NOTICES.md"

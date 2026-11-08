@@ -64,6 +64,9 @@ hiddenimports = [
     "deps",
     "service",
     "flash",
+    "limitlog",
+    "limitreport",
+    "sqlite3",
 ] + pythonnet_hidden + clr_hidden
 
 excludes = [

@@ -861,6 +861,45 @@ def probe_service_view():
     return Result("service_view", "Service's own view", OK, detail)
 
 
+def probe_limitlog():
+    """Is the service writing the limit log, and how much is in it?"""
+    title = "Limit log"
+    try:
+        eng = paths.engine_module()
+        enabled = bool(getattr(eng, "LIMITLOG_ENABLE", 1))
+    except Exception:
+        enabled = True
+    path = os.path.join(paths.data_dir(), "limitlog.sqlite")
+    if not enabled:
+        return Result("limitlog", title, NA, "LIMITLOG_ENABLE = 0 in sysmon.ini")
+    if not os.path.isfile(path):
+        return Result("limitlog", title, NA, f"{path} not written yet",
+                      "The service writes it once it runs this version.")
+    try:
+        import sqlite3
+        import time
+        from pathlib import Path
+        db = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True,
+                             timeout=5)
+        try:
+            last, n = db.execute("SELECT MAX(ts), COUNT(*) FROM samples").fetchone()
+            eps = db.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
+        finally:
+            db.close()
+    except Exception as err:
+        return Result("limitlog", title, DEGRADED, f"{path}: {err}")
+    size = os.path.getsize(path) / 1048576
+    age = None if last is None else time.time() - last
+    detail = (f"{path} ({size:.1f} MB): {n} samples, {eps} episodes, last sample "
+              + ("never" if age is None else f"{age:.0f} s ago"))
+    if age is None or age > 120:
+        return Result("limitlog", title, DEGRADED, detail,
+                      "The service hasn't written a sample in the last 2 minutes "
+                      "(samples come every 30 s at the most). Is it running? See "
+                      "sysmon.log for 'Limit log' lines.")
+    return Result("limitlog", title, OK, detail)
+
+
 def probe_service():
     try:
         import service
@@ -892,6 +931,7 @@ PROBES = [
     probe_config,
     probe_service,
     probe_service_view,
+    probe_limitlog,
 ]
 
 

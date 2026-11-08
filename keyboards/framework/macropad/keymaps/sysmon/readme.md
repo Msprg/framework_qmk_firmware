@@ -313,6 +313,76 @@ below full brightness). If no stats arrive for 5 seconds (script stopped,
 reboot, etc.) the macropad falls back to the regular RGB matrix effect, so
 set a calm/dim effect via VIA as the fallback.
 
+## Limit log
+
+The pad shows a limit while it binds; the **limit log** keeps the evidence.
+The service records every limit that binds, when, for how long, and what the
+machine was doing then, into `limitlog.sqlite` beside `sysmon.ini`. It records
+from the same readings and the same SMU handle as the pad, and keeps running
+while the pad is unplugged. Read it with the Start menu's **Limit report**, or:
+
+```powershell
+fw16-sysmon.exe --limit-report                         # everything so far
+fw16-sysmon.exe --limit-report --report-days 7 --export-csv C:\temp\limits
+python host\limitreport.py C:\copy\limitlog.sqlite --days 7   # stdlib only, any Python
+```
+
+The report has these sections:
+- How long the machine was observed, by power source and Windows power mode.
+- Per component: each reason's *primary* time (the binding limit closest to
+  its own limit), its *bound* time, its share of busy time, and its episodes
+  (count, median, p90, longest), broken down by power source and power mode.
+- For STAPM, and the top CPU limits, a closer look:
+  - the limit's own value (it moves), with temperatures, fans, clocks,
+    charging state and the PD contract at each level;
+  - the headroom to the slow and fast PPT;
+  - clocks while bound, against busy and unbound.
+- Every SMU limit change, with what the machine was doing when it changed.
+- The busiest processes during each kind of episode.
+
+What is recorded, beyond what the pad reads:
+
+- **Raw reasons**, unfiltered: every SMU limit at its threshold (fast PPT
+  included, on battery too, whatever `LIMIT_KINDS` says). It also records the
+  skin-temperature (STT) limit, the clock held at base, and the EC's own APU
+  throttle flags (`AP Throttle Status`: soft SPPT and PROCHOT#). For the dGPU,
+  every NVML throttle bit. The pad's own verdict is recorded next to them.
+- **More of the SMU table**: the STAPM and slow PPT time constants, APU-only
+  slow PPT, STT limits and values, the boost setpoint, and socket/SoC power and
+  clocks. The **raw PM table** is saved as well, at each CPU episode's start
+  and every 10 minutes, for decoding the fields libryzenadj doesn't name
+  (`--export-csv` writes it out as float columns). libryzenadj decodes the
+  extra fields per table version, and some decode wrong: on this FW16's Strix
+  Point table (0x5d000b), socket power reads the boost setpoint, and the GFX
+  temperature and dGPU STT values are nonsense. They are kept as read; the
+  report doesn't use them, and the STAPM / PPT / TDC / EDC / THM pairs check
+  out against the raw table.
+- **Context**:
+  - power: AC or battery, and whether the battery is assisting the charger;
+    the USB-PD contract (port, V, A, W); charger input current; battery
+    voltage, current and charge state.
+  - Windows: the power mode (efficiency / balanced / performance), the plan,
+    Energy Saver, and Windows' performance-limit counters.
+  - thermals: every EC temperature sensor and both fans.
+  - activity: CPU load, busy cores and clocks; dGPU power state, draw, limit,
+    temperature and clocks (read only while it's awake, so it isn't woken);
+    the top CPU processes.
+- **Events**:
+  - every change of an SMU limit (STAPM, PPT, current, thermal and the time
+    constants), with the full context it changed in;
+  - AC and charger changes, power mode, charge cap, and the EC throttle flags;
+  - suspend/resume, the pad connecting, and every message sent to it.
+
+Samples come every `LIMITLOG_ACTIVE_S` (2 s) while something binds or a
+component is busy, every `LIMITLOG_IDLE_S` (30 s) otherwise, plus one at each
+episode start/end and event. That is a few MB per day of use. Samples and raw
+tables are kept for `LIMITLOG_RETENTION_DAYS` (90), capped at
+`LIMITLOG_MAX_MB`. Episodes, events and the daily tallies are kept for good.
+The settings are in `[limitlog]` in `sysmon.ini`; `LIMITLOG_ENABLE = 0` turns
+it off. The database uses a rollback journal, not WAL, so it can be read
+(and copied) without admin rights while the service writes it. The schema is
+described at the top of `host\limitlog.py`.
+
 ## Install
 
 Download `FW16-Sysmon-Setup-<version>.exe` and run it. It bundles everything —
@@ -345,7 +415,8 @@ The installer is **not code-signed**, so SmartScreen shows
 | `C:\Program Files\FW16 Macropad Sysmon\` | the program and its bundled DLLs |
 | `C:\ProgramData\FW16Sysmon\sysmon.ini` | every tunable (see [Tuning](#tuning-no-reflash)) |
 | `C:\ProgramData\FW16Sysmon\sysmon.log` | rotating service log |
-| Start menu | self-test, live console view, edit settings, view log, flash firmware, restart service |
+| `C:\ProgramData\FW16Sysmon\limitlog.sqlite` | the [limit log](#limit-log) |
+| Start menu | self-test, live console view, edit settings, view log, limit report, flash firmware, restart service |
 
 Managing the service:
 
