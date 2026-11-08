@@ -390,11 +390,13 @@ qmk compile -kb framework/macropad -km sysmon
 
 On Windows with QMK MSYS: its GNU Make 4.4.1 can't parse QMK's
 `keyboard:keymap` targets in this firmware vintage, so invoke the build
-makefile directly (this is what worked here):
+makefile directly, from your checkout (`/c/path/to/qmk_firmware` is its path
+in MSYS form). `host\packaging\build.ps1 -BuildFirmware` does all of this
+for you.
 
 ```powershell
 $env:MSYSTEM='MINGW64'
-& C:\QMK_MSYS\usr\bin\bash.exe -l -c "cd /c/Users/Msprg/repo/framework_qmk_firmware && make -r -R -f builddefs/build_keyboard.mk -j8 KEYBOARD=framework/macropad KEYMAP=sysmon TARGET=framework_macropad_sysmon QMK_BIN=qmk SILENT=false"
+& C:\QMK_MSYS\usr\bin\bash.exe -l -c "cd /c/path/to/qmk_firmware && make -r -R -f builddefs/build_keyboard.mk -j8 KEYBOARD=framework/macropad KEYMAP=sysmon TARGET=framework_macropad_sysmon QMK_BIN=qmk SILENT=false"
 ```
 
 Flashing is one command — it jumps to the bootloader, waits for the `RPI-RP2`
