@@ -31,12 +31,16 @@ SAMPLE_CAP_S = 6.0  # a sample stands for at most this long (3x the busy cadence
 
 
 def default_db():
+    """The data directory's log; from source, where none is beside the script,
+    the installed service's."""
+    base = os.environ.get("ProgramData") or r"C:\ProgramData"
+    installed = os.path.join(base, "FW16Sysmon", DB_NAME)
     try:
         import paths
-        return os.path.join(paths.data_dir(), DB_NAME)
+        path = os.path.join(paths.data_dir(), DB_NAME)
     except Exception:
-        base = os.environ.get("ProgramData") or r"C:\ProgramData"
-        return os.path.join(base, "FW16Sysmon", DB_NAME)
+        return installed
+    return path if os.path.exists(path) or not os.path.exists(installed) else installed
 
 
 def connect(path):
@@ -281,17 +285,22 @@ class Report:
                    f"{num(r2['pkg'])} W")
 
     def limit_changes(self):
-        rows = []
+        rows, small = [], 0
         for r in self.q("SELECT ts, detail FROM events WHERE kind='smu_limits' AND ts>=? "
                         "ORDER BY ts", self.since):
             d = json.loads(r["detail"] or "{}")
             # stt_dgpu_l: misdecoded on Strix Point and moving every read; the
             # first build logged its changes (see limitlog.SMU_LIMIT_KEYS)
-            d["changed"] = {k: v for k, v in d.get("changed", {}).items()
-                            if k not in IGNORED_LIMITS}
+            ch = {k: v for k, v in d.get("changed", {}).items() if k not in IGNORED_LIMITS}
+            d["changed"] = {k: v for k, v in ch.items() if _real_move(k, v)}
             if d["changed"]:
                 rows.append({"ts": r["ts"], "detail": json.dumps(d)})
+            elif ch:
+                small += 1
         self.w(f"\n== SMU limit changes: {len(rows)} ==")
+        if small:
+            self.w(f"  ({small} moves under {num(MIN_LIMIT_MOVE)} left out: older builds logged "
+                   f"read-to-read jitter; samples.stapm_l has the limit's path)")
         if not rows:
             return
         counts = {}
@@ -350,6 +359,20 @@ class Report:
 
 
 IGNORED_LIMITS = {"stt_dgpu_l"}
+# Builds before 2026-11-09 compared each SMU read with the previous one, so a
+# drifting STAPM limit logged mostly sub-watt jitter; moves smaller than this
+# (the time constants aside) are left out of the list. Newer builds log a
+# move only once it reaches limitlog.SMU_LIMIT_TOL (2 W).
+MIN_LIMIT_MOVE = 1.0
+TIME_LIMITS = {"stapm_time", "slow_time"}
+
+
+def _real_move(key, change):
+    try:
+        a, b = change
+        return key in TIME_LIMITS or abs(b - a) >= MIN_LIMIT_MOVE
+    except (TypeError, ValueError):
+        return True
 
 # reason -> (limit column, value column, unit) for the deep dive
 LIMIT_COLS = {

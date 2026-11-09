@@ -369,14 +369,18 @@ What is recorded, beyond what the pad reads:
     the top CPU processes.
 - **Events**:
   - every change of an SMU limit (STAPM, PPT, current, thermal and the time
-    constants), with the full context it changed in;
+    constants), with the full context it changed in. A limit that drifts, as
+    STAPM does on Strix Point, logs one each time it has moved 2 W (or A, or
+    C) from where the last one left it;
   - AC and charger changes, power mode, charge cap, and the EC throttle flags;
   - suspend/resume, the pad connecting, and every message sent to it.
 
 Samples come every `LIMITLOG_ACTIVE_S` (2 s) while something binds or a
 component is busy, every `LIMITLOG_IDLE_S` (30 s) otherwise, plus one at each
-episode start/end and event. That is a few MB per day of use. Samples and raw
-tables are kept for `LIMITLOG_RETENTION_DAYS` (90), capped at
+episode start/end and event. The CPU counts as busy at 25% total load, or
+with a core at `CLOCK_BUSY_PCT` (80%) averaged over about
+`LIMITLOG_BUSY_TAU_S` (10 s); the dGPU at 30% or 15 W. That is a few MB per
+day of use. Samples and raw tables are kept for `LIMITLOG_RETENTION_DAYS` (90), capped at
 `LIMITLOG_MAX_MB`. Episodes, events and the daily tallies are kept for good.
 The settings are in `[limitlog]` in `sysmon.ini`; `LIMITLOG_ENABLE = 0` turns
 it off. The database uses a rollback journal, not WAL, so it can be read

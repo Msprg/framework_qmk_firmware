@@ -391,6 +391,9 @@ LIMITLOG_ACTIVE_S = 2.0      # sample interval while a limit binds or a componen
 LIMITLOG_IDLE_S = 30.0       # ...and otherwise
 LIMITLOG_LINGER_S = 30.0
 LIMITLOG_CPU_ACTIVE_PCT = 25  # total CPU load that counts as busy for sampling
+LIMITLOG_BUSY_TAU_S = 10.0   # the busiest core's % is averaged over about this
+                             # long before it counts as busy (CLOCK_BUSY_PCT):
+                             # idle Windows spikes some core to 80%+ every few s
 LIMITLOG_ONSET_S = 2.0       # a limit held this long becomes an episode (its
                              # time counts in the tallies from the first read)
 LIMITLOG_EC_S = 5.0          # framework_tool --thermal (EC temperatures, fans,

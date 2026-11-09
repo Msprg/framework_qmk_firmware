@@ -316,6 +316,12 @@ SCHEMA = [
             comment="How long the busy cadence lasts after the last busy tick."),
     Setting("LIMITLOG_CPU_ACTIVE_PCT", "limitlog", INT, lo=0, hi=100,
             comment="Total CPU load (%) that counts as busy for the cadence."),
+    Setting("LIMITLOG_BUSY_TAU_S", "limitlog", FLOAT, lo=0, hi=600,
+            comment="A core this busy (CLOCK_BUSY_PCT) also counts as busy, for\n"
+                    "the cadence and the report's busy time, once its load averaged\n"
+                    "over about this many seconds gets there; idle Windows spikes\n"
+                    "some core that high for a moment every few seconds. 0: no\n"
+                    "averaging."),
     Setting("LIMITLOG_ONSET_S", "limitlog", FLOAT, lo=0, hi=600,
             comment="A limit held this long becomes an episode. Its time counts in\n"
                     "the tallies from the first read regardless."),

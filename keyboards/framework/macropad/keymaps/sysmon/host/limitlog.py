@@ -65,6 +65,7 @@ beside them (samples.cpu_pad / gpu_pad, episodes.pad).
 
 import ctypes
 import json
+import math
 import os
 import queue
 import re
@@ -95,14 +96,19 @@ PROCHOT_RATIO = 1.1
 NV_SW_POWER, NV_HW_SLOWDOWN, NV_SW_THERMAL, NV_HW_THERMAL, NV_HW_BRAKE = (
     0x04, 0x08, 0x20, 0x40, 0x80)
 
-# Changes of these between SMU reads are logged as "smu_limits" events. Not
-# stt_dgpu_l: on the FW16's Strix Point table (0x5d000b) libryzenadj decodes
-# it from a field that moves every read (1.3 -> 1.0 -> 0.8), which would bury
-# the real changes; the samples still keep it.
+# Moves of these are logged as "smu_limits" events: once one is more than its
+# tolerance away from where the last event left it (not from the previous
+# read). Some limits drift: STAPM on Strix Point floats between 35 and 63 W,
+# a fraction of a watt per read, so a read-to-read compare saw only jitter.
+# A drifting limit logs one event per SMU_LIMIT_TOL moved. Not stt_dgpu_l: on
+# the FW16's Strix Point table (0x5d000b) libryzenadj decodes it from a field
+# that moves every read (1.3 -> 1.0 -> 0.8), which would bury the real
+# changes; the samples still keep it.
 SMU_LIMIT_KEYS = ("stapm_l", "fast_l", "slow_l", "apu_slow_l", "tdc_l",
                   "tdc_soc_l", "edc_l", "edc_soc_l", "thm_l", "stt_apu_l",
                   "stapm_time", "slow_time")
-SMU_LIMIT_TOL = 0.2
+SMU_LIMIT_TOL = 2.0  # W, A or C; idle STAPM wobbles about 1 W at its ceiling
+SMU_LIMIT_TOL_KEY = {"stapm_time": 0.2, "slow_time": 0.2}  # seconds
 
 # Windows power modes (the overlay the Settings slider picks) and plans.
 POWER_MODES = {
@@ -991,6 +997,8 @@ class Recorder:
         self._next_sample = 0.0
         self._active_until = 0.0
         self._prev = {}
+        self._anchor = {}          # SMU limit -> its value at the last smu_limits event
+        self._busiest_ema = None   # the busiest core's %, smoothed (LIMITLOG_BUSY_TAU_S)
         self._last_rj = None
         self._next_table = time.monotonic() + 30.0
         self._table_for = None     # (episode id, why) the requested table is for
@@ -999,10 +1007,12 @@ class Recorder:
         self._errors = {}          # where -> (count, last logged monotonic)
         self.event("start", version=getattr(eng, "__version__", "?"),
                    pid=os.getpid(), db=self.path, machine=self._writer.machine,
-                   thresholds={k: getattr(eng, k, None) for k in (
+                   thresholds=dict({k: getattr(eng, k, None) for k in (
                        "APU_LIMIT_NEAR", "APU_THM_MARGIN_C", "LIMIT_RELEASE_S",
                        "NV_NEAR_CAP", "CLOCK_BUSY_PCT", "CLOCK_BASE_MARGIN",
-                       "LIMITLOG_ONSET_S", "LIMITLOG_ACTIVE_S", "LIMITLOG_IDLE_S")})
+                       "LIMITLOG_ONSET_S", "LIMITLOG_ACTIVE_S", "LIMITLOG_IDLE_S",
+                       "LIMITLOG_BUSY_TAU_S")},
+                       SMU_LIMIT_TOL=SMU_LIMIT_TOL, SMU_LIMIT_TOL_KEY=SMU_LIMIT_TOL_KEY))
 
     # --- entry points: none of them raises ---------------------------------
 
@@ -1070,6 +1080,7 @@ class Recorder:
             self.event("resume" if self._resumed else "gap", ts=wall,
                        since=self._last_wall, seconds=round(dt, 1))
             self._resumed = False
+            self._busiest_ema = None
             dt = 0.0
         self._last_tick, self._last_wall = now, wall
 
@@ -1084,9 +1095,22 @@ class Recorder:
         s["cpu_bound"], s["cpu_primary"] = _bound_text(cpu), _primary(cpu)
         s["gpu_bound"], s["gpu_primary"] = _bound_text(gpu), _primary(gpu)
 
-        busiest = s.get("cpu_busiest")
+        # the busiest core, smoothed: Windows' background work puts some core
+        # at 80%+ for a moment every few seconds even at idle, which held the
+        # busy cadence (and the tallies' "busy" time) all night
+        # (no history -- the first tick, after a gap or an unreadable counter --
+        # starts from 0, so one spike then doesn't count either)
+        busiest, ema = s.get("cpu_busiest"), self._busiest_ema
+        tau = E.LIMITLOG_BUSY_TAU_S
+        if busiest is None:
+            ema = None
+        elif tau <= 0:
+            ema = busiest
+        else:
+            ema = (ema or 0.0) + (1.0 - math.exp(-dt / tau)) * (busiest - (ema or 0.0))
+        self._busiest_ema = ema
         loaded = {
-            "cpu": (busiest is not None and busiest >= E.CLOCK_BUSY_PCT)
+            "cpu": (ema is not None and ema >= E.CLOCK_BUSY_PCT)
                    or (s.get("cpu_util") or 0) >= E.CPU_LOAD_HIGH,
             "gpu": bool(m.get("dgpu_present")) and (
                 (s.get("dgpu") or 0) >= 30 or (s.get("nv_w") or 0) >= E.NV_ACTIVE_MIN_W),
@@ -1381,10 +1405,17 @@ class Recorder:
             why = "event"
         if new_rj:
             moved = {}
+            anchor = self._anchor
             for name in SMU_LIMIT_KEYS:
-                old = prev.get(name)
-                if changed(name, s.get(name), SMU_LIMIT_TOL):
-                    moved[name] = [old, s.get(name)]
+                val = s.get(name)
+                if val is None:
+                    continue
+                old = anchor.get(name)
+                if old is None:
+                    anchor[name] = val  # the first value seen is the baseline
+                elif abs(val - old) > SMU_LIMIT_TOL_KEY.get(name, SMU_LIMIT_TOL):
+                    moved[name] = [old, val]
+                    anchor[name] = val
             if moved:
                 # the event this log exists for: what moved a limit, and when
                 self.event("smu_limits", ts=wall, changed=moved, **ctx)
