@@ -115,3 +115,10 @@ Three scripts keep it in step with the code. All are standard-library Python
 - [`tools/check_manual.py`](tools/check_manual.py) checks that every link and
   anchor resolves, and that every setting, flag and Start-menu item named
   here exists in the sources.
+
+Coding sessions don't update the manual as they go. A weekly catch-up job
+reviews the commits made since the bookmark below, updates the chapters
+they affect, moves the bookmark, and opens a pull request. The bookmark is
+the last `macropad-sysmon` commit the manual reflects:
+
+<!-- manual-synced-to: cb28343001 -->
