@@ -360,7 +360,7 @@ def fig_pad_map(exe):
     h = pad_keys(a, 24, 24, tracks(sm), poster(sm, 6000))
     labels = ["Battery|charge, charging / draining", "CPU|usage; breathes when held back",
               "Memory|usage; blinks at 90 %+", "iGPU|usage, with the NPU behind it",
-              "dGPU|usage; teal from the right = asleep",
+              "dGPU|usage; teal from the right = powered off",
               "Temperature|30-90 \u00b0C; blinks above 90 \u00b0C"]
     y = 24
     for r, lab in enumerate(labels):
@@ -403,6 +403,11 @@ def fig_battery(exe):
         m_of(ac=False, discharging=True, raw_pct=12, cap=100, rate_w=12),    # critical
     ]
     rows = [e.build_battery_row(m) for m in states]
+    # The real drift tell dips the last key only from ROW_VAL_BATT_IDLE (80) to
+    # BATT_DRIFT_FLOOR (68): easy to miss on the pad by design, and invisible
+    # in a picture. Dip it much deeper here so the reader can find it; the
+    # caption says so.
+    rows[4].floor = 8
     s = Script(exe)
     stream(s, lambda t: rows, warm + dur)
     sm = clip(s.run(), warm, warm + dur, 185)
@@ -411,7 +416,7 @@ def fig_battery(exe):
         ("On battery, at 60 %", "red; the edge key flares and fades", 1),
         ("On AC, battery helping the charger", "amber: the charger can't keep up", 2),
         ("On AC, battery idle", "the whole row steady dim green", 3),
-        ("On AC, battery drifting", "the last key breathes, barely visibly (by design)", 4),
+        ("On AC, battery drifting", "the last key breathes; exaggerated here, faint on the pad", 4),
         ("Draining, below 15 %", "the whole row red, blinking", 5),
     ]
     return strip_figure("The battery row", items, sm, 1000, dur,
