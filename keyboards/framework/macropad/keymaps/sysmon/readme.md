@@ -140,6 +140,16 @@ starts at power-up, so a `trace` within ~13 s holds the whole startup. It shows
 the values sent, not the light: how the LEDs turn very low PWM at a high
 current into light, for one, it cannot show.
 
+For a glitch seen where no tool can run (the laptop still booting, say), hold
+the top-left key (Esc) for a second within ~13 s of it: the macropad saves the
+recorder to its own flash, and the whole pad flashes white once when it's
+done (about a second later). It keeps the last four saves, through power-off and
+reflashing. The hold never reaches the laptop; a quick tap still sends the key
+(on release). Later, `trace saved` lists the saves (when after power-up, which
+start of the pad), and `trace saved N` (or `trace saved last`) writes save N's
+CSV, summary and PNG like `trace` does. `trace save` saves from the laptop, as
+the key does.
+
 A replay of several animations names each with dots before it plays: up to
 9, N white dots in reading order from the top-left key; from 10, the tens as
 cyan dots on the top row and the units as white dots from the second row. A
@@ -858,11 +868,19 @@ trace`):
 
 ```text
 [3] 0 = status, 1 = freeze (stop recording, so it can be read), 2 = read,
-    3 = restart (clear and record again)
+    3 = restart (clear and record again), 4 = read saved, 5 = save (as
+    holding the save key does)
 read:   [4..7] byte offset (u32 LE) into the frozen frames, oldest first;
         echo [8..31] = the next 24 bytes
+read saved: [4..7] byte offset (u32 LE) into the saved traces: slot k at
+        k x 64 KiB, a 256-byte header ([0..3] magic "TRC1", [4..7] save
+        number, the highest the newest, [8..11] ms after power-up it was
+        saved, [12..15] the power-up counter, [16..17] frames, [18] frame
+        size, [19] 1 the key, 2 the host), then its frames, oldest first;
+        echo [8..31] = the next 24 bytes
 others: echo [8..9] frames held (u16 LE), [10] frame size (76), [11] frozen,
-        [12..13] frames the ring holds (u16 LE)
+        [12..13] frames the ring holds (u16 LE), [14] save slots (0: this
+        firmware can't save), [15] a save under way, [16] slot size in KiB
 frame (76 bytes): [0..1] ms (the timer's low 16 bits), [2] global current,
         [3] bits 0-1 display (as data[20] of BOOT REPLAY), bits 2-3 current
         change (1 rising: PWM sent first, 2 falling: current first), bit 4

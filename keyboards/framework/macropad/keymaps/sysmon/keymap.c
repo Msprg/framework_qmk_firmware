@@ -77,6 +77,8 @@ void enable_factory_mode(bool enable) {
 #include <lib/lib8tion/lib8tion.h>
 #include <math.h>
 #include "is31flcommon.h"
+#include "hardware/flash.h" // the saved trace: erasing and programming the flash
+#include "hardware/sync.h"
 
 // ---------------------------------------------------------------------------
 // Host -> macropad protocol (FROZEN WIRE PROTOCOL v2)
@@ -186,12 +188,17 @@ void enable_factory_mode(bool enable) {
 // TRACE (value_id 0x12): a flight recorder of what the LED chip was sent,
 // every frame, for checking the pad's output without seeing it (see "LED
 // trace" below; read out by bootanim_preview.py trace).
-//   data[3] = 0 status, 1 freeze, 2 read, 3 restart (clear and record again)
+//   data[3] = 0 status, 1 freeze, 2 read, 3 restart (clear and record again),
+//             4 read saved, 5 save (as holding the save key does)
 //   read:   data[4..7] = byte offset (u32 LE) into the frozen frames, oldest
 //           first; the echo carries the next 24 bytes in data[8..31]
+//   read saved: data[4..7] = byte offset (u32 LE) into the saved traces (slot
+//           k at k x 64 KiB: a 256-byte header, then its frames, oldest
+//           first); the echo carries the next 24 bytes in data[8..31]
 //   others: the echo carries frames held (u16 LE) in data[8..9], the frame
 //           size in data[10], frozen in data[11], frames the ring holds
-//           (u16 LE) in data[12..13]
+//           (u16 LE) in data[12..13], save slots in data[14], a save under
+//           way in data[15], the slot size in KiB in data[16]
 //
 // BOOT REPLAY (value_id 0x10) replays boot animations, for previewing and
 // tuning them. Each animation plays from dark and holds its finished rainbow
@@ -381,6 +388,10 @@ static void boot_status(uint8_t *out);
 static bool warn_prev_started;
 static uint32_t sysmon_reboot_at = 0; // nonzero: REBOOT asked for at this time
 static void     sysmon_trace_cmd(uint8_t *p); // with the LED trace, below
+#define SYSMON_SAVED_BY_KEY 1  // why a trace was saved: the save key,
+#define SYSMON_SAVED_BY_HOST 2 // ...or TRACE 5
+static void     sysmon_trace_save_start(uint8_t why);
+static void     sysmon_trace_save_step(bool usb_settled);
 
 // Decode one 8-byte descriptor at src into sysmon_rows[row].
 static void sysmon_decode_row(uint8_t row, const uint8_t *src) {
@@ -2412,9 +2423,35 @@ static bool sysmon_host_live(void) {
 // stays an ordinary keypad 5: a host that never reports NumLock (macOS, a
 // pre-boot environment) reads as NumLock off all the time, and swallowing the
 // key there would take it away for good.
+//
+// Holding the top-left key (Esc; RGB toggle on the Fn layer) for
+// SYSMON_SAVE_HOLD_MS saves the LED trace to the flash (see "saved trace"):
+// for a glitch seen while the laptop boots, before any tool on it can read
+// the trace out. Caught by position, so it works whatever the keymap and
+// NumLock say, and the press never reaches the host; a shorter press is
+// played back through QMK on release, as the key it is then. A hold doesn't
+// count as using the pad (the boot rainbow stays); a tap does.
+#define SYSMON_SAVE_KEY_ROW 2 // matrix position of the top-left key (H1)
+#define SYSMON_SAVE_KEY_COL 1
+#define SYSMON_SAVE_HOLD_MS 1000
+static uint32_t save_key_down;   // when it went down (0: up)
+static bool     save_key_fired;  // this hold saved a trace
+static bool     save_key_tap;    // released early: play its tap back
+static bool     save_key_replay; // ...being played back now
+
 bool pre_process_record_user(uint16_t keycode, keyrecord_t *record) {
     static matrix_row_t swallowed[MATRIX_ROWS]; // keys whose press was swallowed
     keypos_t            k = record->event.key;
+    if (IS_KEYEVENT(record->event) && k.row == SYSMON_SAVE_KEY_ROW && k.col == SYSMON_SAVE_KEY_COL && !save_key_replay) {
+        if (record->event.pressed) {
+            save_key_down  = sysmon_stamp();
+            save_key_fired = false;
+        } else if (save_key_down) {
+            save_key_tap  = !save_key_fired;
+            save_key_down = 0;
+        }
+        return false;
+    }
     if (record->event.pressed) {
         boot_dismissed = true;
         boot_playing   = false;
@@ -2470,6 +2507,20 @@ void housekeeping_task_user(void) {
     }
     static bool usb_ever_up = false;
     if (usb_up_since) usb_ever_up = true;
+    // The save key: held long enough, it saves; let go sooner, it was a tap,
+    // played back here, outside QMK's handling of the release.
+    if (save_key_down && !save_key_fired && timer_elapsed32(save_key_down) >= SYSMON_SAVE_HOLD_MS) {
+        save_key_fired = true;
+        sysmon_trace_save_start(SYSMON_SAVED_BY_KEY);
+    }
+    if (save_key_tap) {
+        save_key_tap    = false;
+        save_key_replay = true;
+        action_exec(MAKE_KEYEVENT(SYSMON_SAVE_KEY_ROW, SYSMON_SAVE_KEY_COL, true));
+        action_exec(MAKE_KEYEVENT(SYSMON_SAVE_KEY_ROW, SYSMON_SAVE_KEY_COL, false));
+        save_key_replay = false;
+    }
+    sysmon_trace_save_step(usb_up_since && timer_elapsed32(usb_up_since) >= BOOT_SAVE_SETTLE_MS);
     // (With nothing drawn nothing plays, so a replay started meanwhile
     // counts as over: its pick is saved too.)
     if (boot_counter_dirty && (!boot_playing || sysmon_dark())) {
@@ -2879,6 +2930,141 @@ static void sysmon_trace_frame(void) {
     if (sysmon_trace_count < SYSMON_TRACE_FRAMES) sysmon_trace_count++;
 }
 
+// --- saved trace ---
+
+// Holding the save key (see pre_process_record_user) copies the ring, oldest
+// frame first, to one of SYSMON_SAVE_SLOTS slots in the flash, just below the
+// EEPROM's wear-leveling area and far above the firmware. A copy survives
+// power-off and reflashing (a UF2 only rewrites the blocks it carries). Each
+// save goes to the slot after the newest, so the last four are kept. TRACE 4
+// reads them out.
+//
+// Erasing and programming the flash stops the MCU (interrupts off: its code
+// runs from that flash), so the work is spread over housekeeping passes: one
+// 4 KiB sector erase (~45 ms) or four 256-byte pages (~3 ms) a pass, about a
+// second in all, and only once USB has settled, as for the boot counter (or
+// after SYSMON_SAVE_WAIT_MS without it). The ring stays frozen meanwhile and
+// the header goes last, so a save cut short leaves no valid slot. Done, the
+// whole pad flashes white once.
+#define SYSMON_SAVE_SLOTS 4
+#define SYSMON_SAVE_SLOT_SIZE (64UL * 1024)
+#define SYSMON_SAVE_BASE ((uint32_t)(WEAR_LEVELING_RP2040_FLASH_BASE) - SYSMON_SAVE_SLOTS * SYSMON_SAVE_SLOT_SIZE) // flash offset
+#define SYSMON_SAVE_MAGIC 0x31435254UL // "TRC1"
+#define SYSMON_SAVE_WAIT_MS 5000
+_Static_assert(FLASH_PAGE_SIZE + SYSMON_TRACE_FRAMES * sizeof(sysmon_trace_frame_t) <= SYSMON_SAVE_SLOT_SIZE, "a saved trace fits its slot");
+_Static_assert(SYSMON_SAVE_BASE % FLASH_SECTOR_SIZE == 0, "slots start on a sector");
+
+typedef struct {
+    uint32_t magic;      // SYSMON_SAVE_MAGIC (erased flash reads 0xFFFFFFFF)
+    uint32_t seq;        // saves so far, this one included: the highest is the newest
+    uint32_t saved_at;   // ms since power-up when it was saved
+    uint32_t boot;       // the power-up counter: which start of the pad it was
+    uint16_t frames;     // frames after the header, oldest first
+    uint8_t  frame_size; // sizeof(sysmon_trace_frame_t)
+    uint8_t  why;        // SYSMON_SAVED_BY_*
+} sysmon_save_hdr_t;
+
+// The image's end in flash (code and constants, then .data's initial values).
+extern uint8_t __textdata_base__[], __data_base__[], __data_end__[];
+
+static uint8_t           save_stage; // 0 idle, 1 erasing, 2 writing the frames, 3 the header
+static uint8_t           save_slot;
+static uint16_t          save_step;              // sector or page
+static uint16_t          save_head, save_count;  // the ring as it was frozen
+static bool              save_was_frozen;        // (by the host: it stays frozen)
+static uint32_t          save_t0;
+static sysmon_save_hdr_t save_hdr;
+static uint32_t          save_done_at; // when the last save finished, for the flash (0: none)
+
+static const sysmon_save_hdr_t *sysmon_save_hdr(uint8_t slot) {
+    return (const sysmon_save_hdr_t *)(XIP_BASE + SYSMON_SAVE_BASE + (uint32_t)slot * SYSMON_SAVE_SLOT_SIZE);
+}
+
+static void sysmon_trace_save_start(uint8_t why) {
+    if (save_stage) return; // one at a time
+    // never over the firmware (it would have to grow nine-fold)
+    if ((uint32_t)__textdata_base__ + (uint32_t)(__data_end__ - __data_base__) > XIP_BASE + SYSMON_SAVE_BASE) return;
+    uint32_t seq    = 0;
+    int8_t   newest = -1;
+    for (uint8_t s = 0; s < SYSMON_SAVE_SLOTS; s++) {
+        const sysmon_save_hdr_t *h = sysmon_save_hdr(s);
+        if (h->magic == SYSMON_SAVE_MAGIC && h->seq >= seq) {
+            seq    = h->seq;
+            newest = (int8_t)s;
+        }
+    }
+    save_slot           = (uint8_t)((newest + 1) % SYSMON_SAVE_SLOTS);
+    save_was_frozen     = sysmon_trace_frozen;
+    sysmon_trace_frozen = true;
+    save_head           = sysmon_trace_head;
+    save_count          = sysmon_trace_count;
+    save_hdr            = (sysmon_save_hdr_t){
+        .magic = SYSMON_SAVE_MAGIC, .seq = seq + 1, .saved_at = timer_read32(), .boot = boot_counter, .frames = save_count, .frame_size = sizeof(sysmon_trace_frame_t), .why = why};
+    save_step  = 0;
+    save_stage = 1;
+    save_t0    = timer_read32();
+}
+
+static void sysmon_flash_program(uint32_t offset, const uint8_t *page) {
+    uint32_t irq = save_and_disable_interrupts();
+    flash_range_program(offset, page, FLASH_PAGE_SIZE);
+    restore_interrupts(irq);
+}
+
+// One step of a save, from housekeeping.
+static void sysmon_trace_save_step(bool usb_settled) {
+    if (!save_stage) return;
+    if (!usb_settled && timer_elapsed32(save_t0) < SYSMON_SAVE_WAIT_MS) return;
+    uint32_t       base  = SYSMON_SAVE_BASE + (uint32_t)save_slot * SYSMON_SAVE_SLOT_SIZE;
+    uint32_t       bytes = (uint32_t)save_count * sizeof(sysmon_trace_frame_t);
+    static uint8_t page[FLASH_PAGE_SIZE]; // the source must not be the flash itself
+    if (save_stage == 1) {
+        uint32_t irq = save_and_disable_interrupts();
+        flash_range_erase(base + (uint32_t)save_step * FLASH_SECTOR_SIZE, FLASH_SECTOR_SIZE);
+        restore_interrupts(irq);
+        if (++save_step * (uint32_t)FLASH_SECTOR_SIZE >= FLASH_PAGE_SIZE + bytes) {
+            save_stage = 2;
+            save_step  = 0;
+        }
+        return;
+    }
+    if (save_stage == 2) {
+        for (uint8_t k = 0; k < 4 && (uint32_t)save_step * FLASH_PAGE_SIZE < bytes; k++, save_step++) {
+            for (uint16_t b = 0; b < FLASH_PAGE_SIZE; b++) {
+                uint32_t pos = (uint32_t)save_step * FLASH_PAGE_SIZE + b;
+                uint8_t  v   = 0xFF;
+                if (pos < bytes) {
+                    uint16_t n = (uint16_t)(pos / sizeof(sysmon_trace_frame_t));
+                    uint16_t i = (uint16_t)((save_head + SYSMON_TRACE_FRAMES - save_count + n) % SYSMON_TRACE_FRAMES);
+                    v          = ((const uint8_t *)&sysmon_trace[i])[pos % sizeof(sysmon_trace_frame_t)];
+                }
+                page[b] = v;
+            }
+            sysmon_flash_program(base + FLASH_PAGE_SIZE + (uint32_t)save_step * FLASH_PAGE_SIZE, page);
+        }
+        if ((uint32_t)save_step * FLASH_PAGE_SIZE >= bytes) save_stage = 3;
+        return;
+    }
+    memset(page, 0xFF, sizeof(page)); // the header, last
+    memcpy(page, &save_hdr, sizeof(save_hdr));
+    sysmon_flash_program(base, page);
+    save_stage          = 0;
+    sysmon_trace_frozen = save_was_frozen;
+    save_done_at        = sysmon_stamp();
+}
+
+// The answer to a save, drawn over whatever shows: once it is done, every key
+// flashes white for SYSMON_SAVE_FLASH_MS.
+#define SYSMON_SAVE_FLASH_MS 150
+static void sysmon_save_flash(void) {
+    if (!save_done_at) return;
+    if (timer_elapsed32(save_done_at) >= SYSMON_SAVE_FLASH_MS) {
+        save_done_at = 0;
+        return;
+    }
+    rgb_matrix_set_color_all(255, 255, 255);
+}
+
 // TRACE: p = data[3..]; layout in the protocol notes.
 static void sysmon_trace_cmd(uint8_t *p) {
     if (p[0] == 2) {
@@ -2895,10 +3081,24 @@ static void sysmon_trace_cmd(uint8_t *p) {
         }
         return;
     }
-    if (p[0] == 1) sysmon_trace_frozen = true;
-    if (p[0] == 3) {
-        sysmon_trace_count  = 0;
-        sysmon_trace_frozen = false;
+    if (p[0] == 4) {
+        uint32_t off = (uint32_t)p[1] | ((uint32_t)p[2] << 8) | ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 24);
+        for (uint8_t k = 0; k < 24; k++, off++) {
+            p[5 + k] = off < SYSMON_SAVE_SLOTS * SYSMON_SAVE_SLOT_SIZE ? *(const uint8_t *)(XIP_BASE + SYSMON_SAVE_BASE + off) : 0xFF;
+        }
+        return;
+    }
+    if (p[0] == 5) sysmon_trace_save_start(SYSMON_SAVED_BY_HOST);
+    if (save_stage) {
+        // the ring is being saved: change only what it goes back to after
+        if (p[0] == 1) save_was_frozen = true;
+        if (p[0] == 3) save_was_frozen = false;
+    } else {
+        if (p[0] == 1) sysmon_trace_frozen = true;
+        if (p[0] == 3) {
+            sysmon_trace_count  = 0;
+            sysmon_trace_frozen = false;
+        }
     }
     p[5]  = (uint8_t)sysmon_trace_count;
     p[6]  = (uint8_t)(sysmon_trace_count >> 8);
@@ -2906,6 +3106,9 @@ static void sysmon_trace_cmd(uint8_t *p) {
     p[8]  = sysmon_trace_frozen;
     p[9]  = (uint8_t)SYSMON_TRACE_FRAMES;
     p[10] = (uint8_t)(SYSMON_TRACE_FRAMES >> 8);
+    p[11] = SYSMON_SAVE_SLOTS;
+    p[12] = save_stage != 0;
+    p[13] = (uint8_t)(SYSMON_SAVE_SLOT_SIZE / 1024);
 }
 
 // Display priority, highest first:
@@ -3082,6 +3285,7 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
         sysmon_gcc_flushed  = false;
         sysmon_frame_effect = sysmon_indicators();
         if (!sysmon_frame_effect) {
+            sysmon_save_flash(); // kept with the frame
             for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) sysmon_frame[i] = sysmon_led_get(i);
         } else if (!was_effect) {
             // handing over to the effect: from black, not the last bars frame
@@ -3100,6 +3304,7 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
             for (uint8_t d = 0; d < DRIVER_COUNT; d++) g_pwm_buffer_update_required[d] = false;
         }
     }
+    if (sysmon_frame_effect) sysmon_save_flash(); // over each chunk the effect drew
     if (calls < UINT8_MAX) calls++;
     if (!committed && (early || led_max >= RGB_MATRIX_LED_COUNT)) {
         committed = true;

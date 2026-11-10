@@ -24,6 +24,11 @@
                                    times; the recording keeps the last ~13 s) and
                                    the fade into the bars after it. Writes a CSV,
                                    a summary and a timeline PNG to host/traces/
+  bootanim_preview.py trace saved [N|last]
+                                   list the traces saved in the macropad's flash
+                                   (holding the top-left key for a second saves
+                                   one), or write save N's files like trace does
+  bootanim_preview.py trace save   save one from here, as the key does
   bootanim_preview.py text TEXT [TEXT ...] [options]
                                    show text; several texts play one after another
                                    (A/B testing). See `text --help`.
@@ -168,9 +173,25 @@ def trace_cmd(dev, sub, offset=0):
     dev.write(b"\x00" + bytes([0x07, 0x42, 0x12]) + payload + bytes(29 - len(payload)))
     for _ in range(50):
         rep = bytes(dev.read(32, 100))
-        if rep[:4] == bytes([0x07, 0x42, 0x12, sub]) and (sub != 2 or rep[4:8] == payload[1:5]):
+        if rep[:4] == bytes([0x07, 0x42, 0x12, sub]) and (sub not in (2, 4) or rep[4:8] == payload[1:5]):
             return rep
     return None
+
+
+def trace_read(dev, sub, start, total):
+    """Read total bytes from start, 24 at a time (sub 2: the frozen ring, 4: the saved traces)."""
+    data, off = bytearray(), start
+    while off < start + total:
+        rep = None
+        for _ in range(3):
+            rep = trace_cmd(dev, sub, off)
+            if rep is not None:
+                break
+        if rep is None:
+            sys.exit(f"trace read failed at byte {off}")
+        data += rep[8:32]
+        off += 24
+    return bytes(data[:total])
 
 
 def trace_download(dev):
@@ -181,20 +202,14 @@ def trace_download(dev):
     count, size = st[8] | st[9] << 8, st[10]
     if size != TRACE_FRAME:
         sys.exit(f"unexpected trace frame size {size}")
-    total, data, off = count * size, bytearray(), 0
     started = time.monotonic()
-    while off < total:
-        rep = None
-        for _ in range(3):
-            rep = trace_cmd(dev, 2, off)
-            if rep is not None:
-                break
-        if rep is None:
-            sys.exit(f"trace read failed at byte {off}")
-        data += rep[8:32]
-        off += 24
-    data = data[:total]
-    print(f"read {count} frames ({total} bytes) in {time.monotonic() - started:.1f} s")
+    data = trace_read(dev, 2, 0, count * size)
+    print(f"read {count} frames ({len(data)} bytes) in {time.monotonic() - started:.1f} s")
+    return trace_frames(data, count, size)
+
+
+def trace_frames(data, count, size=TRACE_FRAME):
+    """Frames from their bytes, oldest first; t in ms from the first, unwrapped."""
     frames, t, last = [], 0, None
     for k in range(count):
         b = data[k * size:(k + 1) * size]
@@ -442,8 +457,103 @@ def fade_checks(frames, a, b, light):
                if notes else []))
 
 
+SAVE_HEADER = struct.Struct("<IIIIHBB")  # magic, save number, ms after power-up, power-up counter, frames, frame size, why
+SAVE_MAGIC = 0x31435254  # "TRC1"
+SAVED_BY = {1: "the save key", 2: "the laptop (trace save)"}
+
+
+def saved_list(dev):
+    """The traces saved in the macropad's flash, oldest save first."""
+    st = trace_cmd(dev, 0)
+    if st is None:
+        sys.exit("no TRACE answer (firmware without the LED trace?)")
+    slots, slot_size = st[14], st[16] * 1024
+    if not slots:
+        sys.exit("this firmware can't save traces (flash the current one)")
+    out = []
+    for slot in range(slots):
+        magic, seq, at, boot, frames, size, why = SAVE_HEADER.unpack(
+            trace_read(dev, 4, slot * slot_size, SAVE_HEADER.size))
+        if magic == SAVE_MAGIC:
+            out.append({"slot": slot, "base": slot * slot_size, "seq": seq, "at": at, "boot": boot,
+                        "frames": frames, "size": size, "why": why})
+    return sorted(out, key=lambda e: e["seq"]), st
+
+
+def saved_line(e):
+    return (f"save {e['seq']}: {e['frames']} frames, saved {e['at'] / 1000:.1f} s after power-up "
+            f"(power-up counter {e['boot']}), by {SAVED_BY.get(e['why'], e['why'])}")
+
+
+def saved_main(dev, argv):
+    if argv[:1] == ["save"]:
+        st = trace_cmd(dev, 5)
+        if st is None or not st[14]:
+            sys.exit("this firmware can't save traces (flash the current one)")
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            st = trace_cmd(dev, 0)
+            if st is not None and not st[15]:
+                break
+        else:
+            sys.exit("the save didn't finish within 15 s")
+        saves, _ = saved_list(dev)
+        print("saved:", saved_line(saves[-1]) if saves else "?")
+        return
+    saves, _ = saved_list(dev)  # "saved", with or without N
+    if len(argv) < 2:
+        if not saves:
+            print("no saved traces (hold the top-left key for a second to save one)")
+        for e in saves:
+            print(saved_line(e))
+        return
+    want = argv[1]
+    pick = saves[-1:] if want == "last" else [e for e in saves if str(e["seq"]) == want]
+    if not pick:
+        sys.exit(f"no save {want} (trace saved lists them)")
+    e = pick[0]
+    if e["size"] != TRACE_FRAME:
+        sys.exit(f"unexpected trace frame size {e['size']}")
+    data = trace_read(dev, 4, e["base"] + 256, e["frames"] * e["size"])
+    frames = trace_frames(data, e["frames"], e["size"])
+    if not frames:
+        sys.exit("that save holds no frames")
+    # when the frames were, after power-up: the newest one was just before the save
+    raw_last = data[-e["size"]] | data[-e["size"] + 1] << 8
+    last = e["at"] - ((e["at"] - raw_last) % 65536)
+    first = last - (frames[-1]["t"] - frames[0]["t"])
+    trace_write(frames, f"saved{e['seq']}", [
+        saved_line(e),
+        f"its frames run from {first / 1000:.2f} s to {last / 1000:.2f} s after power-up "
+        f"(t below is ms from the first)",
+    ])
+
+
+def trace_write(frames, label, notes=()):
+    """Write a trace's CSV, summary and PNG to host/traces/, and print the summary."""
+    os.makedirs(TRACE_DIR, exist_ok=True)
+    base = os.path.join(TRACE_DIR, time.strftime("trace-%Y%m%d-%H%M%S") + (f"-{label}" if label else ""))
+    with open(base + ".csv", "w", encoding="utf-8") as f:
+        keys = [f"r{r}c{c}_{ch}" for r in range(6) for c in range(4) for ch in "rgb"]
+        f.write(",".join(["frame", "t_ms", "gcc", "display", "gcc_change", "fading"] + keys) + "\n")
+        t0 = frames[0]["t"]
+        for i, fr in enumerate(frames):
+            f.write(",".join(map(str, [i, fr["t"] - t0, fr["gcc"], MODES.get(fr["mode"], fr["mode"]),
+                                       fr["change"], int(fr["fade"])] + list(fr["px"]))) + "\n")
+    summary = "\n".join(list(notes) + [trace_summary(frames)])
+    with open(base + ".txt", "w", encoding="utf-8") as f:
+        f.write(summary + "\n")
+    trace_png(frames, base + ".png")
+    print(summary)
+    print(f"saved {base}.csv / .txt / .png")
+
+
 def trace_main(dev, argv, speed=None):
     label = ""
+    if argv[:1] in (["saved"], ["save"]):
+        saved_main(dev, argv)
+        return
     if argv[:1] == ["--render"]:  # redraw the PNG (and summary) of saved traces
         for path in argv[1:]:
             frames = trace_load_csv(path)
@@ -469,21 +579,7 @@ def trace_main(dev, argv, speed=None):
     trace_cmd(dev, 3)  # record again
     if not frames:
         sys.exit("no frames recorded")
-    os.makedirs(TRACE_DIR, exist_ok=True)
-    base = os.path.join(TRACE_DIR, time.strftime("trace-%Y%m%d-%H%M%S") + (f"-{label}" if label else ""))
-    with open(base + ".csv", "w", encoding="utf-8") as f:
-        keys = [f"r{r}c{c}_{ch}" for r in range(6) for c in range(4) for ch in "rgb"]
-        f.write(",".join(["frame", "t_ms", "gcc", "display", "gcc_change", "fading"] + keys) + "\n")
-        t0 = frames[0]["t"]
-        for i, fr in enumerate(frames):
-            f.write(",".join(map(str, [i, fr["t"] - t0, fr["gcc"], MODES.get(fr["mode"], fr["mode"]),
-                                       fr["change"], int(fr["fade"])] + list(fr["px"]))) + "\n")
-    summary = trace_summary(frames)
-    with open(base + ".txt", "w", encoding="utf-8") as f:
-        f.write(summary + "\n")
-    trace_png(frames, base + ".png")
-    print(summary)
-    print(f"saved {base}.csv / .txt / .png")
+    trace_write(frames, label)
 
 
 def text_main(dev, argv):
