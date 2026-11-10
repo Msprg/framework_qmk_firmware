@@ -1,0 +1,3 @@
+# The manual's figures (figures.py writes them). QMK's root .gitignore
+# excludes *.svg; these are sources, not build output.
+!*.svg
