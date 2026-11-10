@@ -1,0 +1,73 @@
+# The user manual (../manual) as a website, built with Material for MkDocs and
+# published to GitHub Pages by .github/workflows/manual-site.yml.
+#
+# The markdown stays the single source: GitHub renders the same files in the
+# repo, and hooks.py smooths over the few differences.
+#
+# Preview locally, from this folder (any Python, or uv):
+#   pip install -r requirements.txt && mkdocs serve
+#   uv run --no-project --with-requirements requirements.txt mkdocs serve
+
+site_name: FW16 Macropad Sysmon
+site_description: User manual for the Framework Laptop 16 RGB Macropad system monitor
+site_url: https://msprg.github.io/framework_qmk_firmware/
+repo_url: https://github.com/Msprg/framework_qmk_firmware
+repo_name: Msprg/framework_qmk_firmware
+edit_uri: edit/macropad-sysmon/keyboards/framework/macropad/keymaps/sysmon/manual/
+
+docs_dir: ../manual
+exclude_docs: |
+  tools/
+  img/*.py
+  img/.gitignore
+
+theme:
+  name: material
+  icon:
+    logo: material/keyboard
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Follow the system
+  features:
+    - navigation.footer
+    - navigation.top
+    - toc.follow
+    - search.highlight
+    - search.suggest
+    - content.action.edit
+    - content.code.copy
+
+hooks:
+  - hooks.py
+
+markdown_extensions:
+  - tables
+  - admonition
+  - attr_list
+  - toc:
+      permalink: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+validation:
+  links:
+    not_found: warn
+    anchors: warn
+    absolute_links: warn
+    unrecognized_links: warn

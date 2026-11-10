@@ -1,0 +1,83 @@
+# The sysmon user manual as a website: builds
+# keyboards/framework/macropad/keymaps/sysmon/manual with Material for MkDocs
+# (docs-site/mkdocs.yml) and publishes it to GitHub Pages. Pull requests into
+# macropad-sysmon get the build as a check, without publishing.
+name: Manual site
+
+on:
+  push:
+    branches: [macropad-sysmon]
+    paths:
+      - keyboards/framework/macropad/keymaps/sysmon/**
+      - .github/workflows/manual-site.yml
+  pull_request:
+    branches: [macropad-sysmon]
+    paths:
+      - keyboards/framework/macropad/keymaps/sysmon/**
+      - .github/workflows/manual-site.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-site-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SYSMON: keyboards/framework/macropad/keymaps/sysmon
+  NO_MKDOCS_2_WARNING: "1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: keyboards/framework/macropad/keymaps/sysmon/docs-site/requirements.txt
+
+      - name: Install MkDocs
+        run: pip install -r "$SYSMON/docs-site/requirements.txt"
+
+      # Code changes can leave the manual behind for up to a week (the weekly
+      # catch-up fixes it), so these two only warn.
+      - name: Check names and links against the sources
+        run: |
+          python "$SYSMON/manual/tools/check_manual.py" \
+            || echo "::warning::check_manual.py found problems; the weekly manual catch-up will fix them"
+
+      - name: Check the generated settings tables
+        run: |
+          python "$SYSMON/manual/tools/settings_tables.py"
+          git diff --quiet -- "$SYSMON/manual/06-settings.md" \
+            || echo "::warning::06-settings.md's tables are behind the code; the weekly manual catch-up will regenerate them"
+          git checkout -- "$SYSMON/manual/06-settings.md"
+
+      # Broken links or anchors inside the manual fail the build; the site
+      # keeps its last good version.
+      - name: Build
+        run: mkdocs build --strict -f "$SYSMON/docs-site/mkdocs.yml" -d "$RUNNER_TEMP/site"
+
+      - name: Upload
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

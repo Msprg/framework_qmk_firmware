@@ -93,7 +93,7 @@ It's for reporting a display glitch seen at a time when no tool on the laptop
 can run, such as while Windows boots. The pad keeps the last four saves,
 through power-off and reflashing, and a developer tool on the laptop reads
 them out later (`bootanim_preview.py trace saved`, see the technical
-[readme](../readme.md)). It works in both layers, whatever the keymap. The
+[readme](https://github.com/Msprg/framework_qmk_firmware/blob/macropad-sysmon/keyboards/framework/macropad/keymaps/sysmon/readme.md)). It works in both layers, whatever the keymap. The
 pad records only while its lights are on, so a save made with the lights off
 holds nothing from the dark stretch.
 

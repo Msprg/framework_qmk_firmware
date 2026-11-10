@@ -1,0 +1,6 @@
+# The user manual's site (mkdocs.yml). Pinned: Material for MkDocs is in
+# maintenance mode (end of life May 2027); its successor Zensical reads the
+# same mkdocs.yml, so moving later means changing the build command.
+mkdocs==1.6.1
+mkdocs-material==9.8.1
+pymdown-extensions==13.0

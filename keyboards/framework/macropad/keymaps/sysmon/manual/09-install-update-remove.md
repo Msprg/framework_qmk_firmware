@@ -19,7 +19,7 @@
 The installer is `FW16-Sysmon-Setup-<version>.exe`. No release is published on
 GitHub. It's built from this repository with one command,
 `host\packaging\build.ps1`, which puts it in `host\dist\`. See
-[Building the installer](../readme.md#building-the-installer) in the technical
+[Building the installer](https://github.com/Msprg/framework_qmk_firmware/blob/macropad-sysmon/keyboards/framework/macropad/keymaps/sysmon/readme.md#building-the-installer) in the technical
 readme. If someone built it for you, that file is all you need. It bundles
 everything, so no Python or other downloads are required.
 

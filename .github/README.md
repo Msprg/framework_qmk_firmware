@@ -14,7 +14,7 @@ sends.
 
 ## User manual
 
-**[Read the manual →](/keyboards/framework/macropad/keymaps/sysmon/manual/README.md)**
+**[Read the manual online →](https://msprg.github.io/framework_qmk_firmware/)**, or [here in the repository](/keyboards/framework/macropad/keymaps/sysmon/manual/README.md).
 
 1. [Reading the pad](/keyboards/framework/macropad/keymaps/sysmon/manual/01-reading-the-pad.md): every row, the bars, the brightness, the rhythms
 2. [Limits and messages](/keyboards/framework/macropad/keymaps/sysmon/manual/02-limits-and-messages.md): why a row breathes, what the scrolling text means, the replay key

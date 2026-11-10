@@ -81,7 +81,7 @@ python limitreport.py C:\ProgramData\FW16Sysmon\limitlog.sqlite --days 7 --csv C
 ```
 
 The script is
-[`host/limitreport.py`](../host/limitreport.py) in this repository.
+[`host/limitreport.py`](https://github.com/Msprg/framework_qmk_firmware/blob/macropad-sysmon/keyboards/framework/macropad/keymaps/sysmon/host/limitreport.py) in this repository.
 
 ### Reading it
 

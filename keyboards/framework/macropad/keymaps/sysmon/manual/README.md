@@ -98,7 +98,7 @@ Two keys worth remembering, both with **NumLock off**:
 ## Beyond this manual
 
 The technical reference for the firmware and host is the sysmon
-[readme](../readme.md). It covers the wire protocol, building the firmware and
+[readme](https://github.com/Msprg/framework_qmk_firmware/blob/macropad-sysmon/keyboards/framework/macropad/keymaps/sysmon/readme.md). It covers the wire protocol, building the firmware and
 the installer, running the host from source, and the animation preview and LED
 trace tools.
 
@@ -107,14 +107,21 @@ trace tools.
 Three scripts keep it in step with the code. All are standard-library Python
 3.8+, and none imports the host.
 
-- [`img/figures.py`](img/figures.py) redraws the figures.
-- [`tools/settings_tables.py`](tools/settings_tables.py) regenerates the
+- [`img/figures.py`](https://github.com/Msprg/framework_qmk_firmware/blob/macropad-sysmon/keyboards/framework/macropad/keymaps/sysmon/manual/img/figures.py) redraws the figures.
+- [`tools/settings_tables.py`](https://github.com/Msprg/framework_qmk_firmware/blob/macropad-sysmon/keyboards/framework/macropad/keymaps/sysmon/manual/tools/settings_tables.py) regenerates the
   settings and `[cli]` tables in [Settings](06-settings.md) from
   `host/config.py` and `host/fw16_sysmon.py`. Run it after adding or changing
   a setting.
-- [`tools/check_manual.py`](tools/check_manual.py) checks that every link and
+- [`tools/check_manual.py`](https://github.com/Msprg/framework_qmk_firmware/blob/macropad-sysmon/keyboards/framework/macropad/keymaps/sysmon/manual/tools/check_manual.py) checks that every link and
   anchor resolves, and that every setting, flag and Start-menu item named
   here exists in the sources.
+
+The website at <https://msprg.github.io/framework_qmk_firmware/> is built from these same files with Material for
+MkDocs (configured in
+[`docs-site/`](https://github.com/Msprg/framework_qmk_firmware/tree/macropad-sysmon/keyboards/framework/macropad/keymaps/sysmon/docs-site)).
+A GitHub workflow republishes it on every push to `macropad-sysmon`.
+Keep links to anything outside this folder as full GitHub URLs, so they
+work in both places.
 
 Coding sessions don't update the manual as they go. A weekly catch-up job
 reviews the commits made since the bookmark below, updates the chapters
