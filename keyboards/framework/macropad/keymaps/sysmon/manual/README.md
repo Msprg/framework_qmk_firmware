@@ -135,4 +135,4 @@ reviews the commits made since the bookmark below, updates the chapters
 they affect, moves the bookmark, and opens a pull request. The bookmark is
 the last `macropad-sysmon` commit the manual reflects:
 
-<!-- manual-synced-to: cb28343001 -->
+<!-- manual-synced-to: 1cc14de61a -->
