@@ -163,7 +163,7 @@ bright=96
 | `bright=` | The pad brightness sent (0-255), from the screen brightness |
 | `lvl=` | The bar's length, 0 (empty) to 255 (full) |
 | `val=` | The row's base brightness (80 = the dim idle battery or sleep marker) |
-| `hue=` | Its colour, a QMK hue (0 red, 36 gold, 85 green, 128 cyan, 140 teal) |
+| `hue=` | Its colour, a QMK hue (0 red, 16 orange, 36 gold, 85 green, 128 cyan, 140 teal) |
 | `env=breathe@48` / `env=blink@32` | The row breathes or blinks, with its period in 32 ms units (48 = about 1.5 s) |
 | `ovl=risex2up` / `ovl=fallx1down` | Battery pulse: charging (`rise`) or draining (`fall`), how many keys animate, and in which direction |
 | `ghost=` | The second bar behind the main one: the NPU on the iGPU row, the sleep marker (`right`) on the dGPU row |
@@ -172,7 +172,7 @@ bright=96
 | `clock[...]` | The busy cores' fastest clock, and the busiest core's load. `HELD` means held at base clock. |
 | `-> stapm(1.00 35.0W)` | The limit the row breathes for: its name, how close it is (1.00 = at the limit), and its value. `None` means no limit. |
 | `dgpu[nvml]` | Where the dGPU readings come from (`nvml` = the NVIDIA driver, `pdh` = Windows counters) |
-| `power=D3cold for 412s` | The dGPU's power state, and how long it has been off |
+| `power=D3cold for 412s` | The dGPU's power state (`D0` on, `D3hot` light sleep, `D3cold` off), and how long it has been in that sleep state without a break |
 
 A line `Message to the pad: CPU STAPM 35W` appears when a limit is named.
 

@@ -185,6 +185,15 @@ Something wakes the dGPU briefly now and then. Each wake starts the count
 over. That's by design: the marker shows how long the card *really* stayed
 off. Restarting the host also wakes it once.
 
+One orange key that turns into one teal key a few seconds later is normal:
+that's the card's light sleep before it powers off, not a wake.
+
+### The sleep marker stays orange and keeps growing
+
+The dGPU is asleep (D3hot), but something keeps its connection, the PCIe
+link, up, so it never powers off. It saves less than when it's off. The
+self-test's *dGPU power state* line shows the state as well.
+
 ### I changed a setting and nothing happened
 
 - **The service wasn't restarted.** Start menu → **Restart the service**.
@@ -225,7 +234,7 @@ open, or restart Windows, then run Setup again.
 | **sysmon firmware** | No answer: not sysmon firmware. *Older sysmon firmware*: from before this host version. *Lighting switched off*: the lights-off key. | **Flash firmware onto the macropad**, or switch the lights on (NumLock off, top-left key) |
 | **AMD APU power limits** | ryzenadj found but can't start (usually the driver is blocked), or its files are missing | See *Ring0 driver*. Missing files: reinstall. Shows `--` on Intel. |
 | **Ring0 driver** | Memory Integrity is on, which blocks the sensor driver | Your choice. See [Memory Integrity](10-faq-and-glossary.md#memory-integrity). |
-| **dGPU power state** | Information only: `D0` on, `D3hot` light sleep, `D3cold` off | n/a |
+| **dGPU power state** | Information only: `D0` on, `D3hot` light sleep (the orange marker), `D3cold` off (the teal marker) | n/a |
 | **NVIDIA dGPU** | The driver didn't answer. *Powered down*: normal on hybrid graphics, as the service connects when the card wakes. | Repair the NVIDIA driver if it says init failed. |
 | **LibreHardwareMonitor lib** | The secondary sensor source can't read the processor | On AMD, ryzenadj covers it. Same driver caveat. |
 | **framework_tool (EC)** | Not installed, or not elevated | `winget install FrameworkComputer.framework_tool`. Optional, but it gives the battery charge-limit scaling and a reliable temperature. |

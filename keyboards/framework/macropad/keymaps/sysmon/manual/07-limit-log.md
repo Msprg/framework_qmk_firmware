@@ -32,7 +32,12 @@ The service writes it all the time, from the same readings that drive the pad,
   and every 30 seconds otherwise. Each one records:
   - **power:** AC or battery, whether the battery is helping the charger, the
     USB-C charger's contract (port, volts, amps, watts), and the battery's
-    charge and current;
+    charge and current. Only a port the laptop actually draws power from
+    counts: a dock or monitor can hold a contract it isn't drawing on. The
+    rear USB-C port on the Framework 16's graphics module isn't among the
+    ports `framework_tool` lists, so with the charger there the contract stays
+    empty (`-` under `PD W` in the report), and the sample notes that the
+    charger is on an unlisted port (`pd_unlisted` in the CSV export);
   - **Windows:** the power mode (best efficiency / balanced / best
     performance), the power plan, Energy Saver;
   - **thermals:** every temperature sensor of the embedded controller, and
@@ -91,7 +96,8 @@ numbers will differ.
 ```text
 Limit log   C:\ProgramData\FW16Sysmon\limitlog.sqlite  (41.3 MB)
 Machine     Laptop 16 (AMD Ryzen AI 300 Series), AMD Ryzen AI 9 HX 370 w/ Radeon 890M, BIOS 03.05 (01/15/2026)
-Window      since 2026-03-01 00:00; samples 2026-03-01 08:12 .. 2026-03-08 22:40
+Window      since 2026-03-01 22:45; samples 2026-03-01 22:45 .. 2026-03-08 22:40
+            (the times from the tallies cover whole days, from 2026-03-01 00:00; episodes and samples start at the window)
 Rows        96210 samples, 214 episodes, 905 events
 
 Observed 61.5 h (the service running, the machine awake)
@@ -100,7 +106,11 @@ Observed 61.5 h (the service running, the machine awake)
 ```
 
 **The header** says which file, which machine, which time window, and how much
-data. **Observed** is the time the service ran with the laptop awake, split by
+data. With a window (`--report-days`), the times that come from the daily
+tallies (Observed, and each limit's primary and bound time) cover whole days,
+from midnight of the window's first day, so they can count up to a day more
+than the window. Episodes, samples and events start exactly at the window.
+**Observed** is the time the service ran with the laptop awake, split by
 power source and Windows power mode. All the percentages below are relative
 to it.
 

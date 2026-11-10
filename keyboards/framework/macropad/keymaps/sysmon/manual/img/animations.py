@@ -140,7 +140,7 @@ def engine():
 BASE = dict(has_batt=True, ac=True, charging=False, discharging=False, raw_pct=80,
             cap=80, rate_w=0, cpu=30, cpu_limit=None, mem=55, raw_mem=55, igpu=12,
             npu=0, dgpu_present=True, dgpu=0, dgpu_limit=None, ghost_flags=True,
-            dgpu_off_s=1000, has_temp=True, temp_c=55, raw_temp=55)
+            dgpu_power="D3cold", dgpu_sleep_s=1000, has_temp=True, temp_c=55, raw_temp=55)
 
 
 def m_of(**kw):
@@ -505,14 +505,25 @@ def fig_npu(exe):
 def fig_dgpu_sleep(exe):
     warm, dur = 2000, 15000
     e = engine()
-    plan = [(0, 2000, dict(dgpu=40, dgpu_off_s=None), "Awake, 40 % busy", "the green usage bar"),
-            (2000, 3200, dict(dgpu=0, dgpu_off_s=None), "Idle", "still powered for a few seconds"),
-            (3200, 5000, dict(dgpu=0, dgpu_off_s=0), "Powered off (D3cold)", "the last key glows dim teal"),
-            (5000, 7000, dict(dgpu=0, dgpu_off_s=900), "Off for 15 minutes", "a second key"),
-            (7000, 9000, dict(dgpu=0, dgpu_off_s=1800), "Off for 30 minutes", "a third key"),
-            (9000, 11000, dict(dgpu=0, dgpu_off_s=2700), "Off for 45 minutes or more", "all four keys"),
-            (11000, 12000, dict(dgpu=2, dgpu_off_s=None), "Something wakes it", "even for a second: the marker fades"),
-            (12000, 15000, dict(dgpu=0, dgpu_off_s=0), "Off again", "the count starts over from one key")]
+    awake = dict(dgpu_power="D0", dgpu_sleep_s=None)
+    # (start, end, machine state): the dGPU's power state as PnP reports it
+    plan = [(0, 2000, dict(awake, dgpu=40)),
+            (2000, 3500, dict(dgpu=0, dgpu_power="D3hot", dgpu_sleep_s=0)),
+            (3500, 5000, dict(dgpu=0, dgpu_power="D3cold", dgpu_sleep_s=0)),
+            (5000, 7000, dict(dgpu=0, dgpu_power="D3cold", dgpu_sleep_s=900)),
+            (7000, 9000, dict(dgpu=0, dgpu_power="D3cold", dgpu_sleep_s=1800)),
+            (9000, 11000, dict(dgpu=0, dgpu_power="D3cold", dgpu_sleep_s=2700)),
+            (11000, 12000, dict(awake, dgpu=2)),
+            (12000, 12800, dict(dgpu=0, dgpu_power="D3hot", dgpu_sleep_s=0)),
+            (12800, 15000, dict(dgpu=0, dgpu_power="D3cold", dgpu_sleep_s=0))]
+    phases = [(0, 2000, "Awake, 40 % busy", "the green usage bar"),
+              (2000, 3500, "Asleep, link still up (D3hot)", "for a few seconds the last key glows dim orange"),
+              (3500, 5000, "Powered off (D3cold)", "the key turns dim teal"),
+              (5000, 7000, "Off for 15 minutes", "a second key"),
+              (7000, 9000, "Off for 30 minutes", "a third key"),
+              (9000, 11000, "Off for 45 minutes or more", "all four keys"),
+              (11000, 12000, "Something wakes it", "even for a second: the marker fades"),
+              (12000, 15000, "Off again", "orange for a moment, then teal from one key")]
 
     def state(t):
         c = (t - warm) % dur if t >= warm else 0
@@ -521,9 +532,8 @@ def fig_dgpu_sleep(exe):
     s = Script(exe)
     stream(s, state, warm + dur)
     sm = clip(s.run(), warm, warm + dur, 185)
-    phases = [(p[0], p[1], p[3], p[4]) for p in plan]
     return story_figure("The dGPU sleep marker", 1, sm, dur, phases, 8000,
-                        note="Time-lapse: each step is 15 minutes in real life.", width=700)
+                        note="Time-lapse: each step is 15 minutes in real life.", width=720)
 
 
 def fig_temperature(exe):

@@ -153,11 +153,13 @@ watts, so it's worth knowing whether it happens. While the dGPU is off, the
 row's **last (right) key glows dim teal**. The longer it stays off without a
 break, the further the teal grows to the left:
 
-![The dGPU row: awake, then powered off for under 15, 15, 30 and 45+ minutes](img/dgpu-sleep.svg)
+![The dGPU row: awake, a moment of orange light sleep, then powered off for under 15, 15, 30 and 45+ minutes](img/dgpu-sleep.svg)
 
-- The last key lights a few seconds after the dGPU goes idle. The card drops
-  to a light sleep within a second, and its connection powers down 6 to 8
-  seconds later. Only then does it count as off.
+- On the way to off, the card first drops to a **light sleep (D3hot)**
+  within a second of going idle: it's asleep, but its connection (the PCIe
+  link) is still up, so it saves less. The last key glows **dim orange**.
+- The connection powers down 6 to 8 seconds later. Only then does the card
+  count as off, and the key turns teal.
 - One more key lights after 15, 30 and 45 minutes off (`DGPU_OFF_STEP_S`).
   It stays at four keys after that.
 - **Any wake, even a second long, fades the marker out.** Once the card is
@@ -167,14 +169,20 @@ break, the further the teal grows to the left:
   restarts, the count starts over. The host itself wakes the dGPU for a
   couple of seconds when it starts.
 
+The two colours count apart. Light sleep grows in orange the same way, one
+more key per 15 minutes, but going from light sleep to off starts the bar
+again at one teal key. So teal always means "fully off for this long".
+
 Reading the power state never wakes the card. It comes from Windows' device
 manager (the device's *Power data*), not from the GPU.
 
-A full four-key marker means the dGPU hasn't woken for at least 45 minutes.
-That's the best case for battery life. A marker that keeps restarting from
-one key means something wakes the dGPU regularly. A marker that never appears
-means something keeps it awake: a browser or game using it, an external
-monitor wired to the dGPU's port, or an overlay.
+A full four-key teal marker means the dGPU hasn't woken for at least 45
+minutes. That's the best case for battery life. A marker that keeps
+restarting from one key means something wakes the dGPU regularly. A marker
+that never appears means something keeps it awake: a browser or game using
+it, an external monitor wired to the dGPU's port, or an overlay. An **orange
+bar that keeps growing** means the card is asleep but something keeps its
+connection up, so it never powers off.
 
 On a laptop without a dGPU, row 5 stays dark.
 
