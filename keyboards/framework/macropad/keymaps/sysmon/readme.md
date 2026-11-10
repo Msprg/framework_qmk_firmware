@@ -712,7 +712,9 @@ Three 32-byte VIA "custom set value" reports are sent per interval on channel
                0x04 = GOODBYE (no payload; sent once on a clean exit)
                0x05 = MESSAGE (a line of text over the bars; when there is one)
                0x10 = BOOT REPLAY, 0x11 = REBOOT, 0x12 = TRACE (testing only, see below)
-[3..] payload: FRAME A/B: three back-to-back 8-byte row descriptors
+[3..] payload: FRAME A/B: three back-to-back 8-byte row descriptors (FRAME A
+               is sent first; FRAME B keeps the display alive: the bars show
+               from the first one on, drawn with its globals)
                FRAME C:   six back-to-back 4-byte ghost descriptors
                MESSAGE:   see below
 
@@ -767,7 +769,7 @@ When frames stop, what happens depends on how. After a GOODBYE the firmware
 restores the stock global current and hands over to the regular RGB effect at
 once. If frames just stop, it waits `timeout`, shows the disconnect warning for
 10 s, and then hands over. After a USB suspend it skips the warning. The next
-FRAME A/B cancels all of this; the bars cross-fade back in over 0.7 s from the
+FRAME B cancels all of this; the bars cross-fade back in over 0.7 s from the
 boot rainbow or the warning, and cut in from the regular effect.
 
 FRAME C is optional in both directions. Firmware that predates it ignores value

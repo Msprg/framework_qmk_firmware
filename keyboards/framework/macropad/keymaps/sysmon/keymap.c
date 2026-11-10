@@ -96,8 +96,9 @@ void enable_factory_mode(bool enable) {
 //                       0x02 = FRAME B (rows 3,4,5 + globals)
 //   data[3..] = payload
 //
-// Two FRAME reports are sent every tick. Each carries three 8-byte row
-// descriptors back-to-back:
+// Two FRAME reports are sent every tick, A then B. Each carries three 8-byte
+// row descriptors back-to-back. FRAME B is what keeps the display alive: the
+// bars show from the first FRAME B on, drawn with its globals.
 //
 //   row descriptor (8 bytes):
 //     +0 level         0..255  fraction of the 4-segment bar (0=empty,255=full)
@@ -147,7 +148,7 @@ void enable_factory_mode(bool enable) {
 // stop, shutdown, Ctrl+C). The firmware hands over to the regular RGB effect at
 // once. Without it, frames simply stop: after the timeout the macropad shows a
 // disconnect warning (caution stripes) for SYSMON_WARN_MS, then falls back to
-// the regular effect. The next FRAME A/B cancels either state.
+// the regular effect. The next FRAME B cancels either state.
 //
 // MESSAGE (value_id 0x05): a line of text for the user to read -- which limit
 // holds a component back, say. The bars dim out, the text scrolls through on
@@ -270,9 +271,8 @@ void enable_factory_mode(bool enable) {
 #define SYSMON_OVL_TRAP_FALL 2
 #define SYSMON_OVL_SINE 3
 
-// Defaults applied until the first FRAME B arrives, so an early FRAME A still
-// renders sensibly. Brightness 255 lands on the stock GCC; glide/timeout match
-// the host defaults (300ms glide => 75, 5000ms timeout => 50).
+// Defaults until the first FRAME B arrives (the bars don't show before it);
+// they match the host defaults (300ms glide => 75, 5000ms timeout => 50).
 #define SYSMON_DEFAULT_GLIDE_UNITS 75
 #define SYSMON_DEFAULT_TIMEOUT_UNITS 50
 
@@ -402,12 +402,14 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
 
     if (*channel_id == SYSMON_CHANNEL) {
         if (*command_id == id_custom_set_value && *value_id == SYSMON_FRAME_A) {
+            // Rows only: the bars wait for FRAME B, which the host sends right
+            // after it with the brightness, glide and timeout they are drawn
+            // with. (Shown on FRAME A alone, a frame drawn in the ms before
+            // FRAME B started the bars at full brightness, and they slid down
+            // to the host's through the fade, swelling and sinking.)
             sysmon_decode_row(0, payload + 0 * SYSMON_ROW_BYTES);
             sysmon_decode_row(1, payload + 1 * SYSMON_ROW_BYTES);
             sysmon_decode_row(2, payload + 2 * SYSMON_ROW_BYTES);
-            sysmon_last_update = sysmon_stamp(); // 0 means never
-            sysmon_goodbye     = false;
-            sysmon_quiet       = false;
         } else if (*command_id == id_custom_set_value && *value_id == SYSMON_FRAME_B) {
             sysmon_decode_row(3, payload + 0 * SYSMON_ROW_BYTES);
             sysmon_decode_row(4, payload + 1 * SYSMON_ROW_BYTES);
@@ -718,11 +720,14 @@ typedef struct {
     uint32_t t0;
 } sysmon_glide_t;
 
-// Set for the first render of a fade into the bars: every bar jumps to its
-// level, so the fade heads for what the bars actually show instead of for
-// bars that are still growing from empty (or from where they stood before
-// the warning).
-static bool sysmon_glide_snap;
+// For the first SYSMON_SNAP_MS of a fade into the bars, every bar and ghost
+// jumps to its level, so the fade heads for what the bars actually show
+// instead of for bars still growing from empty (or from where they stood
+// before the warning). A window, not one frame: FRAME C's ghosts arrive a
+// few ms after the bars have started. By its end the fade is 5% under way.
+#define SYSMON_SNAP_MS 100
+static uint32_t sysmon_entered;    // when the bars last took over the display
+static bool     sysmon_glide_snap; // set while drawing inside that window
 
 static uint8_t sysmon_glide(sysmon_glide_t *g, uint8_t target, uint32_t glide_ms) {
     if (glide_ms == 0) glide_ms = 1;
@@ -747,12 +752,19 @@ static uint8_t sysmon_glide(sysmon_glide_t *g, uint8_t target, uint32_t glide_ms
 }
 
 // Slew brightness toward the host-sent target (1 level per 4ms) so a frame
-// landing mid-pulse can't step the whole display's brightness.
-static uint8_t sysmon_slewed_val(void) {
+// landing mid-pulse can't step the whole display's brightness. jump: go
+// straight there instead (the bars are just taking over: a slide would run
+// through the fade into them, the bars swelling or sinking as it went).
+static uint8_t sysmon_slewed_val(bool jump) {
     static uint8_t  val  = 0;
     static uint32_t last = 0;
 
-    uint32_t now  = timer_read32();
+    uint32_t now = timer_read32();
+    if (jump) {
+        val  = sysmon_brightness;
+        last = now;
+        return val;
+    }
     uint32_t step = (now - last) / 4;
     if (step) {
         last = now;
@@ -2370,7 +2382,7 @@ static uint32_t sysmon_timeout_ms(void) {
     return (uint32_t)sysmon_timeout_units * 100;
 }
 
-// ms since the last FRAME A/B (0 before the first)
+// ms since the last FRAME B (0 before the first)
 static uint32_t sysmon_since(void) {
     return sysmon_last_update ? timer_elapsed32(sysmon_last_update) : 0;
 }
@@ -2951,7 +2963,7 @@ static bool sysmon_indicators(void) {
         return false;
     }
     if (warn_preview_render()) {
-        sysmon_set_gcc(sysmon_last_update ? sysmon_slewed_val() : BOOT_BRIGHTNESS);
+        sysmon_set_gcc(sysmon_last_update ? sysmon_slewed_val(false) : BOOT_BRIGHTNESS);
         sysmon_disp = DISP_WARN;
         sysmon_msg_hold(); // it waits this out too, as the boot animation's
         return false;
@@ -2970,7 +2982,7 @@ static bool sysmon_indicators(void) {
             return false;
         }
         if (sysmon_last_update != 0 && !sysmon_goodbye && !sysmon_quiet && since - timeout_ms < SYSMON_WARN_MS) {
-            sysmon_set_gcc(sysmon_slewed_val());
+            sysmon_set_gcc(sysmon_slewed_val(false));
             sysmon_warn_el    = since - timeout_ms;
             sysmon_warn_shown = SYSMON_WARN_STYLE;
             for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
@@ -2991,10 +3003,12 @@ static bool sysmon_indicators(void) {
         sysmon_xf_from    = sysmon_disp; // blend in from whatever was showing
         sysmon_xf_t0      = timer_read32();
         sysmon_xf_ready   = false;
-        sysmon_glide_snap = sysmon_xf_from != DISP_EFFECT;
+        sysmon_entered    = sysmon_xf_t0;
         sysmon_disp       = DISP_SYSMON;
     }
-    uint8_t gcc_bars = sysmon_gcc_for(sysmon_slewed_val());
+    bool snap         = timer_elapsed32(sysmon_entered) < SYSMON_SNAP_MS;
+    sysmon_glide_snap = snap && sysmon_xf_from != DISP_EFFECT; // a cut from the effect glides
+    uint8_t gcc_bars  = sysmon_gcc_for(sysmon_slewed_val(snap));
     sysmon_gcc_bars  = gcc_bars;
 
     uint32_t glide_ms = (uint32_t)sysmon_glide_units * 4;
