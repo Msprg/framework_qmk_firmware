@@ -360,7 +360,7 @@ def fig_pad_map(exe):
     h = pad_keys(a, 24, 24, tracks(sm), poster(sm, 6000))
     labels = ["Battery|charge, charging / draining", "CPU|usage; breathes when held back",
               "Memory|usage; blinks at 90 %+", "iGPU|usage, with the NPU behind it",
-              "dGPU|usage; teal from the right = asleep",
+              "dGPU|usage; teal from the right = powered off",
               "Temperature|30-90 \u00b0C; blinks above 90 \u00b0C"]
     y = 24
     for r, lab in enumerate(labels):

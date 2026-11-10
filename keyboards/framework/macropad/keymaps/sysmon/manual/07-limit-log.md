@@ -37,7 +37,9 @@ The service writes it all the time, from the same readings that drive the pad,
     rear USB-C port on the Framework 16's graphics module isn't among the
     ports `framework_tool` lists, so with the charger there the contract stays
     empty (`-` under `PD W` in the report), and the sample notes that the
-    charger is on an unlisted port (`pd_unlisted` in the CSV export);
+    charger is on an unlisted port (`pd_unlisted` in the CSV export). An
+    older `framework_tool` doesn't say which port the laptop draws from;
+    with one, the largest contract it lists counts;
   - **Windows:** the power mode (best efficiency / balanced / best
     performance), the power plan, Energy Saver;
   - **thermals:** every temperature sensor of the embedded controller, and
@@ -106,10 +108,12 @@ Observed 61.5 h (the service running, the machine awake)
 ```
 
 **The header** says which file, which machine, which time window, and how much
-data. With a window (`--report-days`), the times that come from the daily
-tallies (Observed, and each limit's primary and bound time) cover whole days,
-from midnight of the window's first day, so they can count up to a day more
-than the window. Episodes, samples and events start exactly at the window.
+data. With a window (`--report-days`, or `--days` with the script), the
+times that come from the daily tallies cover whole days, from midnight of the
+window's first day, so they can count up to a day more than the window. Those
+are Observed, busy and limited, each limit's primary and bound time, and
+their splits by power source and power mode. Episodes, samples and events
+start exactly at the window.
 **Observed** is the time the service ran with the laptop awake, split by
 power source and Windows power mode. All the percentages below are relative
 to it.
