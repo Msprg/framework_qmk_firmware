@@ -70,7 +70,7 @@ bar stays readable.
 
 ## Row 1: battery
 
-![The battery row: charging, on battery, battery helping the charger, idle, critical](img/battery.svg)
+![The battery row: charging, on battery, battery helping the charger, idle, drifting (exaggerated), critical](img/battery.svg)
 
 | State | How it looks |
 |-------|--------------|
@@ -78,7 +78,7 @@ bar stays readable.
 | **On battery** (unplugged) | A **red** bar of the charge level. The edge key and the keys to its left **flare and fade**, like charge draining out. |
 | **On AC, battery helping** | The same draining look in **amber**. The charger is plugged in but can't cover what the laptop draws, so the battery makes up at least 10 W. Typical with a low-power USB-C charger or a monitor's USB-C port. The CPU or dGPU row usually [breathes slowly](02-limits-and-messages.md#brisk-or-slow) at the same time. |
 | **On AC, idle** | The **whole row steady dim green**. The battery is full, or held at its charge limit, and nothing flows. A drain under 10 W on AC also counts as idle: that's the embedded controller managing the battery around its charge limit, not a real shortage. |
-| **On AC, drifting** | The idle green row with **its last key breathing very faintly**, easy to miss by design. The battery is drifting a little below its charge limit. It's harmless. |
+| **On AC, drifting** | The idle green row with **its last key breathing very faintly**, easy to miss by design. The battery is drifting a little below its charge limit. It's harmless. The figure above exaggerates the breathing so you can see it. |
 | **Critical** | The **whole row red, blinking**. The battery is below 15 % (`BATT_CRITICAL_PCT`) and draining: on battery, or on AC with the battery helping. |
 
 **How many keys pulse** shows how much power is flowing: one key below 20 W,
