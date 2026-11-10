@@ -157,6 +157,9 @@ class Report:
                    f"{machine.get('BIOSVersion', '?')} ({machine.get('BIOSReleaseDate', '?')})")
         self.w(f"Window      {'all of it' if not self.since else 'since ' + local(self.since)}"
                f"; samples {local(first)} .. {local(last)}")
+        if self.since:
+            self.w(f"            (the times from the tallies cover whole days, from {self.day} "
+                   f"00:00; episodes and samples start at the window)")
         self.w(f"Rows        {n} samples, {eps} episodes, {evs} events")
 
     def sources(self, observed):
@@ -270,8 +273,13 @@ class Report:
                        f"{pct(r['slr'], 1)} of its limit. Raising STAPM to the slow PPT "
                        f"would allow +{num(r['sl'] - r['st'])} W "
                        f"(+{pct(r['sl'] - r['st'], r['st'])}) before the next limit.")
-            self.w(f"  STAPM time constant {num(r['tc'])}; skin-temperature (STT) limit "
-                   f"{num(r['sttl'])} C, value {num(r['sttv'])} C")
+            # (on Strix Point's table 0x5d000b libryzenadj's "STT APU limit" holds
+            # the BIOS STT row's dGPU/HS2 skin limit: 51 -> 58 C as the FW16
+            # went from best efficiency to balanced/performance, where the APU
+            # limit goes 47.5 -> 49/50.5 C; and its "stapm_time" isn't the STAPM
+            # time constant)
+            self.w(f"  table's \"stapm_time\" {num(r['tc'])}; STT limit field (the dGPU/HS2 skin "
+                   f"limit on 0x5d000b) {num(r['sttl'])} C, value {num(r['sttv'])} C")
         # what the CPU did when it was not held back, at a like load: a
         # single busy thread boosts far higher than all cores can, so compare
         # all-core load with all-core load

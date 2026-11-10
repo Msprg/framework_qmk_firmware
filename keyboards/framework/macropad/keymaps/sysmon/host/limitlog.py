@@ -136,7 +136,7 @@ SAMPLE_COLS = [
     # power source
     ("ac", I), ("power_src", T), ("batt_pct", I), ("batt_state", T),
     ("batt_rate_w", R), ("charge_cap", I),
-    ("pd_w", R), ("pd_v", R), ("pd_a", R), ("pd_port", I),
+    ("pd_w", R), ("pd_v", R), ("pd_a", R), ("pd_port", I), ("pd_unlisted", I),
     ("chg_input_ma", I), ("chg_ma", I), ("batt_v", R), ("batt_ma", I),
     ("power_mode", T), ("power_plan", T), ("energy_saver", I),
     # CPU load and clocks (Windows' view)
@@ -589,20 +589,29 @@ class _Extras:
                 cur["partner"] = v
             elif k == "EPR":
                 cur["epr"] = v
+            elif k == "Sink Active":
+                cur["sink_active"] = v.lower().startswith("y")
             elif k == "Negotiated":
                 n = re.match(r"([\d.]+)\s*V,\s*(\d+)\s*mA,\s*([\d.]+)\s*W", v)
                 if n:
                     cur["v"], cur["ma"], cur["w"] = (float(n.group(1)),
                                                      int(n.group(2)),
                                                      float(n.group(3)))
+        # only a contract the laptop actually sinks through: a dock or monitor
+        # can hold a sink contract it isn't drawing on ("Sink Active: No"). And
+        # --pdports lists ports 0-3 only: on the FW16 the graphics module's rear
+        # USB-C (its own PD controller, "Back" in --pd-info) isn't among them, so
+        # an adapter there leaves no active sink in the list (pd_unlisted).
         sinks = [p for p in ports if p.get("contract") and p.get("w")
-                 and str(p.get("role", "")).lower() == "sink"]
+                 and str(p.get("role", "")).lower() == "sink"
+                 and p.get("sink_active", True)]
         best = max(sinks, key=lambda p: p["w"]) if sinks else None
         self._put(pd_ports=ports or None,
                   pd_w=best["w"] if best else None,
                   pd_v=best["v"] if best else None,
                   pd_a=best["ma"] / 1000.0 if best else None,
-                  pd_port=best["port"] if best else None)
+                  pd_port=best["port"] if best else None,
+                  pd_unlisted=(int(best is None) if ports else None))
 
     def _procs(self):
         """The processes with the most CPU time since the last look, summed
@@ -1196,11 +1205,14 @@ class Recorder:
             "cpu_pad": getattr(cpu_track, "current", None),
             "gpu_pad": getattr(gpu_track, "current", None),
         }
-        for k in ("pd_w", "pd_v", "pd_a", "pd_port", "chg_input_ma", "chg_ma",
+        for k in ("pd_w", "pd_v", "pd_a", "pd_port", "pd_unlisted", "chg_input_ma", "chg_ma",
                   "batt_v", "batt_ma", "power_mode", "power_plan", "energy_saver",
                   "perf_pct", "perf_limit_pct", "perf_limit_flags", "utility_pct",
                   "nv_temp", "nv_gfx_clk", "nv_mem_clk", "nv_pstate", "top_procs"):
             s[k] = ex.get(k)
+        if s.get("pd_unlisted") is not None:
+            # no listed port sinking means an unlisted adapter only on AC
+            s["pd_unlisted"] = int(bool(s["pd_unlisted"] and ac))
         s.update(ex.get("ec") or {})
         extra = {}
         if ex.get("ec_extra"):
