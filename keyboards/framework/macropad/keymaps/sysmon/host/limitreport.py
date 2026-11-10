@@ -187,8 +187,8 @@ class Report:
         out = []
         for r in rows:
             durs = [d["duration"] or 0 for d in self.q(
-                "SELECT duration FROM episodes WHERE component=? AND reason=? AND start>=?",
-                comp, r["reason"], self.since)]
+                "SELECT duration FROM episodes WHERE component=? AND reason=? AND start>=? "
+                f"AND NOT {FAKE_DGPU}", comp, r["reason"], self.since)]
             out.append([r["reason"], dur(r["p"]), dur(r["b"]), pct(r["l"], loaded),
                         len(durs), dur(quantile(durs, 0.5)), dur(quantile(durs, 0.9)),
                         dur(max(durs) if durs else None)])
@@ -196,6 +196,13 @@ class Report:
                "%busy = bound while busy / busy time")
         table(self.out, ["reason", "primary", "bound", "%busy", "episodes", "median",
                          "p90", "longest"], out)
+        n, s = self.db.execute(f"SELECT COUNT(*), SUM(duration) FROM episodes WHERE "
+                               f"component=? AND start>=? AND {FAKE_DGPU}",
+                               (comp, self.since)).fetchone()
+        if n:
+            self.w(f"  ({n} dGPU power episodes, {dur(s)}, with an impossible draw left out of "
+                   f"the episode columns: NVML garbage as the dGPU woke, logged by builds "
+                   f"before 2026-11-10. The primary/bound times still include them.)")
         for col, label in (("power_src", "power source"), ("power_mode", "power mode")):
             piv = self.q(f"SELECT reason, {col} k, SUM(primary_s) p FROM tally WHERE "
                          f"component=? AND reason NOT LIKE '\\_%' ESCAPE '\\' AND day>=? "
@@ -324,7 +331,7 @@ class Report:
 
     def processes(self):
         rows = self.q("SELECT component, reason, duration, top_procs FROM episodes WHERE "
-                      "start>=? AND top_procs IS NOT NULL", self.since)
+                      f"start>=? AND top_procs IS NOT NULL AND NOT {FAKE_DGPU}", self.since)
         by = {}
         for r in rows:
             agg = by.setdefault((r["component"], r["reason"]), {})
@@ -359,6 +366,11 @@ class Report:
 
 
 IGNORED_LIMITS = {"stt_dgpu_l"}
+# Episodes (SQL) that builds before 2026-11-10 logged from a garbage NVML power
+# reading (100,000-475,000 W as the dGPU woke from D3cold): a mean draw past
+# twice the limit, as fw16_sysmon.NV_DRAW_MAX_RATIO now rejects per read.
+FAKE_DGPU = ("(component='gpu' AND COALESCE(nv_w_mean, 0) > "
+             "2 * COALESCE(NULLIF(limit_max, 0), 500))")
 # Builds before 2026-11-09 compared each SMU read with the previous one, so a
 # drifting STAPM limit logged mostly sub-watt jitter; moves smaller than this
 # (the time constants aside) are left out of the list. Newer builds log a

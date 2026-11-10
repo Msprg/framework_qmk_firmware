@@ -415,6 +415,10 @@ NV_NEAR_CAP = 0.92      # dGPU draw as a fraction of its enforced limit to count
                         # as genuinely power-capped -- filters NVIDIA's eager
                         # SwPowerCap (set even near idle), which made the dGPU
                         # breathe flicker on/off every few seconds
+NV_DRAW_MAX_RATIO = 2.0  # an NVML power reading above this times the dGPU's own
+                        # (enforced or default) limit is garbage, read as unknown:
+                        # waking from D3cold, the FW16's RTX 5070 gave
+                        # 100,000-475,000 W for a few seconds, with SwPowerCap set
 NV_DEBOUNCE_READS = 3   # consecutive evaluations a dGPU limit flag must hold
                         # before it flips, so a single-tick NVML blip can't flash
                         # the breathe on and off
@@ -1156,9 +1160,15 @@ class NvGpuLimits:
                 default = enforced
         except Exception:
             return self._debounce({})
+        # a reading far past the GPU's own limit isn't a draw (NV_DRAW_MAX_RATIO):
+        # this read's draw is unknown
+        bad_draw = None
+        ceiling = max(enforced, default)
+        if ceiling > 0 and draw > NV_DRAW_MAX_RATIO * ceiling:
+            bad_draw, draw = draw, None
         # raw, unfiltered: the limit log keeps every bit (limitlog.py)
         self.last = {"reasons": int(reasons), "draw": draw,
-                     "enforced": enforced, "default": default}
+                     "enforced": enforced, "default": default, "bad_draw": bad_draw}
 
         sw_cap = bool(reasons & self._sw_power)
         hw_brake = bool(reasons & self._hw_brake)
@@ -1168,9 +1178,9 @@ class NvGpuLimits:
         # GPU is nowhere near its limit, which made the breathe flicker. Only
         # honour it as a real power cap when the GPU is actually drawing near its
         # enforced limit. HwPowerBrake is a genuine hardware brake; keep it as-is.
-        near_cap = enforced > 0 and draw >= NV_NEAR_CAP * enforced
+        near_cap = draw is not None and enforced > 0 and draw >= NV_NEAR_CAP * enforced
         found = {}
-        if (weak_charger and "charger" in LIMIT_KINDS and draw >= NV_ACTIVE_MIN_W
+        if (weak_charger and "charger" in LIMIT_KINDS and (draw or 0) >= NV_ACTIVE_MIN_W
                 and (hw_brake or (sw_cap and near_cap) or capped_below_stock)):
             # supply-bound: a loaded GPU capped while the charger can't keep up
             found["charger"] = Reason("charger", "charger")

@@ -1011,7 +1011,7 @@ class Recorder:
                        "APU_LIMIT_NEAR", "APU_THM_MARGIN_C", "LIMIT_RELEASE_S",
                        "NV_NEAR_CAP", "CLOCK_BUSY_PCT", "CLOCK_BASE_MARGIN",
                        "LIMITLOG_ONSET_S", "LIMITLOG_ACTIVE_S", "LIMITLOG_IDLE_S",
-                       "LIMITLOG_BUSY_TAU_S")},
+                       "LIMITLOG_BUSY_TAU_S", "NV_DRAW_MAX_RATIO")},
                        SMU_LIMIT_TOL=SMU_LIMIT_TOL, SMU_LIMIT_TOL_KEY=SMU_LIMIT_TOL_KEY))
 
     # --- entry points: none of them raises ---------------------------------
@@ -1205,6 +1205,8 @@ class Recorder:
         extra = {}
         if ex.get("ec_extra"):
             extra["ec"] = ex["ec_extra"]
+        if nvl.get("bad_draw") is not None:
+            extra["nv_w_bad"] = _round(nvl["bad_draw"], 1)  # rejected; nv_w is None
         if rj:
             for k in ("stapm", "fast", "slow", "tdc", "tdc_soc", "edc", "edc_soc", "thm"):
                 pair = rj.get(k)
@@ -1261,7 +1263,9 @@ class Recorder:
             return {}
         bits, draw, enf = nvl["reasons"], nvl["draw"], nvl["enforced"]
         out = {}
-        if bits & NV_SW_POWER and enf > 0 and draw >= E.NV_NEAR_CAP * enf:
+        # draw None: NVML's reading was garbage (NV_DRAW_MAX_RATIO), not a cap
+        if (bits & NV_SW_POWER and draw is not None and enf > 0
+                and draw >= E.NV_NEAR_CAP * enf):
             out["power"] = _Reason("power", draw / enf, enf, "W")
         if bits & NV_HW_BRAKE:
             out["brake"] = _Reason("brake")
