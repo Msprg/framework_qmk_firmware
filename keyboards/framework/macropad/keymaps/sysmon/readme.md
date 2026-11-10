@@ -1,5 +1,9 @@
 # sysmon — system monitor lighting for the Framework 16 RGB Macropad
 
+> **Using the pad?** The [user manual](manual/README.md) explains what every
+> light means, the keys, the settings and troubleshooting. This readme is the
+> technical reference.
+
 Turns the macropad's six key rows into live bar graphs, driven by a small
 host-side Python script over the VIA raw HID endpoint (VIA keeps working
 normally — the stats ride on a private custom-value channel, `0x42`):
