@@ -64,8 +64,8 @@ else changed. See
 
 ### Esc (or the lights key) only acts when released, and doesn't repeat
 
-That's by design: the top-left key waits to see whether it's a tap or a
-one-second hold. See
+That's by design, in firmware from 10 November 2026 on: the top-left key
+waits to see whether it's a tap or a one-second hold. See
 [The top-left key](04-keys-and-lighting.md#the-top-left-key-tap-or-hold-to-save-a-trace).
 
 ### The display jumps between states

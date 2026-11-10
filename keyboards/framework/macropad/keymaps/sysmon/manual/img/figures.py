@@ -194,7 +194,7 @@ def fig_battery():
          assist, False),
         ("On AC, battery idle", "the whole row steady dim green",
          [Key(lit(GREEN, 0.38)) for _ in range(4)], False),
-        ("On battery, below 15 %", "the whole row red, blinking",
+        ("Draining, below 15 %", "the whole row red, blinking",
          [Key(lit(RED), mark=True) for _ in range(4)], False),
     ]
     return strips("The battery row", items, label_w=420,

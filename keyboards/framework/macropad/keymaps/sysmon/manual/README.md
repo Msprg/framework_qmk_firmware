@@ -17,9 +17,14 @@ Two parts work together:
   colour and timing lives in a settings file on the laptop, so you can change
   how the pad behaves without touching the firmware.
 
-> **Version.** Written for host version 1.0.0 and the firmware built from this
-> branch. The [self-test](05-the-host-program.md#self-test) tells you if the
-> firmware on your pad is older than the host.
+> **Version.** Written for this branch as of November 2026: host 1.0.0, and
+> the firmware built alongside it. Every build so far calls itself 1.0.0, so
+> the version number alone doesn't tell builds apart. The
+> [self-test](05-the-host-program.md#self-test) flags firmware from before the
+> current host protocol, but not every later addition. Where a feature needs
+> recent firmware, the manual says so. Flashing the firmware that came with
+> your host (Start menu → *Flash firmware onto the macropad*) always brings
+> the pad up to date.
 
 ## The pad at a glance
 
@@ -27,7 +32,7 @@ Two parts work together:
 
 | Row | Shows | Normal look | When it needs your attention |
 |-----|-------|-------------|------------------------------|
-| 1 (short keys) | **Battery** | Charging: a bar that turns from red to green as it fills, with the keys past its edge pulsing. On battery: a red bar whose edge flares and fades. On AC with the battery idle: the whole row steady dim green. | The whole row **blinks red** below 15 % on battery. **Amber** means you're on AC but the charger can't keep up, so the battery is helping. |
+| 1 (short keys) | **Battery** | Charging: a bar that turns from red to green as it fills, with the keys past its edge pulsing. On battery: a red bar whose edge flares and fades. On AC with the battery idle: the whole row steady dim green. | The whole row **blinks red** below 15 % while draining. **Amber** means you're on AC but the charger can't keep up, so the battery is helping. |
 | 2 | **CPU** usage | Red bar | **Breathes** while a limit holds the CPU back (briskly: one of its own limits; slowly: a weak charger). |
 | 3 | **Memory** usage | Gold bar | The whole row **blinks** at 90 % and above. |
 | 4 | **iGPU** usage, with the **NPU** | Red bar for the iGPU, dim cyan behind it for the NPU | n/a |
@@ -96,3 +101,17 @@ The technical reference for the firmware and host is the sysmon
 [readme](../readme.md). It covers the wire protocol, building the firmware and
 the installer, running the host from source, and the animation preview and LED
 trace tools.
+
+## Maintaining this manual
+
+Three scripts keep it in step with the code. All are standard-library Python
+3.8+, and none imports the host.
+
+- [`img/figures.py`](img/figures.py) redraws the figures.
+- [`tools/settings_tables.py`](tools/settings_tables.py) regenerates the
+  settings and `[cli]` tables in [Settings](06-settings.md) from
+  `host/config.py` and `host/fw16_sysmon.py`. Run it after adding or changing
+  a setting.
+- [`tools/check_manual.py`](tools/check_manual.py) checks that every link and
+  anchor resolves, and that every setting, flag and Start-menu item named
+  here exists in the sources.

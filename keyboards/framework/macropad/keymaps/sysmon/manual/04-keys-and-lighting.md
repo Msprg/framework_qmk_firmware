@@ -24,8 +24,9 @@ keyboard, so pressing NumLock on either one switches the pad's layer.
 | **Row 5** | 1 | 2 | 3 | Enter |
 | **Row 6** | 0 | 0 | . | Enter |
 
-¹ Acts when released. Holding it for a second saves a diagnostic trace
-instead. See [The top-left key](#the-top-left-key-tap-or-hold-to-save-a-trace).
+¹ With recent firmware, acts when released, and holding it for a second saves
+a diagnostic trace instead. See
+[The top-left key](#the-top-left-key-tap-or-hold-to-save-a-trace).
 
 ## NumLock off: lighting and navigation
 
@@ -92,7 +93,14 @@ It's for reporting a display glitch seen at a time when no tool on the laptop
 can run, such as while Windows boots. The pad keeps the last four saves,
 through power-off and reflashing, and a developer tool on the laptop reads
 them out later (`bootanim_preview.py trace saved`, see the technical
-[readme](../readme.md)). It works in both layers, whatever the keymap.
+[readme](../readme.md)). It works in both layers, whatever the keymap. The
+pad records only while its lights are on, so a save made with the lights off
+holds nothing from the dark stretch.
+
+> **Needs recent firmware**, from 10 November 2026 on. With older sysmon
+> firmware, the top-left key acts on press as usual, Esc auto-repeats, and
+> holding it does nothing more. If the pad never flashes white, flash the
+> firmware that came with your host.
 
 Because of this, the key acts **when you release it**:
 
@@ -122,7 +130,7 @@ is the same as the lights-off key.
 The macropad has one data connection for VIA and the host. VIA and the
 running service normally coexist. If VIA behaves oddly while the service is
 running, stop the service while you use VIA (Start menu, or
-`sc stop FW16Sysmon`), then start it again.
+`sc.exe stop FW16Sysmon`), then start it again.
 
 ## Entering the bootloader by hand
 

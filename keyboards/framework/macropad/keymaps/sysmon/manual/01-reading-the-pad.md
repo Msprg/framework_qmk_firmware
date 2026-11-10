@@ -62,7 +62,7 @@ Rows move in five distinct ways, and each one means something different:
 | **Pulse** (~4 s) | Keys at the bar's edge swell, hold, fade and rest dark | Battery only: power flowing in (charging) or out (draining) |
 | **Brisk breathe** (~1.5 s) | The whole row swells and dims, but never goes dark | The CPU or dGPU is at one of its own limits |
 | **Slow breathe** (~4 s) | The same, slower | The CPU or dGPU is held back because the charger can't supply enough power |
-| **Blink** (~1 Hz) | The whole row on and fully off, once a second | **Critical**: battery below 15 %, memory at 90 %+, temperature above 90 °C |
+| **Blink** (~1 Hz) | The whole row on and fully off, once a second | **Critical**: battery draining below 15 %, memory at 90 %+, temperature above 90 °C |
 
 The rule of thumb: **blinking means act now, breathing means "for your
 information"**. A breathing row dips only to about 40 % brightness, so the
@@ -79,7 +79,7 @@ bar stays readable.
 | **On AC, battery helping** | The same draining look in **amber**. The charger is plugged in but can't cover what the laptop draws, so the battery makes up at least 10 W. Typical with a low-power USB-C charger or a monitor's USB-C port. The CPU or dGPU row usually [breathes slowly](02-limits-and-messages.md#brisk-or-slow) at the same time. |
 | **On AC, idle** | The **whole row steady dim green**. The battery is full, or held at its charge limit, and nothing flows. A drain under 10 W on AC also counts as idle: that's the embedded controller managing the battery around its charge limit, not a real shortage. |
 | **On AC, drifting** | The idle green row with **one key breathing faintly**. The battery is drifting a little below its charge limit. It's harmless, just visible. |
-| **Critical** | The **whole row red, blinking**. On battery, below 15 % (`BATT_CRITICAL_PCT`). |
+| **Critical** | The **whole row red, blinking**. The battery is below 15 % (`BATT_CRITICAL_PCT`) and draining: on battery, or on AC with the battery helping. |
 
 **How many keys pulse** shows how much power is flowing: one key below 20 W,
 two from 20 W, three from 45 W and all four from 75 W (`RATE_SEG_W1` to
@@ -94,8 +94,10 @@ not the scaled one.
 
 ## Row 2: CPU
 
-A **red** bar of total CPU usage across all cores, the same figure as Task
-Manager's CPU graph.
+A **red** bar of total CPU usage across all cores: the share of time the
+cores were busy. Task Manager computes its CPU figure differently (it
+accounts for clock speed), so the two can disagree, especially while the
+processor boosts.
 
 The row **breathes** when a limit holds the processor back: a power budget, a
 current limit, its temperature limit, or a clock held at base. On the AMD

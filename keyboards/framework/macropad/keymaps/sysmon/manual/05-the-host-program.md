@@ -64,11 +64,15 @@ From the Start menu: **Restart the service**. From an **elevated** terminal
 (right-click Terminal → Run as administrator):
 
 ```powershell
-sc query FW16Sysmon      # is it running?
-sc stop FW16Sysmon       # stop: the pad switches to its regular effect
-sc start FW16Sysmon      # start: the bars come back
+sc.exe query FW16Sysmon      # is it running?
+sc.exe stop FW16Sysmon       # stop: the pad switches to its regular effect
+sc.exe start FW16Sysmon      # start: the bars come back
 & "C:\Program Files\FW16 Macropad Sysmon\fw16-sysmon.exe" --restart-service
 ```
+
+Type `sc.exe`, not just `sc`. In Windows PowerShell, `sc` is short for
+`Set-Content`, so `sc stop FW16Sysmon` writes a file named `stop` instead of
+stopping the service. (In Command Prompt, plain `sc` works.)
 
 The Windows **Services** console (`services.msc`) lists it as `FW16Sysmon`,
 set to start automatically. To stop the pad being a monitor for a while
@@ -125,10 +129,10 @@ you:
 WARNING: the FW16Sysmon service is also running and writing to the macropad.
 ```
 
-1. Stop the service: `sc stop FW16Sysmon` in an elevated terminal.
+1. Stop the service: `sc.exe stop FW16Sysmon` in an elevated terminal.
 2. Start **Live view (console)** from the Start menu.
 3. When done, press **Ctrl+C**. The pad switches to its regular effect.
-4. Start the service again: **Restart the service**, or `sc start FW16Sysmon`.
+4. Start the service again: **Restart the service**, or `sc.exe start FW16Sysmon`.
 
 At the start it lists the graphics adapters it found and how it classified
 them:

@@ -1,6 +1,6 @@
 # sysmon — system monitor lighting for the Framework 16 RGB Macropad
 
-> **Using the pad?** The [user manual](manual/README.md) explains what every
+> **Using the pad?** The [user manual](https://github.com/Msprg/framework_qmk_firmware/blob/macropad-sysmon/keyboards/framework/macropad/keymaps/sysmon/manual/README.md) explains what every
 > light means, the keys, the settings and troubleshooting. This readme is the
 > technical reference.
 

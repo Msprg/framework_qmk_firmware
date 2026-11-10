@@ -428,8 +428,6 @@ Per-source cache lifetimes. Most ticks reuse cached readings so the poll loop st
 | `TTL_TEMP` | `2.0` | 0–3600 | ACPI thermal-zone cache lifetime: the last-resort temperature source, a WMI query, used only when nothing better reads. |
 | `TTL_LHM_SNAPSHOT` | `1.0` | 0–3600 | One LibreHardwareMonitor walk feeds temperature, package power and CPU load together. |
 | `TTL_EC_THERMAL` | `2.5` | 0–3600 | framework_tool --thermal fallback. Each read spawns a process, so do not lower this much. |
-
-<!-- 89 settings -->
 <!-- END SETTINGS-REFERENCE -->
 
 ---
