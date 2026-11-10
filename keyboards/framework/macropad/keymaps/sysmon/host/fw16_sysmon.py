@@ -277,12 +277,15 @@ HUE_CHARGE_FULL = 85  # charging hue at 100% (pct*85/100, red->green)
 HUE_NPU = 128       # NPU ghost bar on the iGPU row (cyan)
 HUE_DGPU_OFF = 140  # dGPU powered off (D3cold): the dGPU row's keys from the
                     # right (light blue/teal; kept off HUE_NPU, the row above)
+HUE_DGPU_D3HOT = 16  # dGPU idle in D3hot (its PCIe link still up): the same
+                     # marker in orange (kept off HUE_AMBER's yellower 28)
 
 # Brightness levels (base row_val)
 ROW_VAL_FULL = 255
 ROW_VAL_BATT_IDLE = 80   # AC-idle dim green; firmware lifts via visible_pwm
 ROW_VAL_NPU_GHOST = 96   # NPU ghost bar: dim, so the bright iGPU bar reads first
-ROW_VAL_DGPU_OFF = 80    # the D3cold marker: steady and dim, like the idle battery
+ROW_VAL_DGPU_OFF = 80    # the D3cold / D3hot marker: steady and dim, like the
+                         # idle battery
 
 # Battery policy
 BATT_CRITICAL_PCT = 15   # raw % below which a discharging battery blinks red
@@ -307,8 +310,9 @@ TEMP_CRITICAL_C = 90
 TEMP_MIN_C = 30
 TEMP_MAX_C = 90
 
-# The D3cold marker grows: the last key lights as the dGPU powers off, and one
-# more for each further DGPU_OFF_STEP_S it stays off without a break, up to 4.
+# The D3cold / D3hot marker grows: the last key lights as the dGPU enters the
+# state, and one more for each further DGPU_OFF_STEP_S it stays in it without a
+# break, up to 4. The two states count apart (DgpuSleepWatch).
 DGPU_OFF_STEP_S = 900.0
 
 # Breathe overlay floor for power-limited rows (~43% of 255: dim but readable).
@@ -959,24 +963,29 @@ class DgpuPower:
 
 
 class DgpuSleepWatch:
-    """How long the dGPU has stayed powered off (D3cold) without a break.
+    """How long the dGPU has stayed in D3cold, or in D3hot, without a break.
+
+    The two are counted apart: a streak is a run of looks in one of
+    SLEEP_STATES, and a look in any other state (D3hot -> D3cold included)
+    ends it. So does a gap between two looks longer than GAP_S (the machine
+    slept, the process was frozen): the GPU could have woken unseen. The next
+    look in a sleep state starts a new streak.
 
     A thread of its own looks at DgpuPower every POLL_S, apart from the main
     loop: a background wake lasts a second or two, and a main-loop tick can
     stall about that long (WMI, framework_tool) or stop for seconds while the
-    pad is away. A look that isn't D3cold ends the streak, and so does a gap
-    between two looks longer than GAP_S (the machine slept, the process was
-    frozen): the GPU could have woken unseen. The next D3cold look starts over.
+    pad is away.
     """
 
     POLL_S = 0.25
     GAP_S = 3.0
+    SLEEP_STATES = ("D3hot", "D3cold")
 
     def __init__(self, power):
         self.power = power
         # (state, since, seen): the last look's state, when the streak it
-        # belongs to started (None = not in D3cold) and when that look was
-        # taken, all monotonic. One tuple, so a reader never sees half a look.
+        # belongs to started (None = not in a sleep state) and when that look
+        # was taken, all monotonic. One tuple, so a reader never sees half a look.
         self._look = (None, None, None)
         self._failed = False
 
@@ -988,10 +997,10 @@ class DgpuSleepWatch:
                 self._failed = True
                 log(f"dGPU power state could not be read: {err!r}")
             state = None
-        _, since, seen = self._look
-        if state != "D3cold" or seen is None or now - seen > self.GAP_S:
+        last, since, seen = self._look
+        if state != last or seen is None or now - seen > self.GAP_S:
             since = None
-        if state == "D3cold" and since is None:
+        if state in self.SLEEP_STATES and since is None:
             since = now
         self._look = (state, since, now)
 
@@ -1004,7 +1013,8 @@ class DgpuSleepWatch:
         threading.Thread(target=loop, name="dgpu-sleep-watch", daemon=True).start()
 
     def snapshot(self):
-        """(state, seconds in D3cold so far or None): 'D0'..'D3cold' or None.
+        """(state, seconds in this D3hot or D3cold streak so far, or None):
+        state is 'D0'..'D3cold' or None.
 
         The time runs to the last look, not to now, so a stale look (the
         watcher not yet past a gap) can't count time nobody saw."""
@@ -2885,24 +2895,26 @@ def build_igpu_row(m):
     return desc
 
 
-def dgpu_off_keys(off_s):
-    """Keys of the D3cold marker for a streak off_s seconds long (None = none):
-    1 at once, one more at the start of each DGPU_OFF_STEP_S, at most 4."""
-    if off_s is None:
+def dgpu_sleep_keys(sleep_s):
+    """Keys of the D3cold / D3hot marker for a streak sleep_s seconds long
+    (None = none): 1 at once, one more at the start of each DGPU_OFF_STEP_S,
+    at most 4."""
+    if sleep_s is None:
         return 0
-    return min(4, 1 + int(off_s // DGPU_OFF_STEP_S))
+    return min(4, 1 + int(sleep_s // DGPU_OFF_STEP_S))
 
 
 def build_dgpu_row(m):
     """row4: dGPU usage, solid green; breathe when a dGPU limit binds.
 
     While the dGPU is powered off (D3cold) the row glows dim HUE_DGPU_OFF from
-    its last key: a right-anchored ghost, so it glides in and out and stays
+    its last key, and while it idles in D3hot (link still up) dim
+    HUE_DGPU_D3HOT: a right-anchored ghost, so it glides in and out and stays
     clear of the bar. One key at once, then one more per DGPU_OFF_STEP_S the
-    GPU stays off without a break (dgpu_off_keys). Not tied to dgpu_present:
-    finding the device in D3cold is proof enough that there is one. It needs
-    firmware that reads the ghost flags (m["ghost_flags"]); without them it
-    would show at the left end.
+    GPU stays in that state without a break (dgpu_sleep_keys). Not tied to
+    dgpu_present: finding the device in D3 is proof enough that there is one.
+    It needs firmware that reads the ghost flags (m["ghost_flags"]); without
+    them it would show at the left end.
     """
     if m["dgpu_present"]:
         desc = limit_breathe(RowDesc(level=pct_to_level(m["dgpu"]), hue0=HUE_GREEN),
@@ -2910,8 +2922,10 @@ def build_dgpu_row(m):
     else:
         desc = RowDesc(level=0)
     if m.get("ghost_flags"):
-        desc.ghost_level = GHOST_LEVEL_KEYS[dgpu_off_keys(m["dgpu_off_s"])]
-        desc.ghost_hue = HUE_DGPU_OFF
+        # A ghost sent at level 0 glides out in the hue it had, so the hue
+        # sent with no marker doesn't matter.
+        desc.ghost_level = GHOST_LEVEL_KEYS[dgpu_sleep_keys(m["dgpu_sleep_s"])]
+        desc.ghost_hue = HUE_DGPU_D3HOT if m["dgpu_power"] == "D3hot" else HUE_DGPU_OFF
         desc.ghost_val = ROW_VAL_DGPU_OFF
         desc.ghost_right = True
     return desc
@@ -3543,9 +3557,10 @@ def run(args, stop_event=None, resume_check=None):
             m["cpu_limit"] = cpu_track.reason
             m["dgpu_limit"] = gpu_track.reason
             m["ghost_flags"] = ghost_flags
-            # whether the dGPU is powered off, and for how long without a
-            # break, from PnP (never wakes it; see DgpuPower, DgpuSleepWatch)
-            m["dgpu_power"], m["dgpu_off_s"] = dwatch.snapshot()
+            # the dGPU's power state, and how long it has been in D3cold or
+            # D3hot without a break, from PnP (never wakes it; see DgpuPower,
+            # DgpuSleepWatch)
+            m["dgpu_power"], m["dgpu_sleep_s"] = dwatch.snapshot()
             rows = [ROW_BUILDERS[i](m) for i in range(6)]
             if not published_state:
                 # First complete tick: record what this process can actually
@@ -3588,7 +3603,7 @@ def run(args, stop_event=None, resume_check=None):
                       f"cpu {cpu_src} -> {m['cpu_limit']!r} "
                       f"dgpu[{m['dgpu_src']}] {dgpu_now} -> {m['dgpu_limit']!r} "
                       f"power={m['dgpu_power']}"
-                      + (f" for {m['dgpu_off_s']:.0f}s" if m["dgpu_off_s"] is not None else ""))
+                      + (f" for {m['dgpu_sleep_s']:.0f}s" if m["dgpu_sleep_s"] is not None else ""))
             if recorder is not None:
                 recorder.observe(m, now, cpu_track, gpu_track)
             if dev is None:

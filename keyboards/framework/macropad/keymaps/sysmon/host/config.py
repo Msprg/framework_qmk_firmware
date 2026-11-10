@@ -109,6 +109,10 @@ SCHEMA = [
                     "powered off (D3cold): 140 = light blue/teal, kept off\n"
                     "HUE_NPU (the row above). Always fully saturated (the marker\n"
                     "is a ghost bar, which has no saturation of its own)."),
+    Setting("HUE_DGPU_D3HOT", "colours", INT, lo=0, hi=255,
+            comment="The same marker while the dGPU idles in D3hot (asleep, but\n"
+                    "its PCIe link still up): 16 = orange, kept off HUE_AMBER's\n"
+                    "yellower 28."),
 
     Setting("ROW_VAL_FULL", "levels", INT, lo=1, hi=255,
             comment="Base brightness of a normal row, before the global\n"
@@ -123,9 +127,9 @@ SCHEMA = [
                     "ghost-bar firmware (FRAME C); older firmware ignores it."),
     Setting("ROW_VAL_DGPU_OFF", "levels", INT, lo=1, hi=255,
             comment="Brightness of the dGPU row's keys from the right while the\n"
-                    "dGPU is powered off (D3cold): steady and dim, like the idle\n"
-                    "battery row. Needs firmware that reads the ghost flags;\n"
-                    "older firmware shows no marker."),
+                    "dGPU is powered off (D3cold) or idles in D3hot: steady and\n"
+                    "dim, like the idle battery row. Needs firmware that reads\n"
+                    "the ghost flags; older firmware shows no marker."),
     Setting("BATT_DRIFT_FLOOR", "levels", INT, lo=0, hi=255,
             comment="Trough of the faint cap-drift breathe; the peak is\n"
                     "ROW_VAL_BATT_IDLE. Keep the gap small -- this is meant to\n"
@@ -161,9 +165,10 @@ SCHEMA = [
             comment="Temperature mapped to a full bar."),
     Setting("DGPU_OFF_STEP_S", "thresholds", FLOAT, lo=1, hi=86400,
             comment="The dGPU sleep marker grows from the right: its last key\n"
-                    "lights as the dGPU powers off (D3cold), and one more after\n"
-                    "each further this many seconds it stays off, up to all 4\n"
-                    "(900 = every 15 minutes). Any wake starts it over."),
+                    "lights as the dGPU enters D3cold (teal) or D3hot (orange),\n"
+                    "and one more after each further this many seconds it stays\n"
+                    "in that state, up to all 4 (900 = every 15 minutes). Any\n"
+                    "change of state, a wake included, starts it over."),
 
     Setting("RATE_SEG_W1", "battery", FLOAT, lo=0, hi=255,
             comment="Charge/discharge watts above which 2 segments animate."),

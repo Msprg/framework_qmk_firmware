@@ -14,7 +14,7 @@ normally — the stats ride on a private custom-value channel, `0x42`):
 | 2 | CPU usage | red bar; breathes when a limit holds the APU back, and the pad names it (see below) |
 | 3 | Memory usage | gold bar; whole row blinks at ~1 Hz when usage is critically high (≥90%) |
 | 4 | iGPU + NPU usage | red bar for the iGPU; NPU usage as a dim cyan *ghost* bar behind it, visible where the NPU is busier than the iGPU (see below) |
-| 5 | dGPU usage | green bar (dark if no dGPU); breathes when a limit holds the dGPU back, and the pad names it (see below); while the dGPU is powered off (D3cold) dim light blue/teal keys grow from the right, one per 15 minutes it stays off |
+| 5 | dGPU usage | green bar (dark if no dGPU); breathes when a limit holds the dGPU back, and the pad names it (see below); while the dGPU is powered off (D3cold) dim light blue/teal keys grow from the right, one per 15 minutes it stays off; orange the same way while it idles in D3hot |
 | 6 | System temperature | fixed green→deep-red gradient across the row; bar length scales 30–90 °C; whole row blinks at ~1 Hz above 90 °C |
 
 **Lights off.** With NumLock off, the top-left key is the macropad's RGB
@@ -198,6 +198,13 @@ the fourth after 45; it stays at four keys after that. When something wakes the
 GPU, even for a second, the bar fades out, and the count starts again from one
 key once the GPU is off again. The green usage bar is unchanged.
 
+**D3hot** shows the same way in orange (`HUE_DGPU_D3HOT`): the GPU is asleep,
+but its PCIe link is still up, so it saves less. The two count apart: going
+from D3hot to D3cold turns the bar teal and starts it again at one key, so teal
+always means "fully off this long". Normally D3hot lasts only the few seconds
+before the port powers down (below), so an orange key just flashes before the
+teal one; an orange bar that keeps growing means something holds the link up.
+
 A wake is only seen if the host is looking: it checks the power state four
 times a second, on a thread of its own, so a busy tick or a disconnected pad
 can't hide one. Time nobody watched can't count: a gap of more than a few
@@ -210,12 +217,12 @@ no I/O to the GPU, so reading it can't wake it. PnP reports D3 for D3hot and
 D3cold alike; it is D3cold when the PCIe port above the GPU is in D3 as well,
 since Windows only powers the port down once the link is off. On the FW16's
 RTX 5070, an idle GPU drops to D3hot within about a second and its port
-follows 6-8 s later, so the key lights up a few seconds after the GPU goes
-idle. Background activity wakes the GPU now and then for a second or two; the
-key goes out for those wakes too.
+follows 6-8 s later, so the key lights orange about a second after the GPU
+goes idle and turns teal a few seconds after that. Background activity wakes
+the GPU now and then for a second or two; the key goes out for those wakes too.
 
 `--verbose` shows the state at the end of the `limits` line (`power=D0`,
-`D3hot`, or `D3cold for 1234s`, the time off so far), and `--selftest`
+`D3hot for 5s` or `D3cold for 1234s`, the time in that state so far), and `--selftest`
 reports it. The marker needs the
 firmware from this version (it is a right-anchored ghost bar, protocol FRAME C
 below); with older firmware the host sends no marker at all, rather than one
@@ -702,7 +709,8 @@ either works during development. What is available:
   `MSG_SPEED`, `MSG_SHOW_VALUE`, and every word (`MSG_NAME_*`, `MSG_WORD_*`,
   `MSG_NO_LIMIT`)
 - **colours**: the `HUE_*` constants (including `HUE_NPU`, the ghost bar, and
-  `HUE_DGPU_OFF`, the dGPU sleep marker) and the temperature gradient endpoints
+  `HUE_DGPU_OFF` / `HUE_DGPU_D3HOT`, the dGPU sleep marker) and the temperature
+  gradient endpoints
 - **mappings**: `RATE_SEG_W1/2/3` (watts → animated segments),
   `ROW_VAL_BATT_IDLE`, `ROW_VAL_NPU_GHOST`, `ROW_VAL_DGPU_OFF`,
   `BATT_DRIFT_FLOOR`, `LIMIT_FLOOR`

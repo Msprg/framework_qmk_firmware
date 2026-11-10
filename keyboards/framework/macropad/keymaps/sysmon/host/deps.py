@@ -421,7 +421,7 @@ def probe_ring0():
 
 
 def probe_dgpu_power():
-    """Is the dGPU powered off? (the dGPU row's keys from the right show D3cold)
+    """Is the dGPU asleep? (the dGPU row's keys from the right show D3cold/D3hot)
 
     Runs before probe_nvml: NVML initialisation wakes a powered-off dGPU.
     """
@@ -434,7 +434,8 @@ def probe_dgpu_power():
         return Result("dgpu_power", "dGPU power state", NA,
                       "no dGPU found among the display adapters")
     what = {"D3cold": "powered off; the dGPU row glows dim teal from its last key",
-            "D3hot": "idle in D3hot (the port powers off a few seconds later)",
+            "D3hot": "idle in D3hot, its PCIe link still up; the dGPU row glows "
+                     "dim orange from its last key",
             "D0": "powered on"}.get(state, "in a low-power state")
     return Result("dgpu_power", "dGPU power state", OK, f"{state}: {what}")
 
