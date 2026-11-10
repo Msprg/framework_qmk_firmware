@@ -39,7 +39,7 @@ shows a dim, still **rainbow**. It runs diagonally
 from red at the top-left key to violet at the bottom-right one. A short
 **animation** introduces it.
 
-![The boot rainbow](img/rainbow.svg)
+![From power-up to the bars: animation 5 (Twinkle), the still rainbow, then the host connects and the bars fade in](img/rainbow.svg)
 
 The rainbow stays until the host program connects. The service starts with
 Windows, so that's normally around the time the sign-in screen appears. Then
@@ -61,6 +61,31 @@ Each power-up picks one of 22 animations. The pick works like a shuffled deck:
 over 22 power-ups you see every animation once, in a random order, and never
 the same one twice in a row. The random details (where sparks land, how the
 fire flickers) are new every time.
+
+Here they all are, numbered as in the table below, each as the pad plays it:
+
+![Boot animation 1](img/boot-01.svg)
+![Boot animation 2](img/boot-02.svg)
+![Boot animation 3](img/boot-03.svg)
+![Boot animation 4](img/boot-04.svg)
+![Boot animation 5](img/boot-05.svg)
+![Boot animation 6](img/boot-06.svg)
+![Boot animation 7](img/boot-07.svg)
+![Boot animation 8](img/boot-08.svg)
+![Boot animation 9](img/boot-09.svg)
+![Boot animation 10](img/boot-10.svg)
+![Boot animation 11](img/boot-11.svg)
+![Boot animation 12](img/boot-12.svg)
+![Boot animation 13](img/boot-13.svg)
+![Boot animation 14](img/boot-14.svg)
+![Boot animation 15](img/boot-15.svg)
+![Boot animation 16](img/boot-16.svg)
+![Boot animation 17](img/boot-17.svg)
+![Boot animation 18](img/boot-18.svg)
+![Boot animation 19](img/boot-19.svg)
+![Boot animation 20](img/boot-20.svg)
+![Boot animation 21](img/boot-21.svg)
+![Boot animation 22](img/boot-22.svg)
 
 | # | Animation | What happens |
 |---|-----------|--------------|

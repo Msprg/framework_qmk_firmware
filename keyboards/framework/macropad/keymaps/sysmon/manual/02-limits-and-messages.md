@@ -82,6 +82,8 @@ spells it out. When a limit has held for **3 seconds** and still holds:
 3. The bars fade back in. They kept running underneath, so they come back
    showing current readings.
 
+![A limit message: the CPU row breathes, the bars dim out, CPU STAPM 28W scrolls across, and the bars fade back in](img/message.svg)
+
 A message takes about 9.5 seconds for `CPU STAPM 28W`. Examples:
 
 | Message | Meaning |

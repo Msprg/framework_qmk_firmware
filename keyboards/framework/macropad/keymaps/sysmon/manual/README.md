@@ -91,9 +91,10 @@ Two keys worth remembering, both with **NumLock off**:
   `C:\ProgramData\FW16Sysmon\`.
 - Setting names such as `MEM_CRITICAL_PCT` are entries in `sysmon.ini`. See
   [Settings](06-settings.md).
-- The figures are schematic. They show which keys light, and roughly in what
-  colour. Real LEDs look different from a screen: greens come out much
-  stronger, and dim keys look dimmer.
+- Most figures move. They're drawn by the firmware's own code, run on a PC:
+  what it sends the LEDs, frame by frame, shown on screen. Real LEDs still
+  look different from a screen: greens come out much stronger, and dim keys
+  look dimmer. If your system is set to reduce motion, you see a still frame.
 
 ## Beyond this manual
 
@@ -107,7 +108,13 @@ trace tools.
 Three scripts keep it in step with the code. All are standard-library Python
 3.8+, and none imports the host.
 
-- [`img/figures.py`](https://github.com/Msprg/framework_qmk_firmware/blob/macropad-sysmon/keyboards/framework/macropad/keymaps/sysmon/manual/img/figures.py) redraws the figures.
+- [`img/animations.py`](https://github.com/Msprg/framework_qmk_firmware/blob/macropad-sysmon/keyboards/framework/macropad/keymaps/sysmon/manual/img/animations.py) redraws the animated
+  figures. It compiles the firmware's `keymap.c`, unchanged, into a PC program
+  ([`tools/fwsim/`](https://github.com/Msprg/framework_qmk_firmware/blob/macropad-sysmon/keyboards/framework/macropad/keymaps/sysmon/manual/tools/fwsim)), drives it the way the host does,
+  and turns what the firmware sends the LEDs into animated SVGs. It needs
+  gcc (QMK MSYS has one). Rerun it when the firmware's display changes.
+- [`img/figures.py`](https://github.com/Msprg/framework_qmk_firmware/blob/macropad-sysmon/keyboards/framework/macropad/keymaps/sysmon/manual/img/figures.py) draws the one still figure, and
+  holds the drawing helpers both scripts share.
 - [`tools/settings_tables.py`](https://github.com/Msprg/framework_qmk_firmware/blob/macropad-sysmon/keyboards/framework/macropad/keymaps/sysmon/manual/tools/settings_tables.py) regenerates the
   settings and `[cli]` tables in [Settings](06-settings.md) from
   `host/config.py` and `host/fw16_sysmon.py`. Run it after adding or changing

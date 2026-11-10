@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Copyright 2026 Msprg
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Draw the user manual's figures: schematic pictures of the macropad's keys.
+"""Draw the user manual's still figures (the animated ones are animations.py's),
+and the drawing helpers both share.
 
     python figures.py            (writes the .svg files next to this script)
 
@@ -18,7 +19,6 @@ as in keymap.c (sysmon_row_leds).
 """
 
 import colorsys
-import math
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -147,25 +147,6 @@ def strips(title, items, label_w=330, note=None):
 
 # --- figures ------------------------------------------------------------------
 
-def fig_pad_map():
-    rows = [
-        [Key(lit(GREEN, 0.38)) for _ in range(4)],          # battery idle on AC
-        bar(40, RED),                                         # CPU
-        bar(60, GOLD),                                        # memory
-        [Key(lit(RED)), Key(lit(NPU, 0.45)), off(), off()],   # iGPU 25 %, NPU 50 %
-        [off(), off(), off(), Key(lit(DGPU_OFF, 0.38))],      # dGPU asleep
-        bar(55, None, gradient=temp_gradient()),              # temperature ~63 C
-    ]
-    labels = ["Battery|charge, charging / draining",
-              "CPU|usage; breathes when held back",
-              "Memory|usage; blinks at 90 %+",
-              "iGPU|usage, with the NPU behind it",
-              "dGPU|usage; teal from the right = asleep",
-              "Temperature|30-90 °C; blinks above 90 °C"]
-    body, h = pad(24, 24, rows, labels)
-    return svg(560, h + 48, body, "The macropad's six rows")
-
-
 def fig_bar_levels():
     items = [(f"{p} %", sub, bar(p, RED), True) for p, sub in (
         (0, "nothing lit"),
@@ -176,181 +157,9 @@ def fig_bar_levels():
     return strips("Reading a bar", items, label_w=270)
 
 
-def fig_battery():
-    charge_hue = 50 * 85 // 100
-    charging = bar(50, charge_hue)
-    charging[2] = Key(lit(charge_hue, 0.7), mark=True)
-    charging[3] = Key(lit(charge_hue, 0.7), mark=True)
-    draining = bar(60, RED)
-    draining[2] = Key(lit(RED, 0.75), mark=True)
-    assist = bar(60, AMBER)
-    assist[2] = Key(lit(AMBER, 0.75), mark=True)
-    items = [
-        ("Charging, at 50 %", "red → green as it charges; keys past "
-         "the edge pulse", charging, False),
-        ("On battery, at 60 %", "red; the edge key flares and fades",
-         draining, False),
-        ("On AC, battery helping the charger", "amber: the charger can't keep up",
-         assist, False),
-        ("On AC, battery idle", "the whole row steady dim green",
-         [Key(lit(GREEN, 0.38)) for _ in range(4)], False),
-        ("Draining, below 15 %", "the whole row red, blinking",
-         [Key(lit(RED), mark=True) for _ in range(4)], False),
-    ]
-    return strips("The battery row", items, label_w=420,
-                  note="Dashed outline = the key animates. More keys pulse the "
-                       "more power flows: 1 key below 20 W, all 4 from 75 W.")
-
-
-def fig_npu():
-    items = [
-        ("NPU idle", "just the iGPU's red bar (here 50 %)", bar(50, RED), True),
-        ("NPU busier than the iGPU", "dim cyan past the red bar (iGPU 25 %, NPU 75 %)",
-         [Key(lit(RED)), Key(lit(NPU, 0.45)), Key(lit(NPU, 0.45)), off()], True),
-        ("iGPU busier than the NPU", "the cyan is hidden behind the red bar",
-         bar(75, RED), True),
-    ]
-    return strips("The iGPU row and its NPU ghost bar", items, label_w=400)
-
-
-def fig_dgpu_sleep():
-    t = lambda: Key(lit(DGPU_OFF, 0.38))
-    items = [
-        ("dGPU awake, 40 % busy", "the green usage bar", bar(40, GREEN), True),
-        ("Powered off (D3cold)", "the last key glows dim teal", [off(), off(), off(), t()], True),
-        ("Off for 15 minutes", "a second key", [off(), off(), t(), t()], True),
-        ("Off for 30 minutes", "a third key", [off(), t(), t(), t()], True),
-        ("Off for 45 minutes or more", "all four keys", [t(), t(), t(), t()], True),
-    ]
-    return strips("The dGPU sleep marker", items, label_w=330,
-                  note="Any wake, even a second long, fades it out; it starts "
-                       "again from one key.")
-
-
-def fig_temperature():
-    g = temp_gradient()
-    hot = bar(100, None, gradient=g)
-    for k in hot:
-        k.mark = True
-    items = [
-        ("45 °C", "a quarter of the bar, green", bar(25, None, gradient=g), True),
-        ("70 °C", "into yellow and orange", bar(67, None, gradient=g), True),
-        ("Above 90 °C", "the full bar, blinking", hot, True),
-    ]
-    return strips("The temperature row", items, label_w=300,
-                  note="The colours are fixed per key, green on the left to red "
-                       "on the right; the length says how hot.")
-
-
-def fig_warning():
-    rows = []
-    for r in range(6):
-        row = []
-        for c in range(4):
-            on = (((r + c) // 2) & 1) == 0
-            row.append(Key(lit(YELLOW)) if on else off())
-        rows.append(row)
-    body, h = pad(24, 24, rows)
-    body.append(text(24 + 4 * (KW + GAP) + 14, 24 + 40, "Disconnect warning", 15, weight="600"))
-    for i, line in enumerate(("Black and yellow caution stripes,",
-                              "shown for 10 s when the host program",
-                              "stopped sending without saying",
-                              "goodbye (a crash, a hang). Then the",
-                              "pad falls back to its regular",
-                              "RGB effect.")):
-        body.append(text(24 + 4 * (KW + GAP) + 14, 24 + 66 + i * 19, line, 13, MUTED))
-    return svg(560, h + 48, body, "The disconnect warning")
-
-
-def fig_rainbow():
-    rows = []
-    for r in range(6):
-        row = []
-        for c in range(4):
-            pos = (c / 3.0 + r / 5.0) / 2.0
-            row.append(Key(lit(0 + 205 * pos, 0.8)))
-        rows.append(row)
-    body, h = pad(24, 24, rows)
-    x = 24 + 4 * (KW + GAP) + 14
-    body.append(text(x, 24 + 40, "Boot rainbow", 15, weight="600"))
-    for i, line in enumerate(("Dim and still, red at the top-left",
-                              "to violet at the bottom-right,",
-                              "from power-up until the host",
-                              "program first connects. A short",
-                              "animation introduces it, a",
-                              "different one each power-up.")):
-        body.append(text(x, 24 + 66 + i * 19, line, 13, MUTED))
-    return svg(560, h + 48, body, "The boot rainbow")
-
-
-def fig_rhythms():
-    """Brightness over 6 s for each of the pad's rhythms."""
-    W, H = 760, 470
-    x0, plot_w, lane_h, lane_gap = 250, 480, 52, 22
-    seconds = 6.0
-
-    def steady(t):
-        return 1.0
-
-    def blink(t):
-        return 1.0 if (t % 1.024) < 0.512 else 0.0
-
-    def breathe(period, floor):
-        def f(t):
-            ph = (t % period) / period
-            env = (math.sin(2 * math.pi * ph - math.pi / 2) + 1) / 2
-            return floor + (1 - floor) * env
-        return f
-
-    def pulse(t):
-        p = 4.096
-        q = (t % p) / (p / 4)
-        s = q if q < 1 else 1 if q < 2 else 3 - q if q < 3 else 0
-        return math.sqrt(max(0.0, s))
-
-    lanes = [
-        ("Steady", "a bar showing a level", steady),
-        ("Pulse, ~4 s", "battery: power flowing in or out", pulse),
-        ("Brisk breathe, ~1.5 s", "CPU / dGPU at one of its own limits",
-         breathe(1.536, 110 / 255)),
-        ("Slow breathe, ~4 s", "CPU / dGPU held back by the charger",
-         breathe(4.096, 110 / 255)),
-        ("Blink, ~1 Hz", "critical: battery, memory, temperature", blink),
-    ]
-    body, y = [], 28
-    for name, sub, f in lanes:
-        body.append(text(20, y + lane_h / 2 - 2, name, 15, weight="600"))
-        body.append(text(20, y + lane_h / 2 + 15, sub, 12.5, MUTED))
-        body.append(f'<rect x="{x0}" y="{y}" width="{plot_w}" height="{lane_h}" '
-                    f'rx="6" fill="#202329"/>')
-        pts = []
-        n = 300
-        for i in range(n + 1):
-            t = seconds * i / n
-            v = f(t)
-            pts.append(f"{x0 + plot_w * i / n:.1f},{y + lane_h - 4 - (lane_h - 8) * v:.1f}")
-        body.append(f'<polyline points="{" ".join(pts)}" fill="none" '
-                    f'stroke="#f2c14e" stroke-width="2"/>')
-        y += lane_h + lane_gap
-    for s in range(int(seconds) + 1):
-        x = x0 + plot_w * s / seconds
-        body.append(f'<line x1="{x}" y1="{y - lane_gap + 4}" x2="{x}" y2="{y - lane_gap + 10}" '
-                    f'stroke="{MUTED}"/>')
-        body.append(text(x, y - lane_gap + 26, f"{s} s", 12, MUTED, anchor="middle"))
-    body.append(text(x0, 18, "brightness ↑   time →", 12, MUTED))
-    return svg(W, y + 18, body, "The pad's rhythms")
-
-
 FIGURES = {
-    "pad-map.svg": fig_pad_map,
+    # The rest are animated, rendered by the firmware itself: animations.py.
     "bar-levels.svg": fig_bar_levels,
-    "battery.svg": fig_battery,
-    "npu-ghost.svg": fig_npu,
-    "dgpu-sleep.svg": fig_dgpu_sleep,
-    "temperature.svg": fig_temperature,
-    "rhythms.svg": fig_rhythms,
-    "warning.svg": fig_warning,
-    "rainbow.svg": fig_rainbow,
 }
 
 

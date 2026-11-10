@@ -7,7 +7,7 @@ are shorter than the rest. Fitted in the laptop, it sits to the right of the
 keyboard, and its top row is the one nearest the screen. With the host
 running, each row is a separate gauge.
 
-![The six rows of the macropad](img/pad-map.svg)
+![The six rows of the macropad, live: the CPU's load rises until a limit makes it breathe](img/pad-map.svg)
 
 ## How a bar reads
 
@@ -54,7 +54,7 @@ brightness, which you set with the keys or VIA (see
 
 Rows move in five distinct ways, and each one means something different:
 
-![Brightness over time for steady, pulse, brisk breathe, slow breathe and blink](img/rhythms.svg)
+![Each rhythm on a row of keys, beside the brightness the firmware gives it over time](img/rhythms.svg)
 
 | Rhythm | Looks like | Means |
 |--------|------------|-------|
@@ -78,7 +78,7 @@ bar stays readable.
 | **On battery** (unplugged) | A **red** bar of the charge level. The edge key and the keys to its left **flare and fade**, like charge draining out. |
 | **On AC, battery helping** | The same draining look in **amber**. The charger is plugged in but can't cover what the laptop draws, so the battery makes up at least 10 W. Typical with a low-power USB-C charger or a monitor's USB-C port. The CPU or dGPU row usually [breathes slowly](02-limits-and-messages.md#brisk-or-slow) at the same time. |
 | **On AC, idle** | The **whole row steady dim green**. The battery is full, or held at its charge limit, and nothing flows. A drain under 10 W on AC also counts as idle: that's the embedded controller managing the battery around its charge limit, not a real shortage. |
-| **On AC, drifting** | The idle green row with **one key breathing faintly**. The battery is drifting a little below its charge limit. It's harmless, just visible. |
+| **On AC, drifting** | The idle green row with **its last key breathing very faintly**, easy to miss by design. The battery is drifting a little below its charge limit. It's harmless. |
 | **Critical** | The **whole row red, blinking**. The battery is below 15 % (`BATT_CRITICAL_PCT`) and draining: on battery, or on AC with the battery helping. |
 
 **How many keys pulse** shows how much power is flowing: one key below 20 W,
@@ -185,7 +185,7 @@ The processor's temperature as a bar from **30 °C (empty) to 90 °C (full)**
 the left through yellow and orange to red on the right. A longer bar reaches
 further into the red.
 
-![The temperature row at 45 °C, 70 °C and above 90 °C](img/temperature.svg)
+![The temperature row warming from 45 °C to 93 °C, and blinking above 90 °C](img/temperature.svg)
 
 Above **90 °C** (`TEMP_CRITICAL_C`) the whole row **blinks**. Mobile Ryzen
 processors run up to their limit (100 °C on the Ryzen AI 9 HX 370) by
