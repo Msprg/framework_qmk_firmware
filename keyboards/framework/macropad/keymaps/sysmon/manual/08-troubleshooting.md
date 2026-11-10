@@ -174,7 +174,8 @@ for example when only an external monitor is in use. Check the self-test's
 
 ### The dGPU sleep marker never appears
 
-Something keeps the dGPU awake: a browser, a game or an app using it, an
+The dGPU never goes to sleep: something keeps it working, usually at a light
+but steady load. That can be a browser, a game or an app using it, an
 external monitor wired to the dGPU's video output, or a vendor overlay.
 Task Manager's GPU page shows which processes use the dGPU. The marker also
 needs the current firmware.
@@ -190,9 +191,20 @@ that's the card's light sleep before it powers off, not a wake.
 
 ### The sleep marker stays orange and keeps growing
 
-The dGPU is asleep (D3hot), but something keeps its connection, the PCIe
-link, up, so it never powers off. It saves less than when it's off. The
-self-test's *dGPU power state* line shows the state as well.
+The same problem as a marker that never appears, a step further along: the
+dGPU still never powers off, but here nothing is using it. It's idle and in
+light sleep (D3hot), and it could power off, but for some reason its
+connection, the PCIe link, stays up, so it stays in light sleep. That draws
+more power than being off, though less than being awake. Normally the
+orange lasts only 6 to 8 seconds before the key turns teal.
+
+Side by side:
+
+- **No marker:** the dGPU is awake, because something uses it.
+- **Orange, growing:** it's idle, but never powers off.
+- **Teal, growing:** it's off. That's the power saving you want.
+
+The self-test's *dGPU power state* line shows the state as well.
 
 ### I changed a setting and nothing happened
 

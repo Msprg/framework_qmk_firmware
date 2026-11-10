@@ -179,10 +179,12 @@ manager (the device's *Power data*), not from the GPU.
 A full four-key teal marker means the dGPU hasn't woken for at least 45
 minutes. That's the best case for battery life. A marker that keeps
 restarting from one key means something wakes the dGPU regularly. A marker
-that never appears means something keeps it awake: a browser or game using
-it, an external monitor wired to the dGPU's port, or an overlay. An **orange
-bar that keeps growing** means the card is asleep but something keeps its
-connection up, so it never powers off.
+that never appears means something keeps it awake and working, even if only
+lightly: a browser or game using it, an external monitor wired to the dGPU's
+port, or an overlay. An **orange bar that keeps growing** means nothing uses
+the card and it's asleep, yet it never powers off: something keeps its
+connection up, so it draws more than it would when off. See
+[Troubleshooting](08-troubleshooting.md#the-sleep-marker-stays-orange-and-keeps-growing).
 
 On a laptop without a dGPU, row 5 stays dark.
 
