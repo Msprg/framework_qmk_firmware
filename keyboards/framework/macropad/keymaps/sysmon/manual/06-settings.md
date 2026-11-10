@@ -60,12 +60,13 @@ pad always uses full saturation.
 | Hue | Colour | Used for, by default |
 |-----|--------|----------------------|
 | 0 | red | CPU and iGPU bars, battery on its own power, the hot end of the temperature row |
-| 28 | amber / orange | Battery helping an overloaded charger |
+| 16 | orange | dGPU sleep marker, light sleep (D3hot) |
+| 28 | amber | Battery helping an overloaded charger |
 | 36 | gold | Memory bar |
 | 43 | yellow | n/a |
 | 85 | green | dGPU bar, a full battery, the cool end of the temperature row |
 | 128 | cyan | NPU ghost bar |
-| 140 | light blue / teal | dGPU sleep marker |
+| 140 | light blue / teal | dGPU sleep marker, powered off (D3cold) |
 | 170 | blue | n/a |
 | 191 | violet (looks blue on these LEDs) | n/a |
 | 213 | magenta | n/a |
@@ -306,6 +307,7 @@ QMK hues, 0-255: 0 red, 36 gold, 85 green, 170 blue.
 | `HUE_CHARGE_FULL` | `85` | 0–255 | Charging hue at 100%; the bar interpolates red -> this. |
 | `HUE_NPU` | `128` | 0–255 | NPU ghost bar on the iGPU row (128 = cyan). Pick a hue well away from HUE_RED: a segment the two bars share mixes both colors. |
 | `HUE_DGPU_OFF` | `140` | 0–255 | The dGPU row's keys from the right while the dGPU is powered off (D3cold): 140 = light blue/teal, kept off HUE_NPU (the row above). Always fully saturated (the marker is a ghost bar, which has no saturation of its own). |
+| `HUE_DGPU_D3HOT` | `16` | 0–255 | The same marker while the dGPU idles in D3hot (asleep, but its PCIe link still up): 16 = orange, kept off HUE_AMBER's yellower 28. |
 
 ### [levels]
 
@@ -316,7 +318,7 @@ Row brightness levels and animation floors, 0-255.
 | `ROW_VAL_FULL` | `255` | 1–255 | Base brightness of a normal row, before the global screen-brightness scaling. |
 | `ROW_VAL_BATT_IDLE` | `80` | 1–255 | Dim green shown when on AC and the battery is idle (held at its charge cap). |
 | `ROW_VAL_NPU_GHOST` | `96` | 1–255 | Brightness of the NPU ghost bar behind the iGPU bar. Kept dim so the bright iGPU bar reads first; the ghost only shows where the NPU is busier than the iGPU. Needs the ghost-bar firmware (FRAME C); older firmware ignores it. |
-| `ROW_VAL_DGPU_OFF` | `80` | 1–255 | Brightness of the dGPU row's keys from the right while the dGPU is powered off (D3cold): steady and dim, like the idle battery row. Needs firmware that reads the ghost flags; older firmware shows no marker. |
+| `ROW_VAL_DGPU_OFF` | `80` | 1–255 | Brightness of the dGPU row's keys from the right while the dGPU is powered off (D3cold) or idles in D3hot: steady and dim, like the idle battery row. Needs firmware that reads the ghost flags; older firmware shows no marker. |
 | `BATT_DRIFT_FLOOR` | `68` | 0–255 | Trough of the faint cap-drift breathe; the peak is ROW_VAL_BATT_IDLE. Keep the gap small -- this is meant to be a barely-there tell, not an alert. |
 | `LIMIT_FLOOR` | `110` | 0–255 | Trough of the power-limit breathe. Deliberately not 0: dipping fully off is the critical-blink language, so a power-limited row must stay readable throughout. |
 
@@ -333,7 +335,7 @@ When a row switches into its alert state.
 | `TEMP_CRITICAL_C` | `90` | 0–150 | Temperature above which the whole row blinks. This is the temperature row's own alert; a CPU or dGPU slowed down by a thermal limit breathes its row instead (LIMIT_KINDS). |
 | `TEMP_MIN_C` | `30` | 0–150 | Temperature mapped to an empty bar. Must be below TEMP_MAX_C (if not, both keep their defaults). |
 | `TEMP_MAX_C` | `90` | 0–150 | Temperature mapped to a full bar. |
-| `DGPU_OFF_STEP_S` | `900.0` | 1–86400 | The dGPU sleep marker grows from the right: its last key lights as the dGPU powers off (D3cold), and one more after each further this many seconds it stays off, up to all 4 (900 = every 15 minutes). Any wake starts it over. |
+| `DGPU_OFF_STEP_S` | `900.0` | 1–86400 | The dGPU sleep marker grows from the right: its last key lights as the dGPU enters D3cold (teal) or D3hot (orange), and one more after each further this many seconds it stays in that state, up to all 4 (900 = every 15 minutes). Any change of state, a wake included, starts it over. |
 
 ### [battery]
 

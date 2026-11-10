@@ -36,7 +36,7 @@ Two parts work together:
 | 2 | **CPU** usage | Red bar | **Breathes** while a limit holds the CPU back (briskly: one of its own limits; slowly: a weak charger). |
 | 3 | **Memory** usage | Gold bar | The whole row **blinks** at 90 % and above. |
 | 4 | **iGPU** usage, with the **NPU** | Red bar for the iGPU, dim cyan behind it for the NPU | n/a |
-| 5 | **dGPU** usage | Green bar. **Dim teal keys from the right** mean the dGPU is powered off, one more key for every 15 minutes it stays off. | Breathes like the CPU row. |
+| 5 | **dGPU** usage | Green bar. **Dim teal keys from the right** mean the dGPU is powered off, one more key for every 15 minutes it stays off. **Dim orange** keys the same way mean it's in light sleep, normally for only a few seconds before it powers off. | Breathes like the CPU row. An orange bar that keeps growing means something keeps it from powering off. |
 | 6 | **Temperature** (CPU) | Bar from 30 °C (empty) to 90 °C (full), green keys on the left to red on the right | The whole row **blinks** above 90 °C. |
 
 Other things the pad can show:
@@ -135,4 +135,4 @@ reviews the commits made since the bookmark below, updates the chapters
 they affect, moves the bookmark, and opens a pull request. The bookmark is
 the last `macropad-sysmon` commit the manual reflects:
 
-<!-- manual-synced-to: 1cc14de61a -->
+<!-- manual-synced-to: f18f887c72 -->

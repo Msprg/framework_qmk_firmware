@@ -103,7 +103,8 @@ these cost a single indicator:
 | **iGPU** | The graphics built into the processor (Radeon 890M on the Ryzen AI 9 HX 370) |
 | **dGPU** | The discrete graphics card in the Framework 16's expansion bay |
 | **NPU** | The processor's AI accelerator ("Ryzen AI", XDNA) |
-| **D3cold** | A device's deepest power state: completely powered off. The dGPU enters it when nothing uses it. (**D3hot** is the light sleep just before; **D0** is on.) |
+| **D3cold** | A device's deepest power state: completely powered off. The dGPU enters it when nothing uses it. The pad shows it as the teal sleep marker. (**D0** is on.) |
+| **D3hot** | A device's light sleep: asleep, but its connection (for the dGPU, the PCIe link) is still up. The dGPU passes through it for a few seconds on its way to D3cold. The pad shows it as the orange sleep marker. |
 | **STAPM** | Skin Temperature Aware Power Management: AMD's sustained power budget, moved with the chassis temperature |
 | **PPT** | Package Power Tracking: the chip's power limits, a *slow* (sustained) and a *fast* (short boost) one |
 | **TDC / EDC** | Thermal / Electrical Design Current: the sustained and peak current limits, for the cores and for the SoC |
