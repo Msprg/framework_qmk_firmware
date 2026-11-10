@@ -475,14 +475,28 @@ def saved_list(dev):
         magic, seq, at, boot, frames, size, why = SAVE_HEADER.unpack(
             trace_read(dev, 4, slot * slot_size, SAVE_HEADER.size))
         if magic == SAVE_MAGIC:
+            gap = None
+            if frames:  # how long before the save its newest frame was
+                raw = trace_read(dev, 4, slot * slot_size + 256 + (frames - 1) * size, 2)
+                gap = (at - (raw[0] | raw[1] << 8)) % 65536
             out.append({"slot": slot, "base": slot * slot_size, "seq": seq, "at": at, "boot": boot,
-                        "frames": frames, "size": size, "why": why})
+                        "frames": frames, "size": size, "why": why, "gap": gap})
     return sorted(out, key=lambda e: e["seq"]), st
 
 
+SAVE_GAP_NOTE_MS = 500  # normally the newest frame is a few ms before the save
+
+
 def saved_line(e):
-    return (f"save {e['seq']}: {e['frames']} frames, saved {e['at'] / 1000:.1f} s after power-up "
+    line = (f"save {e['seq']}: {e['frames']} frames, saved {e['at'] / 1000:.1f} s after power-up "
             f"(power-up counter {e['boot']}), by {SAVED_BY.get(e['why'], e['why'])}")
+    # Frames are recorded only while something shows: saved with the lights
+    # off (or the pad suspended), a trace ends where they went off. The
+    # frames' times are 16-bit, so the gap is known modulo 65.5 s: at least.
+    if e.get("gap") is not None and e["gap"] >= SAVE_GAP_NOTE_MS:
+        line += (f"; nothing recorded in at least its last {e['gap'] / 1000:.1f} s "
+                 f"(the lights were off, or the pad suspended)")
+    return line
 
 
 def saved_main(dev, argv):

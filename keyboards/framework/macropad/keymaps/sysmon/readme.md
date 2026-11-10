@@ -148,7 +148,10 @@ reflashing. The hold never reaches the laptop; a quick tap still sends the key
 (on release). Later, `trace saved` lists the saves (when after power-up, which
 start of the pad), and `trace saved N` (or `trace saved last`) writes save N's
 CSV, summary and PNG like `trace` does. `trace save` saves from the laptop, as
-the key does.
+the key does. The recorder only records while something shows: a save made
+with the lights off (with NumLock off, a tap on Esc is the RGB toggle) ends
+where they went off, and `trace saved` says so ("nothing recorded in at least
+its last 6.1 s").
 
 A replay of several animations names each with dots before it plays: up to
 9, N white dots in reading order from the top-left key; from 10, the tens as
